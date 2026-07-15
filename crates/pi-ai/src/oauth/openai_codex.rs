@@ -504,6 +504,9 @@ async fn collect_codex_code(
     expected_state: &str,
 ) -> Result<String, OAuthError> {
     let host = std::env::var("PI_OAUTH_CALLBACK_HOST").unwrap_or_else(|_| "127.0.0.1".into());
+    // Oracle (openai-codex.ts startLocalOAuthServer): bind failure soft-fails —
+    // resolve a no-op server whose waitForCode yields null, then fall through
+    // to onManualCodeInput / onPrompt paste path.
     let server = start_callback_server(CallbackServerConfig {
         host,
         port: 1455,
@@ -511,28 +514,41 @@ async fn collect_codex_code(
         expected_state: Some(expected_state.to_owned()),
         success_message: "OpenAI authentication completed. You can close this window.".into(),
     })
-    .await?;
+    .await
+    .ok();
 
     let mut code: Option<String> = None;
-    if let Some(manual) = &callbacks.on_manual_code_input {
-        tokio::select! {
-            result = server.wait_for_code() => {
-                if let Ok(Some(cb)) = result {
-                    code = Some(cb.code);
+    if let Some(server) = server {
+        if let Some(manual) = &callbacks.on_manual_code_input {
+            tokio::select! {
+                result = server.wait_for_code() => {
+                    if let Ok(Some(cb)) = result {
+                        code = Some(cb.code);
+                    }
+                }
+                input = manual() => {
+                    let (c, s) = parse_authorization_input(&input);
+                    if let Some(s) = &s
+                        && s.as_str() != expected_state
+                    {
+                        return Err(OAuthError::Other("State mismatch".into()));
+                    }
+                    code = c;
                 }
             }
-            input = manual() => {
-                let (c, s) = parse_authorization_input(&input);
-                if let Some(s) = &s
-                    && s.as_str() != expected_state
-                {
-                    return Err(OAuthError::Other("State mismatch".into()));
-                }
-                code = c;
-            }
+        } else if let Ok(Some(cb)) = server.wait_for_code().await {
+            code = Some(cb.code);
         }
-    } else if let Ok(Some(cb)) = server.wait_for_code().await {
-        code = Some(cb.code);
+    } else if let Some(manual) = &callbacks.on_manual_code_input {
+        // No callback server: still honor an immediate manual-input race.
+        let input = manual().await;
+        let (c, s) = parse_authorization_input(&input);
+        if let Some(s) = &s
+            && s.as_str() != expected_state
+        {
+            return Err(OAuthError::Other("State mismatch".into()));
+        }
+        code = c;
     }
 
     if code.is_none() {

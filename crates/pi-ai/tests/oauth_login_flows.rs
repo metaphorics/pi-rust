@@ -305,18 +305,100 @@ async fn openai_codex_browser_login_and_device_code() {
     );
     let device_creds = provider2.login(&callbacks2).await.unwrap();
     assert_eq!(device_creds.extra["accountId"], "acct_login");
-    let dc = device_codes2.lock().unwrap();
-    assert_eq!(dc.len(), 1);
-    assert_eq!(dc[0].user_code, "ABCD-EFGH");
-    assert_eq!(
-        dc[0].verification_uri,
-        openai_codex::DEVICE_VERIFICATION_URI
-    );
+    {
+        let dc = device_codes2.lock().unwrap();
+        assert_eq!(dc.len(), 1);
+        assert_eq!(dc[0].user_code, "ABCD-EFGH");
+        assert_eq!(
+            dc[0].verification_uri,
+            openai_codex::DEVICE_VERIFICATION_URI
+        );
+    }
 
     // Refresh
     let _ = token_json2;
     let refreshed = provider.refresh(&credentials).await.unwrap();
     assert_eq!(refreshed.extra["accountId"], "acct_refresh");
+}
+
+/// When port 1455 is occupied, oracle soft-fails the local callback server and
+/// falls through to `on_prompt` paste. Must not use `with_test_callback` — that
+/// short-circuits `collect_codex_code` entirely.
+#[tokio::test]
+async fn openai_codex_bind_failure_falls_back_to_paste_prompt() {
+    let jwt = jwt_with_account("acct_paste");
+    let token_json =
+        format!(r#"{{"access_token":"{jwt}","refresh_token":"codex-refresh","expires_in":7200}}"#);
+
+    let token_server = MockServer::spawn(Arc::new(move |_line, path, body| {
+        if path.starts_with("/token")
+            && (body.contains("authorization_code") || body.contains("grant_type=authorization_code"))
+        {
+            (200, "application/json", token_json.clone())
+        } else {
+            (404, "text/plain", "no".into())
+        }
+    }))
+    .await;
+
+    // Occupy the Codex callback port for the duration of the test.
+    let _occupied = TcpListener::bind("127.0.0.1:1455")
+        .await
+        .expect("test requires free 127.0.0.1:1455 to occupy");
+
+    let auth_urls = Arc::new(Mutex::new(Vec::new()));
+    let prompt_hits = Arc::new(AtomicUsize::new(0));
+    let prompt_hits_cb = Arc::clone(&prompt_hits);
+
+    // Code only — omit state so collect_codex_code does not compare it.
+    let answers = Arc::new(Mutex::new(vec!["paste-code-1".to_owned()]));
+    let callbacks = OAuthLoginCallbacks {
+        on_auth: Box::new({
+            let auth_urls = Arc::clone(&auth_urls);
+            move |info: OAuthAuthInfo| {
+                auth_urls.lock().unwrap().push(info.url);
+            }
+        }),
+        on_device_code: Box::new(move |_info: OAuthDeviceCodeInfo| {}),
+        on_prompt: Box::new(move |_prompt: OAuthPrompt| {
+            prompt_hits_cb.fetch_add(1, Ordering::SeqCst);
+            let answers = Arc::clone(&answers);
+            Box::pin(async move {
+                let mut guard = answers.lock().unwrap();
+                if guard.is_empty() {
+                    String::new()
+                } else {
+                    guard.remove(0)
+                }
+            }) as Pin<Box<dyn Future<Output = String> + Send>>
+        }),
+        on_progress: Some(Box::new(|_msg: &str| {})),
+        on_manual_code_input: None,
+        on_select: Box::new(move |_prompt: OAuthSelectPrompt| {
+            Box::pin(async move {
+                Some(openai_codex::OPENAI_CODEX_BROWSER_LOGIN_METHOD.to_owned())
+            }) as Pin<Box<dyn Future<Output = Option<String>> + Send>>
+        }),
+        cancellation: None,
+        open_browser: false,
+    };
+
+    // Intentionally NO with_test_callback — must hit collect_codex_code.
+    let provider = openai_codex::OpenAICodexOAuth::with_endpoints(
+        reqwest::Client::new(),
+        token_server.url("/token"),
+        token_server.url("/usercode"),
+        token_server.url("/device-token"),
+    );
+
+    let credentials = provider.login(&callbacks).await.expect("paste fallback login");
+    assert_eq!(credentials.extra["accountId"], "acct_paste");
+    assert_eq!(
+        prompt_hits.load(Ordering::SeqCst),
+        1,
+        "on_prompt must engage when callback port cannot bind"
+    );
+    assert!(!auth_urls.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -383,8 +465,10 @@ async fn github_copilot_device_login_exchange_and_refresh() {
         credentials.extra["availableModelIds"],
         serde_json::json!(["gpt-4.1"])
     );
-    let dc = device_codes.lock().unwrap();
-    assert_eq!(dc[0].user_code, "XXXX-YYYY");
+    {
+        let dc = device_codes.lock().unwrap();
+        assert_eq!(dc[0].user_code, "XXXX-YYYY");
+    }
 
     let auth = github_copilot::to_auth(&credentials);
     assert_eq!(
@@ -414,8 +498,7 @@ async fn radius_factory_registered_and_browser_login() {
             (
                 200,
                 "application/json",
-                format!(
-                    r#"{{
+                r#"{
                       "issuer":"http://radius.test",
                       "authorizationEndpoint":"http://radius.test/authorize",
                       "tokenEndpoint":"PLACEHOLDER_TOKEN",
@@ -424,8 +507,8 @@ async fn radius_factory_registered_and_browser_login() {
                       "clientId":"radius-client",
                       "scope":"openid",
                       "deviceCodeGrantType":"urn:ietf:params:oauth:grant-type:device_code"
-                    }}"#
-                )
+                    }"#
+                .to_string()
                 .replace("PLACEHOLDER_TOKEN", "WILL_PATCH"),
             )
         } else if path.starts_with("/v1/config") {
@@ -528,11 +611,14 @@ async fn radius_factory_registered_and_browser_login() {
     let credentials = provider.login(&callbacks).await.unwrap();
     assert_eq!(credentials.access, "rad-access");
     assert_eq!(credentials.refresh, "rad-refresh");
-    assert!(credentials.extra.get("gatewayConfig").is_some());
+    assert!(credentials.extra.contains_key("gatewayConfig"));
     assert!(!auth_urls.lock().unwrap().is_empty());
-    let url = &auth_urls.lock().unwrap()[0];
-    assert!(url.contains("code_challenge="));
-    assert!(url.contains("client_id=radius-client"));
+    {
+        let urls = auth_urls.lock().unwrap();
+        let url = &urls[0];
+        assert!(url.contains("code_challenge="));
+        assert!(url.contains("client_id=radius-client"));
+    }
 
     // File persist round-trip (byte-compatible shape)
     let dir = tempfile_dir();
