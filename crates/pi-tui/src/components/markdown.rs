@@ -420,6 +420,7 @@ impl Markdown {
         let mut opts = Options::empty();
         opts.insert(Options::ENABLE_STRIKETHROUGH);
         opts.insert(Options::ENABLE_TASKLISTS);
+        opts.insert(Options::ENABLE_TABLES);
         opts
     }
 
@@ -589,6 +590,72 @@ impl Markdown {
                 }
                 (lines, end - start + 1)
             }
+            Event::Start(Tag::Table(_alignments)) => {
+                let end = find_end(events, start, TagEnd::Table);
+                let raw_fallback: String = events[start..=end]
+                    .iter()
+                    .filter_map(|e| match e {
+                        Event::Text(t) => Some(t.as_ref()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                // Collect header + body rows as cell-event slices.
+                let mut header: Vec<String> = Vec::new();
+                let mut rows: Vec<Vec<String>> = Vec::new();
+                let mut i = start + 1;
+                let mut in_head = false;
+                let mut current_row: Vec<String> = Vec::new();
+                let ctx;
+                let ctx_ref = if let Some(c) = style_ctx {
+                    c
+                } else {
+                    ctx = self.default_inline_ctx();
+                    &ctx
+                };
+                while i < end {
+                    match &events[i] {
+                        Event::Start(Tag::TableHead) => {
+                            in_head = true;
+                            i += 1;
+                        }
+                        Event::End(TagEnd::TableHead) => {
+                            in_head = false;
+                            if !current_row.is_empty() {
+                                header = std::mem::take(&mut current_row);
+                            }
+                            i += 1;
+                        }
+                        Event::Start(Tag::TableRow) => {
+                            current_row.clear();
+                            i += 1;
+                        }
+                        Event::End(TagEnd::TableRow) => {
+                            if in_head {
+                                header = std::mem::take(&mut current_row);
+                            } else if !current_row.is_empty() {
+                                rows.push(std::mem::take(&mut current_row));
+                            }
+                            i += 1;
+                        }
+                        Event::Start(Tag::TableCell) => {
+                            let cell_end = find_end(events, i, TagEnd::TableCell);
+                            let text = self.render_inlines(&events[i + 1..cell_end], ctx_ref);
+                            current_row.push(text);
+                            i = cell_end + 1;
+                        }
+                        _ => {
+                            i += 1;
+                        }
+                    }
+                }
+                let mut lines =
+                    self.render_table(&header, &rows, width, &raw_fallback, style_ctx);
+                if self.next_block_needs_spacing(events, end) {
+                    lines.push(String::new());
+                }
+                (lines, end - start + 1)
+            }
             Event::Rule => {
                 let rule = "─".repeat(width.min(80));
                 let mut lines = vec![(self.theme.hr)(&rule)];
@@ -653,6 +720,207 @@ impl Markdown {
         } else {
             Arc::new(move |text: &str| heading(&bold(text)))
         }
+    }
+
+    fn get_longest_word_width(text: &str, max_width: usize) -> usize {
+        let mut max_w = 1usize;
+        for word in text.split_whitespace() {
+            let w = visible_width(word).min(max_width);
+            max_w = max_w.max(w.max(1));
+        }
+        max_w
+    }
+
+    fn wrap_cell_text(text: &str, max_width: usize) -> Vec<String> {
+        wrap_text_with_ansi(text, max_width.max(1))
+    }
+
+    /// Port of markdown.ts renderTable — box-drawing borders + width-aware wrap.
+    fn render_table(
+        &self,
+        header: &[String],
+        rows: &[Vec<String>],
+        available_width: usize,
+        raw_fallback: &str,
+        _style_ctx: Option<&InlineStyleContext>,
+    ) -> Vec<String> {
+        let mut lines = Vec::new();
+        let num_cols = header.len();
+        if num_cols == 0 {
+            return lines;
+        }
+
+        // Border overhead: "│ " + (n-1)*" │ " + " │" = 3n + 1
+        let border_overhead = 3 * num_cols + 1;
+        let available_for_cells = available_width.saturating_sub(border_overhead);
+        if available_for_cells < num_cols {
+            let mut fallback = wrap_text_with_ansi(raw_fallback, available_width.max(1));
+            if !fallback.is_empty() {
+                lines.append(&mut fallback);
+            }
+            return lines;
+        }
+
+        const MAX_UNBROKEN: usize = 30;
+        let mut natural_widths = vec![0usize; num_cols];
+        let mut min_word_widths = vec![1usize; num_cols];
+        for (i, cell) in header.iter().enumerate() {
+            natural_widths[i] = visible_width(cell);
+            min_word_widths[i] = Self::get_longest_word_width(cell, MAX_UNBROKEN).max(1);
+        }
+        for row in rows {
+            for (i, cell) in row.iter().enumerate().take(num_cols) {
+                natural_widths[i] = natural_widths[i].max(visible_width(cell));
+                min_word_widths[i] = min_word_widths[i]
+                    .max(Self::get_longest_word_width(cell, MAX_UNBROKEN).max(1));
+            }
+        }
+
+        let mut min_column_widths = min_word_widths.clone();
+        let mut min_cells_width: usize = min_column_widths.iter().sum();
+
+        if min_cells_width > available_for_cells {
+            min_column_widths = vec![1usize; num_cols];
+            let remaining = available_for_cells.saturating_sub(num_cols);
+            if remaining > 0 {
+                let total_weight: usize = min_word_widths
+                    .iter()
+                    .map(|w| w.saturating_sub(1))
+                    .sum();
+                let mut growth = vec![0usize; num_cols];
+                for i in 0..num_cols {
+                    let weight = min_word_widths[i].saturating_sub(1);
+                    growth[i] = weight
+                        .checked_mul(remaining)
+                        .and_then(|n| n.checked_div(total_weight))
+                        .unwrap_or(0);
+                }
+                for i in 0..num_cols {
+                    min_column_widths[i] += growth[i];
+                }
+                let allocated: usize = growth.iter().sum();
+                let mut leftover = remaining.saturating_sub(allocated);
+                let mut i = 0;
+                while leftover > 0 && i < num_cols {
+                    min_column_widths[i] += 1;
+                    leftover -= 1;
+                    i += 1;
+                }
+            }
+            min_cells_width = min_column_widths.iter().sum();
+        }
+
+        let total_natural: usize = natural_widths.iter().sum::<usize>() + border_overhead;
+        let column_widths: Vec<usize> = if total_natural <= available_width {
+            natural_widths
+                .iter()
+                .enumerate()
+                .map(|(i, w)| (*w).max(min_column_widths[i]))
+                .collect()
+        } else {
+            let total_grow: usize = natural_widths
+                .iter()
+                .enumerate()
+                .map(|(i, w)| w.saturating_sub(min_column_widths[i]))
+                .sum();
+            let extra = available_for_cells.saturating_sub(min_cells_width);
+            let mut column_widths: Vec<usize> = min_column_widths
+                .iter()
+                .enumerate()
+                .map(|(i, min_w)| {
+                    let delta = natural_widths[i].saturating_sub(*min_w);
+                    let grow = delta
+                        .checked_mul(extra)
+                        .and_then(|n| n.checked_div(total_grow))
+                        .unwrap_or(0);
+                    min_w + grow
+                })
+                .collect();
+            let allocated: usize = column_widths.iter().sum();
+            let mut remaining = available_for_cells.saturating_sub(allocated);
+            while remaining > 0 {
+                let mut grew = false;
+                for i in 0..num_cols {
+                    if remaining == 0 {
+                        break;
+                    }
+                    if column_widths[i] < natural_widths[i] {
+                        column_widths[i] += 1;
+                        remaining -= 1;
+                        grew = true;
+                    }
+                }
+                if !grew {
+                    break;
+                }
+            }
+            column_widths
+        };
+
+        // Top border
+        let top_cells: Vec<String> = column_widths.iter().map(|w| "─".repeat(*w)).collect();
+        lines.push(format!("┌─{}─┐", top_cells.join("─┬─")));
+
+        // Header with wrapping
+        let header_cell_lines: Vec<Vec<String>> = header
+            .iter()
+            .enumerate()
+            .map(|(i, text)| Self::wrap_cell_text(text, column_widths[i]))
+            .collect();
+        let header_line_count = header_cell_lines
+            .iter()
+            .map(|c| c.len())
+            .max()
+            .unwrap_or(1);
+        for line_idx in 0..header_line_count {
+            let row_parts: Vec<String> = header_cell_lines
+                .iter()
+                .enumerate()
+                .map(|(col_idx, cell_lines)| {
+                    let text = cell_lines.get(line_idx).map(|s| s.as_str()).unwrap_or("");
+                    let pad = column_widths[col_idx].saturating_sub(visible_width(text));
+                    let padded = format!("{text}{}", " ".repeat(pad));
+                    (self.theme.bold)(&padded)
+                })
+                .collect();
+            lines.push(format!("│ {} │", row_parts.join(" │ ")));
+        }
+
+        // Separator
+        let sep_cells: Vec<String> = column_widths.iter().map(|w| "─".repeat(*w)).collect();
+        let separator = format!("├─{}─┤", sep_cells.join("─┼─"));
+        lines.push(separator.clone());
+
+        // Body rows
+        for (row_index, row) in rows.iter().enumerate() {
+            let row_cell_lines: Vec<Vec<String>> = (0..num_cols)
+                .map(|i| {
+                    let text = row.get(i).map(|s| s.as_str()).unwrap_or("");
+                    Self::wrap_cell_text(text, column_widths[i])
+                })
+                .collect();
+            let row_line_count = row_cell_lines.iter().map(|c| c.len()).max().unwrap_or(1);
+            for line_idx in 0..row_line_count {
+                let row_parts: Vec<String> = row_cell_lines
+                    .iter()
+                    .enumerate()
+                    .map(|(col_idx, cell_lines)| {
+                        let text = cell_lines.get(line_idx).map(|s| s.as_str()).unwrap_or("");
+                        let pad = column_widths[col_idx].saturating_sub(visible_width(text));
+                        format!("{text}{}", " ".repeat(pad))
+                    })
+                    .collect();
+                lines.push(format!("│ {} │", row_parts.join(" │ ")));
+            }
+            if row_index < rows.len() - 1 {
+                lines.push(separator.clone());
+            }
+        }
+
+        // Bottom border
+        let bottom_cells: Vec<String> = column_widths.iter().map(|w| "─".repeat(*w)).collect();
+        lines.push(format!("└─{}─┘", bottom_cells.join("─┴─")));
+        lines
     }
 
     fn next_block_needs_spacing(&self, events: &[Event<'_>], end_idx: usize) -> bool {
@@ -1134,5 +1402,62 @@ mod tests {
         assert!(lines.iter().any(|l| l.contains("```rs")), "{lines:?}");
         assert!(lines.iter().any(|l| l.contains("let x = 1;")), "{lines:?}");
         assert!(lines.iter().any(|l| l.trim() == "```"), "{lines:?}");
+    }
+
+    #[test]
+    fn simple_table_renders_borders_and_cells() {
+        let src = "| Name | Age |\n| --- | --- |\n| Alice | 30 |\n| Bob | 25 |";
+        let mut md = Markdown::new(src, 0, 0, default_markdown_theme(), None, None);
+        let lines = plain_lines(&mut md, 80);
+        let joined = lines.join("\n");
+        assert!(joined.contains("Name"), "{joined}");
+        assert!(joined.contains("Age"), "{joined}");
+        assert!(joined.contains("Alice"), "{joined}");
+        assert!(joined.contains("Bob"), "{joined}");
+        assert!(
+            lines.iter().any(|l| l.contains('│')),
+            "expected vertical borders: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains('─')),
+            "expected horizontal borders: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains('┌') || l.contains('├') || l.contains('└')),
+            "expected box corners: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn table_row_dividers_between_data_rows() {
+        let src = "| A | B |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |";
+        let mut md = Markdown::new(src, 0, 0, default_markdown_theme(), None, None);
+        let lines = plain_lines(&mut md, 80);
+        let seps: Vec<_> = lines
+            .iter()
+            .filter(|l| l.contains('├') && l.contains('┼'))
+            .collect();
+        // header separator + one between data rows
+        assert!(
+            seps.len() >= 2,
+            "expected row dividers, got {seps:?} in {lines:?}"
+        );
+    }
+
+    #[test]
+    fn table_cells_wrap_when_narrow() {
+        let src = "| Command | Description |\n| --- | --- |\n| npm install | Install all dependencies for the project |";
+        let mut md = Markdown::new(src, 0, 0, default_markdown_theme(), None, None);
+        let width = 40u16;
+        let lines = plain_lines(&mut md, width);
+        for line in &lines {
+            assert!(
+                visible_width(line) <= width as usize,
+                "line exceeds width {width}: {line:?} (vw={})",
+                visible_width(line)
+            );
+        }
+        let joined = lines.join(" ");
+        assert!(joined.contains("npm") || joined.contains("install"), "{joined}");
     }
 }
