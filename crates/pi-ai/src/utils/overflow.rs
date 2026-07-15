@@ -57,8 +57,12 @@ fn compile_patterns(patterns: &[&str]) -> Vec<Regex> {
 pub fn is_context_overflow(message: &AssistantMessage, context_window: Option<u64>) -> bool {
     if message.stop_reason == StopReason::Error
         && let Some(error) = message.error_message.as_deref()
-        && !NON_OVERFLOW_PATTERNS.iter().any(|pattern| pattern.is_match(error))
-        && OVERFLOW_PATTERNS.iter().any(|pattern| pattern.is_match(error))
+        && !NON_OVERFLOW_PATTERNS
+            .iter()
+            .any(|pattern| pattern.is_match(error))
+        && OVERFLOW_PATTERNS
+            .iter()
+            .any(|pattern| pattern.is_match(error))
     {
         return true;
     }

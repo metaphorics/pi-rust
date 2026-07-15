@@ -68,9 +68,9 @@ pub fn calculate_cost(model: &Model, usage: &mut Usage) -> UsageCost {
     usage.cost.input = rates.input / 1_000_000.0 * usage.input as f64;
     usage.cost.output = rates.output / 1_000_000.0 * usage.output as f64;
     usage.cost.cache_read = rates.cache_read / 1_000_000.0 * usage.cache_read as f64;
-    usage.cost.cache_write =
-        (rates.cache_write * short_write as f64 + rates.input * 2.0 * long_write as f64)
-            / 1_000_000.0;
+    usage.cost.cache_write = (rates.cache_write * short_write as f64
+        + rates.input * 2.0 * long_write as f64)
+        / 1_000_000.0;
     usage.cost.total =
         usage.cost.input + usage.cost.output + usage.cost.cache_read + usage.cost.cache_write;
     usage.cost.clone()

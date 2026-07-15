@@ -24,8 +24,18 @@ fn oauth_client_ids_match_pi() {
 
 #[test]
 fn anthropic_and_codex_use_access_token_as_api_key() {
-    assert_eq!(anthropic::to_auth(&credential("anthropic-access")).api_key.as_deref(), Some("anthropic-access"));
-    assert_eq!(openai_codex::to_auth(&credential("codex-access")).api_key.as_deref(), Some("codex-access"));
+    assert_eq!(
+        anthropic::to_auth(&credential("anthropic-access"))
+            .api_key
+            .as_deref(),
+        Some("anthropic-access")
+    );
+    assert_eq!(
+        openai_codex::to_auth(&credential("codex-access"))
+            .api_key
+            .as_deref(),
+        Some("codex-access")
+    );
 }
 
 #[test]
@@ -37,10 +47,16 @@ fn copilot_derives_individual_proxy_and_enterprise_urls() {
     );
 
     let mut enterprise = credential("opaque");
-    enterprise.extra.insert("enterpriseUrl".into(), Value::String("https://company.ghe.com/path".into()));
+    enterprise.extra.insert(
+        "enterpriseUrl".into(),
+        Value::String("https://company.ghe.com/path".into()),
+    );
     assert_eq!(
         github_copilot::to_auth(&enterprise).base_url.as_deref(),
         Some("https://copilot-api.company.ghe.com")
     );
-    assert_eq!(github_copilot::get_base_url(None, None), "https://api.individual.githubcopilot.com");
+    assert_eq!(
+        github_copilot::get_base_url(None, None),
+        "https://api.individual.githubcopilot.com"
+    );
 }

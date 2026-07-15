@@ -1,6 +1,9 @@
 use pi_ai::{
     Api, AssistantMessage, StopReason, Usage,
-    utils::{get_overflow_patterns, is_context_overflow, is_retryable_assistant_error, sanitize_surrogates},
+    utils::{
+        get_overflow_patterns, is_context_overflow, is_retryable_assistant_error,
+        sanitize_surrogates,
+    },
 };
 
 fn message(reason: StopReason, error: Option<&str>) -> AssistantMessage {
