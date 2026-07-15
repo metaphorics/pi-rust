@@ -1231,17 +1231,13 @@ async fn process_websocket_stream(
                 TurnEvent::Error(error) => return Err(error),
             }
         }
-        // Finding #1: channel closed without Done/Error → orphaned turn is an error.
+        // Channel closed without Done/Error → orphaned turn is an error.
+        // `busy` is owned solely by session_ws_task: it releases on turn end
+        // and evicts the cache entry on death — a consumer-side store here
+        // would clobber a subsequent acquirer's claim (busy-flag race).
         if !saw_terminal {
-            handle
-                .busy
-                .store(false, std::sync::atomic::Ordering::SeqCst);
             return Err("websocket session closed before turn completed".into());
         }
-        // Successful turn: release busy so idle timer can fire (oracle release keep=true).
-        handle
-            .busy
-            .store(false, std::sync::atomic::Ordering::SeqCst);
     } else {
         // Ephemeral connection (no session id) — no reuse; still stream frames.
         let mut socket = connector.connect(url, headers).await?;
