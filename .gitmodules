@@ -1,0 +1,3 @@
+[submodule "inkferro"]
+	path = inkferro
+	url = https://github.com/metaphorics/inkferro

@@ -1,0 +1,8 @@
+[package]
+name = "pi-ai"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "pi-ai: types, event stream, wire protocols, auth, model catalog"
+
+[dependencies]

@@ -1,0 +1,10 @@
+[package]
+name = "pi-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "pi-tui-shaped component model and widgets on inkferro"
+
+[dependencies]
+inkferro-core = { path = "../../inkferro/crates/inkferro-core" }
+inkferro-rt = { path = "../../inkferro/crates/inkferro-rt" }

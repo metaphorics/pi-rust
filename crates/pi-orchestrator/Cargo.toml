@@ -1,0 +1,12 @@
+[package]
+name = "pi-orchestrator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "pi orchestrator: supervisor spawning pi --mode rpc"
+
+[dependencies]
+
+[[bin]]
+name = "pi-orchestrator"
+path = "src/main.rs"

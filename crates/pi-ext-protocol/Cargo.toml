@@ -1,0 +1,8 @@
+[package]
+name = "pi-ext-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "serde types for the sidecar RPC protocol (single source of truth)"
+
+[dependencies]

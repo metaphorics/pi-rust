@@ -1,0 +1,16 @@
+[package]
+name = "pi-coding-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "pi coding agent: CLI, modes, session manager, tools, extension bridge"
+
+[dependencies]
+pi-tui = { path = "../pi-tui" }
+pi-agent = { path = "../pi-agent" }
+pi-ext-protocol = { path = "../pi-ext-protocol" }
+anyhow.workspace = true
+
+[[bin]]
+name = "pi"
+path = "src/main.rs"

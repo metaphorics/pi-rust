@@ -1,0 +1,25 @@
+# Build
+/target/
+**/target/
+
+# Node / Bun
+node_modules/
+.npm
+dist/
+
+# Local reference material (never commit)
+/.references/
+/.outline/
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment
+.env
+.env.local
+.env.*.local
