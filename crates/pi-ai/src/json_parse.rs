@@ -71,7 +71,13 @@ mod tests {
 
     #[test]
     fn salvages_partial_tool_arguments() {
-        assert_eq!(parse_streaming_json(r#"{"path":"src/ma"#), json!({"path":"src/ma"}));
-        assert_eq!(parse_streaming_json(r#"{"ok":true,"next": "#), json!({"ok":true}));
+        assert_eq!(
+            parse_streaming_json(r#"{"path":"src/ma"#),
+            json!({"path":"src/ma"})
+        );
+        assert_eq!(
+            parse_streaming_json(r#"{"ok":true,"next": "#),
+            json!({"ok":true})
+        );
     }
 }

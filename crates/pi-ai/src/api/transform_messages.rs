@@ -37,7 +37,8 @@ pub fn openai_messages(context: &Context) -> Vec<Value> {
                 messages.push(json!({"role":"user","content":content}));
             }
             Message::Assistant(assistant) => {
-                let mut value = json!({"role":"assistant","content":text_blocks(&assistant.content)});
+                let mut value =
+                    json!({"role":"assistant","content":text_blocks(&assistant.content)});
                 let calls: Vec<Value> = assistant
                     .content
                     .iter()
@@ -106,7 +107,10 @@ pub fn responses_input(context: &Context) -> Vec<Value> {
     if let Some(system) = &context.system_prompt {
         input.push(json!({"role":"system","content":system}));
     }
-    for message in openai_messages(&Context { system_prompt: None, ..context.clone() }) {
+    for message in openai_messages(&Context {
+        system_prompt: None,
+        ..context.clone()
+    }) {
         match message.get("role").and_then(Value::as_str) {
             Some("tool") => input.push(json!({"type":"function_call_output","call_id":message["tool_call_id"],"output":message["content"]})),
             _ => input.push(message),
@@ -154,6 +158,10 @@ pub fn responses_tools(context: &Context) -> Vec<Value> {
 }
 
 pub fn google_tools(context: &Context) -> Vec<Value> {
-    if context.tools.is_empty() { return Vec::new(); }
-    vec![json!({"functionDeclarations":context.tools.iter().map(|tool| json!({"name":tool.name,"description":tool.description,"parametersJsonSchema":tool.parameters})).collect::<Vec<_>>()})]
+    if context.tools.is_empty() {
+        return Vec::new();
+    }
+    vec![
+        json!({"functionDeclarations":context.tools.iter().map(|tool| json!({"name":tool.name,"description":tool.description,"parametersJsonSchema":tool.parameters})).collect::<Vec<_>>()}),
+    ]
 }

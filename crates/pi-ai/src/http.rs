@@ -42,7 +42,9 @@ impl ReqwestStreamHttpClient {
     pub fn new() -> Result<Self, HttpError> {
         // reqwest uses HTTP_PROXY/HTTPS_PROXY by default. Explicitly retaining
         // that behavior here also keeps custom test clients fully injectable.
-        Ok(Self { client: reqwest::Client::builder().use_rustls_tls().build()? })
+        Ok(Self {
+            client: reqwest::Client::builder().use_rustls_tls().build()?,
+        })
     }
 
     async fn post(

@@ -45,7 +45,8 @@ impl SseParser {
         }
         let (field, value) = line.split_once(':').unwrap_or((line, ""));
         if field == "data" {
-            self.data.push(value.strip_prefix(' ').unwrap_or(value).to_owned());
+            self.data
+                .push(value.strip_prefix(' ').unwrap_or(value).to_owned());
         }
     }
 
@@ -77,7 +78,10 @@ mod tests {
 
     #[test]
     fn parses_multiline_data_across_chunk_boundaries() {
-        let chunks = [b": ping\r\ndata: {\"a\":".as_slice(), b"1}\r\ndata: tail\r\n\r\nid: ignored\r\ndata: done\r\n".as_slice()];
+        let chunks = [
+            b": ping\r\ndata: {\"a\":".as_slice(),
+            b"1}\r\ndata: tail\r\n\r\nid: ignored\r\ndata: done\r\n".as_slice(),
+        ];
         assert_eq!(parse_sse_chunks(chunks), ["{\"a\":1}\ntail", "done"]);
     }
 }

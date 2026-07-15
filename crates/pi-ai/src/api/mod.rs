@@ -1,6 +1,10 @@
 use std::sync::Arc;
 
-use crate::{event_stream::AssistantMessageEventStream, http::StreamHttpClient, types::{AssistantMessageEvent, Context, Model, StopReason, StreamOptions}};
+use crate::{
+    event_stream::AssistantMessageEventStream,
+    http::StreamHttpClient,
+    types::{AssistantMessageEvent, Context, Model, StopReason, StreamOptions},
+};
 
 mod common;
 
@@ -32,7 +36,12 @@ pub const BUILTIN_APIS: [&str; 10] = [
     "pi-messages",
 ];
 
-pub fn stream_dispatch(api: &str, model: Model, context: Context, options: StreamOptions) -> AssistantMessageEventStream {
+pub fn stream_dispatch(
+    api: &str,
+    model: Model,
+    context: Context,
+    options: StreamOptions,
+) -> AssistantMessageEventStream {
     match api {
         "anthropic-messages" => anthropic_messages::stream(model, context, options),
         "openai-completions" => openai_completions::stream(model, context, options),
@@ -48,17 +57,37 @@ pub fn stream_dispatch(api: &str, model: Model, context: Context, options: Strea
     }
 }
 
-pub fn stream_dispatch_with_client(api: &str, model: Model, context: Context, options: StreamOptions, client: Arc<dyn StreamHttpClient>) -> AssistantMessageEventStream {
+pub fn stream_dispatch_with_client(
+    api: &str,
+    model: Model,
+    context: Context,
+    options: StreamOptions,
+    client: Arc<dyn StreamHttpClient>,
+) -> AssistantMessageEventStream {
     match api {
-        "anthropic-messages" => anthropic_messages::stream_with_client(model, context, options, client),
-        "openai-completions" => openai_completions::stream_with_client(model, context, options, client),
+        "anthropic-messages" => {
+            anthropic_messages::stream_with_client(model, context, options, client)
+        }
+        "openai-completions" => {
+            openai_completions::stream_with_client(model, context, options, client)
+        }
         "openai-responses" => openai_responses::stream_with_client(model, context, options, client),
-        "openai-codex-responses" => openai_codex_responses::stream_with_client(model, context, options, client),
-        "azure-openai-responses" => azure_openai_responses::stream_with_client(model, context, options, client),
-        "google-generative-ai" => google_generative_ai::stream_with_client(model, context, options, client),
+        "openai-codex-responses" => {
+            openai_codex_responses::stream_with_client(model, context, options, client)
+        }
+        "azure-openai-responses" => {
+            azure_openai_responses::stream_with_client(model, context, options, client)
+        }
+        "google-generative-ai" => {
+            google_generative_ai::stream_with_client(model, context, options, client)
+        }
         "google-vertex" => google_vertex::stream_with_client(model, context, options, client),
-        "mistral-conversations" => mistral_conversations::stream_with_client(model, context, options, client),
-        "bedrock-converse-stream" => bedrock_converse_stream::stream_with_client(model, context, options, client),
+        "mistral-conversations" => {
+            mistral_conversations::stream_with_client(model, context, options, client)
+        }
+        "bedrock-converse-stream" => {
+            bedrock_converse_stream::stream_with_client(model, context, options, client)
+        }
         "pi-messages" => pi_messages::stream_with_client(model, context, options, client),
         _ => unsupported_stream(model, format!("unknown API {api:?}")),
     }
@@ -69,6 +98,9 @@ fn unsupported_stream(model: Model, error: String) -> AssistantMessageEventStrea
     let mut message = common::empty_message(&model);
     message.stop_reason = StopReason::Error;
     message.error_message = Some(error);
-    stream.push(AssistantMessageEvent::Error { reason: StopReason::Error, error: message });
+    stream.push(AssistantMessageEvent::Error {
+        reason: StopReason::Error,
+        error: message,
+    });
     stream
 }
