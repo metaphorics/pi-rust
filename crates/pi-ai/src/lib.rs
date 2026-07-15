@@ -4,6 +4,7 @@
 
 pub mod event_stream;
 pub mod types;
+pub mod utils;
 
 pub mod api;
 pub mod http;
