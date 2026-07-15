@@ -1123,7 +1123,13 @@ dependencies = [
 name = "pi-agent"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
+ "parking_lot",
  "pi-ai",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]

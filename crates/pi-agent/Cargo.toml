@@ -7,3 +7,17 @@ description = "pi-agent: agent loop and tool contract"
 
 [dependencies]
 pi-ai = { path = "../pi-ai" }
+# Async runtime for the agent loop and parallel tool execution.
+tokio = { workspace = true }
+# Stream combinators for assistant event consumption and parallel tools.
+futures-util = "0.3"
+# Agent/tool/event JSON shapes and JSON-schema parameters.
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Public agent/tool error types.
+thiserror = { workspace = true }
+# Low-overhead cancellation and shared tool state.
+parking_lot = "0.12"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
