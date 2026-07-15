@@ -1,6 +1,6 @@
-data: {"id":"resp-1","model":"test-model","choices":[{"delta":{"content":"Hello","reasoning_content":"Think","tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":"}}]},"finish_reason":null}]}
+data: {"data":{"id":"resp-1","model":"test-model","choices":[{"delta":{"content":[{"type":"text","text":"Hello"},{"type":"thinking","thinking":[{"type":"text","text":"Think"}]}],"tool_calls":[{"index":0,"id":"abc123xyz","type":"function","function":{"name":"get_weather","arguments":"{\"city\":"}}]},"finish_reason":null}]}}
 
-data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"Paris\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":3,"completion_tokens":8,"completion_tokens_details":{"reasoning_tokens":2}}}
+data: {"data":{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"Paris\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"promptTokens":3,"completionTokens":8}}}
 
 data: [DONE]
 

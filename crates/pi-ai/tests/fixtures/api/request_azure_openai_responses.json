@@ -1,11 +1,21 @@
 {
   "input": [
     {
-      "content": "Be concise.",
+      "content": [
+        {
+          "text": "Be concise.",
+          "type": "input_text"
+        }
+      ],
       "role": "system"
     },
     {
-      "content": "Hello",
+      "content": [
+        {
+          "text": "Hello",
+          "type": "input_text"
+        }
+      ],
       "role": "user"
     }
   ],

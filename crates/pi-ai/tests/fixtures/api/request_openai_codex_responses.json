@@ -4,20 +4,25 @@
   ],
   "input": [
     {
-      "content": "Be concise.",
-      "role": "system"
-    },
-    {
-      "content": "Hello",
+      "content": [
+        {
+          "text": "Hello",
+          "type": "input_text"
+        }
+      ],
       "role": "user"
     }
   ],
   "instructions": "Be concise.",
-  "max_output_tokens": 64,
   "model": "test-model",
+  "parallel_tool_calls": true,
   "store": false,
   "stream": true,
   "temperature": 0.2,
+  "text": {
+    "verbosity": "low"
+  },
+  "tool_choice": "auto",
   "tools": [
     {
       "description": "Get weather",
@@ -33,6 +38,7 @@
         ],
         "type": "object"
       },
+      "strict": null,
       "type": "function"
     }
   ]

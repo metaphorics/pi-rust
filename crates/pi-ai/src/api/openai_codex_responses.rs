@@ -11,19 +11,36 @@ use crate::{
 use super::{common, openai_responses, openai_responses_shared};
 
 pub const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
-pub const CODEX_INSTRUCTIONS: &str =
-    "You are a coding agent. Follow the user's instructions and use tools when needed.";
+pub const CODEX_INSTRUCTIONS: &str = "You are a helpful assistant.";
 
 pub fn build_request_body(model: &Model, context: &Context, options: &StreamOptions) -> Value {
     let mut body = openai_responses::build_request_body(model, context, options);
+    if let Some(input) = body["input"].as_array_mut()
+        && input.first().and_then(|item| item["role"].as_str()) == Some("system")
+    {
+        input.remove(0);
+    }
+    body.as_object_mut()
+        .expect("request body is an object")
+        .remove("max_output_tokens");
     body["instructions"] = Value::String(
         context
             .system_prompt
             .clone()
             .unwrap_or_else(|| CODEX_INSTRUCTIONS.into()),
     );
+    body["text"] = json!({"verbosity":"low"});
     body["include"] = json!(["reasoning.encrypted_content"]);
-    body["store"] = Value::Bool(false);
+    body["tool_choice"] = Value::String("auto".into());
+    body["parallel_tool_calls"] = Value::Bool(true);
+    if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
+        for tool in tools {
+            tool["strict"] = Value::Null;
+        }
+    }
+    if let Some(session_id) = &options.session_id {
+        body["prompt_cache_key"] = Value::String(session_id.clone());
+    }
     body
 }
 

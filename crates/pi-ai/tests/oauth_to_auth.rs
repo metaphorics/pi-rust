@@ -73,6 +73,13 @@ fn codex_refresh_credentials_preserve_account_id_from_jwt() {
     let token = format!("e30.{payload}.signature");
     let credential = openai_codex::credentials_from_token(token, "refresh".into(), 123).unwrap();
     assert_eq!(credential.extra["accountId"], "acct_123");
+    assert_eq!(
+        openai_codex::to_auth(&credential)
+            .headers
+            .unwrap()["chatgpt-account-id"]
+            .as_deref(),
+        Some("acct_123")
+    );
 }
 
 #[test]

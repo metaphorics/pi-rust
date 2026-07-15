@@ -75,9 +75,21 @@ pub fn credentials_from_token(
 }
 
 pub fn to_auth(credential: &OAuthCredential) -> ModelAuth {
+    let headers = credential
+        .extra
+        .get("accountId")
+        .and_then(Value::as_str)
+        .map(|account_id| {
+            [(
+                "chatgpt-account-id".into(),
+                Some(account_id.to_owned()),
+            )]
+            .into_iter()
+            .collect()
+        });
     ModelAuth {
         api_key: Some(credential.access.clone()),
-        headers: None,
+        headers,
         base_url: None,
     }
 }

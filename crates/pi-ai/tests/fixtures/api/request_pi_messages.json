@@ -28,9 +28,7 @@
   },
   "model": "test-model",
   "options": {
-    "cacheRetention": null,
     "maxTokens": 64,
-    "sessionId": null,
     "temperature": 0.2
   }
 }

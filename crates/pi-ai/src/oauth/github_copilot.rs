@@ -9,7 +9,7 @@ use crate::auth::{ModelAuth, OAuthAuth, OAuthCredential, OAuthError};
 
 pub const CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
 pub const INDIVIDUAL_BASE_URL: &str = "https://api.individual.githubcopilot.com";
-const COPILOT_API_VERSION: &str = "2025-04-01";
+const COPILOT_API_VERSION: &str = "2026-06-01";
 
 static PROXY_ENDPOINT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"proxy-ep=([^;]+)").expect("Copilot proxy regex is valid"));

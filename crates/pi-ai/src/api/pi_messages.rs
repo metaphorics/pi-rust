@@ -16,12 +16,20 @@ use crate::{
 use super::common::{self, ApiResult};
 
 pub fn build_request_body(model: &Model, context: &Context, options: &StreamOptions) -> Value {
-    json!({"model":model.id,"context":context,"options":{
-        "temperature":options.temperature,
-        "maxTokens":options.max_tokens,
-        "cacheRetention":options.cache_retention,
-        "sessionId":options.session_id,
-    }})
+    let mut wire_options = serde_json::Map::new();
+    if let Some(temperature) = options.temperature {
+        wire_options.insert("temperature".into(), json!(temperature));
+    }
+    if let Some(max_tokens) = options.max_tokens {
+        wire_options.insert("maxTokens".into(), json!(max_tokens));
+    }
+    if let Some(cache_retention) = options.cache_retention {
+        wire_options.insert("cacheRetention".into(), json!(cache_retention));
+    }
+    if let Some(session_id) = &options.session_id {
+        wire_options.insert("sessionId".into(), json!(session_id));
+    }
+    json!({"model":model.id,"context":context,"options":wire_options})
 }
 
 pub fn build_headers(model: &Model, options: &StreamOptions) -> Vec<(String, String)> {

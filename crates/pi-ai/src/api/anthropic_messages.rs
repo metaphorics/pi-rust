@@ -36,7 +36,17 @@ pub fn build_request_body(model: &Model, context: &Context, options: &StreamOpti
         "max_tokens": options.max_tokens.unwrap_or(model.max_tokens),
         "stream": true,
     });
-    if let Some(system) = &context.system_prompt {
+    if options
+        .api_key
+        .as_deref()
+        .is_some_and(|key| key.starts_with("sk-ant-oat"))
+    {
+        let mut system = vec![json!({"type":"text","text":CLAUDE_CODE_SYSTEM_PROMPT})];
+        if let Some(prompt) = &context.system_prompt {
+            system.push(json!({"type":"text","text":prompt}));
+        }
+        body["system"] = Value::Array(system);
+    } else if let Some(system) = &context.system_prompt {
         body["system"] = Value::String(system.clone());
     }
     if !tools.is_empty() {
@@ -55,7 +65,17 @@ pub fn build_headers(model: &Model, options: &StreamOptions) -> Vec<(String, Str
     if let Some(key) = &options.api_key {
         if key.starts_with("sk-ant-oat") {
             headers.push(("authorization".into(), format!("Bearer {key}")));
-            headers.push(("anthropic-beta".into(), "oauth-2025-04-20".into()));
+            headers.push((
+                "anthropic-beta".into(),
+                "claude-code-20250219,oauth-2025-04-20".into(),
+            ));
+            headers.push(("accept".into(), "application/json".into()));
+            headers.push((
+                "anthropic-dangerous-direct-browser-access".into(),
+                "true".into(),
+            ));
+            headers.push(("user-agent".into(), "claude-cli/2.1.75".into()));
+            headers.push(("x-app".into(), "cli".into()));
         } else {
             headers.push(("x-api-key".into(), key.clone()));
         }

@@ -1,0 +1,42 @@
+{
+  "max_tokens": 64,
+  "messages": [
+    {
+      "content": [
+        {
+          "thinking": [
+            {
+              "text": "Prior thought",
+              "type": "text"
+            }
+          ],
+          "type": "thinking"
+        },
+        {
+          "text": "Calling",
+          "type": "text"
+        }
+      ],
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "function": {
+            "arguments": "{\"city\":\"Paris\"}",
+            "name": "get_weather"
+          },
+          "id": "1stytzv4b",
+          "type": "function"
+        }
+      ]
+    },
+    {
+      "content": "Sunny",
+      "name": "get_weather",
+      "role": "tool",
+      "tool_call_id": "1stytzv4b"
+    }
+  ],
+  "model": "test-model",
+  "stream": true,
+  "temperature": 0.2
+}

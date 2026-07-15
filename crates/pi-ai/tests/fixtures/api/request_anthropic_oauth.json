@@ -1,0 +1,39 @@
+{
+  "max_tokens": 64,
+  "messages": [
+    {
+      "content": "Hello",
+      "role": "user"
+    }
+  ],
+  "model": "test-model",
+  "stream": true,
+  "system": [
+    {
+      "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+      "type": "text"
+    },
+    {
+      "text": "Be concise.",
+      "type": "text"
+    }
+  ],
+  "temperature": 0.2,
+  "tools": [
+    {
+      "description": "Get weather",
+      "input_schema": {
+        "properties": {
+          "city": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "city"
+        ],
+        "type": "object"
+      },
+      "name": "get_weather"
+    }
+  ]
+}

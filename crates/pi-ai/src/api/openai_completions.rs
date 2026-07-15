@@ -14,14 +14,23 @@ use super::{
     transform_messages,
 };
 
+fn compat<'a>(model: &'a Model, field: &str) -> Option<&'a Value> {
+    model.compat.as_ref()?.get(field)
+}
+
 pub fn build_request_body(model: &Model, context: &Context, options: &StreamOptions) -> Value {
     let mut body = json!({
         "model": model.id,
         "messages": transform_messages::openai_messages(context),
         "stream": true,
-        "stream_options": {"include_usage": true},
-        "max_completion_tokens": options.max_tokens.unwrap_or(model.max_tokens),
     });
+    if compat(model, "supportsUsageInStreaming").and_then(Value::as_bool) != Some(false) {
+        body["stream_options"] = json!({"include_usage":true});
+    }
+    let max_tokens_field = compat(model, "maxTokensField")
+        .and_then(Value::as_str)
+        .unwrap_or("max_completion_tokens");
+    body[max_tokens_field] = json!(options.max_tokens.unwrap_or(model.max_tokens));
     let tools = transform_messages::openai_tools(context);
     if !tools.is_empty() {
         body["tools"] = Value::Array(tools);
@@ -30,7 +39,24 @@ pub fn build_request_body(model: &Model, context: &Context, options: &StreamOpti
         body["temperature"] = json!(temperature);
     }
     if model.reasoning {
-        body["reasoning_effort"] = Value::String("medium".into());
+        match compat(model, "thinkingFormat").and_then(Value::as_str) {
+            Some("openrouter" | "ant-ling") => {
+                body["reasoning"] = json!({"effort":"medium"});
+            }
+            Some("deepseek" | "zai") => {
+                body["thinking"] = json!({"type":"enabled"});
+                body["reasoning_effort"] = Value::String("medium".into());
+            }
+            Some("together") => {
+                body["reasoning"] = json!({"enabled":true});
+                body["reasoning_effort"] = Value::String("medium".into());
+            }
+            Some("qwen") => body["enable_thinking"] = Value::Bool(true),
+            Some("string-thinking") => {
+                body["thinking"] = Value::String("medium".into());
+            }
+            _ => body["reasoning_effort"] = Value::String("medium".into()),
+        }
     }
     body
 }
@@ -88,6 +114,14 @@ where
             .and_then(Value::as_str)
         {
             builder.thinking_delta(thinking);
+        }
+        if let Some(details) = delta["reasoning_details"].as_array() {
+            for detail in details {
+                if let Some(thinking) = detail["text"].as_str().or_else(|| detail["delta"].as_str())
+                {
+                    builder.thinking_delta(thinking);
+                }
+            }
         }
         if let Some(calls) = delta["tool_calls"].as_array() {
             for call in calls {

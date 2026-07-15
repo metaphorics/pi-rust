@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use futures_util::{StreamExt, stream};
 use pi_ai::{
@@ -10,7 +10,8 @@ use pi_ai::{
     http::{HttpByteStream, HttpError, HttpFuture, StreamHttpClient},
     types::{
         Api, AssistantMessage, AssistantMessageEvent, Content, Context, Message, Model, ModelCost,
-        ModelInput, StreamOptions, Tool, UserContent, UserMessage,
+        ModelInput, StopReason, StreamOptions, TextContent, ThinkingContent, Tool, ToolCall,
+        ToolResultMessage, Usage, UserContent, UserMessage,
     },
 };
 use serde::Deserialize;
@@ -67,6 +68,56 @@ fn context() -> Context {
             description: "Get weather".into(),
             parameters: json!({"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}),
         }],
+    }
+}
+
+fn tool_cycle_context() -> Context {
+    Context {
+        system_prompt: None,
+        messages: vec![
+            Message::Assistant(AssistantMessage {
+                content: vec![
+                    Content::Thinking(ThinkingContent {
+                        thinking: "Prior thought".into(),
+                        thinking_signature: None,
+                        redacted: None,
+                    }),
+                    Content::Text(TextContent {
+                        text: "Calling".into(),
+                        text_signature: None,
+                    }),
+                    Content::ToolCall(ToolCall {
+                        id: "call-original|fc_item".into(),
+                        name: "get_weather".into(),
+                        arguments: HashMap::from([("city".into(), json!("Paris"))]),
+                        thought_signature: None,
+                    }),
+                ],
+                api: Api::from("openai-responses"),
+                provider: "test-provider".into(),
+                model: "test-model".into(),
+                response_model: None,
+                response_id: None,
+                diagnostics: None,
+                usage: Usage::default(),
+                stop_reason: StopReason::ToolUse,
+                error_message: None,
+                timestamp: 0,
+            }),
+            Message::ToolResult(ToolResultMessage {
+                tool_call_id: "call-original|fc_item".into(),
+                tool_name: "get_weather".into(),
+                content: vec![Content::Text(TextContent {
+                    text: "Sunny".into(),
+                    text_signature: None,
+                })],
+                details: None,
+                added_tool_names: None,
+                is_error: false,
+                timestamp: 0,
+            }),
+        ],
+        tools: Vec::new(),
     }
 }
 
@@ -165,6 +216,56 @@ fn request_bodies_match_golden_fixtures() {
             "{api}"
         );
     }
+}
+
+#[test]
+fn provider_specific_request_compatibility_matches_goldens() {
+    let context = context();
+    let options = options();
+    let mut oauth_options = options.clone();
+    oauth_options.api_key = Some("sk-ant-oat-test".into());
+    assert_eq!(
+        anthropic_messages::build_request_body(
+            &model("anthropic-messages"),
+            &context,
+            &oauth_options
+        ),
+        fixture_json("request_anthropic_oauth.json")
+    );
+    let oauth_headers: HashMap<_, _> =
+        anthropic_messages::build_headers(&model("anthropic-messages"), &oauth_options)
+            .into_iter()
+            .collect();
+    assert_eq!(
+        serde_json::to_value(oauth_headers).unwrap(),
+        fixture_json("headers_anthropic_oauth.json")
+    );
+
+    let mut openai_model = model("openai-completions");
+    openai_model.reasoning = true;
+    openai_model.compat = Some(json!({
+        "maxTokensField":"max_tokens",
+        "thinkingFormat":"openrouter",
+        "supportsUsageInStreaming":false
+    }));
+    assert_eq!(
+        openai_completions::build_request_body(&openai_model, &context, &options),
+        fixture_json("request_openai_completions_compat.json")
+    );
+
+    let tool_context = tool_cycle_context();
+    assert_eq!(
+        openai_responses::build_request_body(&model("openai-responses"), &tool_context, &options),
+        fixture_json("request_openai_responses_tool_cycle.json")
+    );
+    assert_eq!(
+        mistral_conversations::build_request_body(
+            &model("mistral-conversations"),
+            &tool_context,
+            &options
+        ),
+        fixture_json("request_mistral_conversations_tool_cycle.json")
+    );
 }
 
 #[test]

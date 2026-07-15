@@ -102,18 +102,100 @@ pub fn anthropic_messages(context: &Context) -> Vec<Value> {
     messages
 }
 
+fn response_text_id(signature: Option<&str>, fallback: String) -> String {
+    let Some(signature) = signature.filter(|value| !value.is_empty()) else {
+        return fallback;
+    };
+    let id = serde_json::from_str::<crate::types::TextSignatureV1>(signature)
+        .map(|value| value.id)
+        .unwrap_or_else(|_| signature.to_owned());
+    if id.len() <= 64 { id } else { fallback }
+}
+
 pub fn responses_input(context: &Context) -> Vec<Value> {
     let mut input = Vec::new();
     if let Some(system) = &context.system_prompt {
-        input.push(json!({"role":"system","content":system}));
+        input.push(json!({"role":"system","content":[{"type":"input_text","text":system}]}));
     }
-    for message in openai_messages(&Context {
-        system_prompt: None,
-        ..context.clone()
-    }) {
-        match message.get("role").and_then(Value::as_str) {
-            Some("tool") => input.push(json!({"type":"function_call_output","call_id":message["tool_call_id"],"output":message["content"]})),
-            _ => input.push(message),
+    for (message_index, message) in context.messages.iter().enumerate() {
+        match message {
+            Message::User(user) => {
+                let content = match &user.content {
+                    UserContent::Text(text) => vec![json!({"type":"input_text","text":text})],
+                    UserContent::Blocks(blocks) => blocks
+                        .iter()
+                        .filter_map(|block| match block {
+                            Content::Text(text) => {
+                                Some(json!({"type":"input_text","text":text.text}))
+                            }
+                            Content::Image(image) => Some(json!({
+                                "type":"input_image",
+                                "image_url":format!("data:{};base64,{}", image.mime_type, image.data)
+                            })),
+                            _ => None,
+                        })
+                        .collect(),
+                };
+                input.push(json!({"role":"user","content":content}));
+            }
+            Message::Assistant(assistant) => {
+                let mut text_index = 0;
+                for block in &assistant.content {
+                    match block {
+                        Content::Text(text) if !text.text.is_empty() => {
+                            let fallback = if text_index == 0 {
+                                format!("msg_pi_{message_index}")
+                            } else {
+                                format!("msg_pi_{message_index}_{text_index}")
+                            };
+                            let id = response_text_id(text.text_signature.as_deref(), fallback);
+                            text_index += 1;
+                            input.push(json!({
+                                "type":"message",
+                                "role":"assistant",
+                                "status":"completed",
+                                "id":id,
+                                "content":[{
+                                    "type":"output_text",
+                                    "text":text.text,
+                                    "annotations":[]
+                                }]
+                            }));
+                        }
+                        Content::ToolCall(call) => {
+                            let (call_id, item_id) = call
+                                .id
+                                .split_once('|')
+                                .map_or((call.id.as_str(), None), |(call_id, item_id)| {
+                                    (call_id, Some(item_id))
+                                });
+                            let mut item = json!({
+                                "type":"function_call",
+                                "call_id":call_id,
+                                "name":call.name,
+                                "arguments":serde_json::to_string(&call.arguments)
+                                    .unwrap_or_else(|_| "{}".into())
+                            });
+                            if let Some(item_id) = item_id {
+                                item["id"] = Value::String(item_id.to_owned());
+                            }
+                            input.push(item);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Message::ToolResult(result) => {
+                let call_id = result
+                    .tool_call_id
+                    .split_once('|')
+                    .map_or(result.tool_call_id.as_str(), |(call_id, _)| call_id);
+                input.push(json!({
+                    "type":"function_call_output",
+                    "call_id":call_id,
+                    "output":text_blocks(&result.content)
+                }));
+            }
         }
     }
     input

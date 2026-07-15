@@ -1,0 +1,34 @@
+{
+  "input": [
+    {
+      "content": [
+        {
+          "annotations": [],
+          "text": "Calling",
+          "type": "output_text"
+        }
+      ],
+      "id": "msg_pi_0",
+      "role": "assistant",
+      "status": "completed",
+      "type": "message"
+    },
+    {
+      "arguments": "{\"city\":\"Paris\"}",
+      "call_id": "call-original",
+      "id": "fc_item",
+      "name": "get_weather",
+      "type": "function_call"
+    },
+    {
+      "call_id": "call-original",
+      "output": "Sunny",
+      "type": "function_call_output"
+    }
+  ],
+  "max_output_tokens": 64,
+  "model": "test-model",
+  "store": false,
+  "stream": true,
+  "temperature": 0.2
+}
