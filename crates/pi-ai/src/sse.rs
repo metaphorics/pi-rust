@@ -6,20 +6,21 @@
 
 #[derive(Debug, Default)]
 pub struct SseParser {
-    pending: String,
+    pending: Vec<u8>,
     data: Vec<String>,
 }
 
 impl SseParser {
     pub fn push(&mut self, bytes: &[u8]) -> Vec<String> {
-        self.pending.push_str(&String::from_utf8_lossy(bytes));
+        self.pending.extend_from_slice(bytes);
         let mut events = Vec::new();
-        while let Some(newline) = self.pending.find('\n') {
-            let mut line = self.pending[..newline].to_owned();
-            self.pending.drain(..=newline);
-            if line.ends_with('\r') {
+        while let Some(newline) = self.pending.iter().position(|byte| *byte == b'\n') {
+            let mut line: Vec<u8> = self.pending.drain(..=newline).collect();
+            line.pop();
+            if line.last() == Some(&b'\r') {
                 line.pop();
             }
+            let line = String::from_utf8_lossy(&line);
             self.process_line(&line, &mut events);
         }
         events
@@ -29,6 +30,7 @@ impl SseParser {
         let mut events = Vec::new();
         if !self.pending.is_empty() {
             let line = std::mem::take(&mut self.pending);
+            let line = String::from_utf8_lossy(&line);
             self.process_line(&line, &mut events);
         }
         self.emit(&mut events);
@@ -83,5 +85,15 @@ mod tests {
             b"1}\r\ndata: tail\r\n\r\nid: ignored\r\ndata: done\r\n".as_slice(),
         ];
         assert_eq!(parse_sse_chunks(chunks), ["{\"a\":1}\ntail", "done"]);
+    }
+
+    #[test]
+    fn preserves_utf8_split_between_chunks() {
+        let event = "data: 안녕\n\n".as_bytes();
+        let split = event.iter().position(|byte| *byte >= 0x80).unwrap() + 1;
+        assert_eq!(
+            parse_sse_chunks([&event[..split], &event[split..]]),
+            ["안녕"]
+        );
     }
 }
