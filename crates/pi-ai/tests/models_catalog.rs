@@ -41,6 +41,12 @@ fn model() -> Model {
 fn generated_catalog_is_nonempty_and_deserializes() {
     assert!(MODELS.iter().any(|model| model.provider == "anthropic"));
     assert!(MODELS.iter().any(|model| model.provider == "openai"));
+    assert!(
+        MODELS
+            .windows(2)
+            .all(|pair| { (pair[0].provider, pair[0].id) <= (pair[1].provider, pair[1].id) }),
+        "generated catalog must be sorted by (provider, id)"
+    );
     for entry in MODELS {
         let model = entry
             .to_model()

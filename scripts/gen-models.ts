@@ -51,6 +51,17 @@ function rustRawString(value: string): string {
 	return `r${hashes}"${value}"${hashes}`;
 }
 
+function stableJson(value: unknown): string {
+	return JSON.stringify(value, (_key, item: unknown) => {
+		if (item === null || Array.isArray(item) || typeof item !== "object") return item;
+		return Object.fromEntries(
+			Object.entries(item as Record<string, unknown>).sort(([left], [right]) =>
+				left < right ? -1 : left > right ? 1 : 0,
+			),
+		);
+	});
+}
+
 const referenceRoot = findReferenceRoot();
 const providersDir = join(referenceRoot, "src/providers");
 const generatedSource = await Bun.file(join(referenceRoot, "src/models.generated.ts")).text();
@@ -89,7 +100,7 @@ const lines = [
 	"pub static MODELS: &[ModelEntry] = &[",
 ];
 for (const model of models) {
-	const raw = JSON.stringify(model);
+	const raw = stableJson(model);
 	lines.push("    ModelEntry {");
 	lines.push(`        provider: ${rustString(model.provider)},`);
 	lines.push(`        id: ${rustString(model.id)},`);
@@ -106,4 +117,5 @@ lines.push("];", "");
 
 const output = resolve(import.meta.dir, "../crates/pi-ai/src/models_generated.rs");
 await Bun.write(output, lines.join("\n"));
+// CI zero-diff gate: bun scripts/gen-models.ts && git diff --exit-code crates/pi-ai/src/models_generated.rs
 console.log(`Generated ${models.length} models from ${canonicalProviders.size} providers at ${output}`);
