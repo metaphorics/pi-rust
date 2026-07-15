@@ -13,14 +13,17 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, LazyLock},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use serde_json::{Map, Value, json};
-use tokio::sync::mpsc;
+use tokio::{
+    sync::mpsc,
+    time::Instant,
+};
 use tokio_tungstenite::{
     connect_async,
     tungstenite::{client::IntoClientRequest, http::HeaderValue, Message},
@@ -30,11 +33,12 @@ use crate::{
     event_stream::AssistantMessageEventStream,
     http::{ReqwestStreamHttpClient, StreamHttpClient},
     types::{
-        AssistantMessageEvent, Context, Model, StopReason, StreamOptions, Transport,
+        AssistantMessage, AssistantMessageEvent, Content, Context, Message as PiMessage, Model,
+        StopReason, StreamOptions, TextContent, ToolCall, Transport, Usage,
     },
 };
 
-use super::{common, openai_responses};
+use super::{common, openai_responses, transform_messages};
 
 pub const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const CODEX_INSTRUCTIONS: &str = "You are a helpful assistant.";
@@ -468,11 +472,19 @@ enum TurnEvent {
     Error(String),
 }
 
+/// Successful turn payload: response id + converted response items for continuation.
+struct TurnOutcome {
+    response_id: Option<String>,
+    response_items: Vec<Value>,
+}
+
 #[derive(Clone)]
 struct SessionWsHandle {
     tx: mpsc::Sender<SessionCommand>,
     created_at: Instant,
     last_used: Instant,
+    /// Oracle `busy`: true while a turn is in flight on the cached socket.
+    busy: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Drop every cached session socket (tests).
@@ -491,6 +503,112 @@ fn session_handle_is_live(handle: &SessionWsHandle, now: Instant) -> bool {
         && !handle.tx.is_closed()
 }
 
+/// Convert a completed assistant turn into response-input items (oracle
+/// `convertResponsesMessages(..., {includeSystemPrompt:false}).filter(type !== function_call_output)`).
+fn last_response_items_from_output(model: &Model, content: Vec<Content>) -> Vec<Value> {
+    let assistant = AssistantMessage {
+        content,
+        api: model.api.clone(),
+        provider: model.provider.clone(),
+        model: model.id.clone(),
+        response_model: None,
+        response_id: None,
+        diagnostics: None,
+        usage: Usage::default(),
+        stop_reason: StopReason::Stop,
+        error_message: None,
+        timestamp: 0,
+    };
+    let ctx = Context {
+        messages: vec![PiMessage::Assistant(assistant)],
+        tools: vec![],
+        system_prompt: None,
+    };
+    transform_messages::responses_input(&ctx)
+        .into_iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) != Some("function_call_output"))
+        .collect()
+}
+
+/// Reconstruct assistant content from `response.output` items of a completed frame.
+fn content_from_response_output(output: &[Value]) -> Vec<Content> {
+    let mut content = Vec::new();
+    for item in output {
+        match item.get("type").and_then(Value::as_str) {
+            Some("message") => {
+                if let Some(parts) = item.get("content").and_then(Value::as_array) {
+                    for part in parts {
+                        if part.get("type").and_then(Value::as_str) == Some("output_text") {
+                            let text = part
+                                .get("text")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default();
+                            if text.is_empty() {
+                                continue;
+                            }
+                            let text_signature = item
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .map(|id| {
+                                    serde_json::to_string(&crate::types::TextSignatureV1 {
+                                        v: 1,
+                                        id: id.to_owned(),
+                                        phase: None,
+                                    })
+                                    .unwrap_or_default()
+                                })
+                                .filter(|s| !s.is_empty());
+                            content.push(Content::Text(TextContent {
+                                text: crate::shared_text::SharedText::from_str(text),
+                                text_signature,
+                            }));
+                        }
+                    }
+                }
+            }
+            Some("function_call") => {
+                let call_id = item
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let item_id = item.get("id").and_then(Value::as_str);
+                let id = match item_id {
+                    Some(item_id) if !item_id.is_empty() => format!("{call_id}|{item_id}"),
+                    _ => call_id.to_owned(),
+                };
+                let name = item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let arguments = item
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .and_then(|raw| serde_json::from_str::<HashMap<String, Value>>(raw).ok())
+                    .unwrap_or_default();
+                content.push(Content::ToolCall(ToolCall {
+                    id,
+                    name,
+                    arguments,
+                    thought_signature: None,
+                }));
+            }
+            Some("reasoning") => {
+                // Persist the whole item as thinking_signature so responses_input can re-emit it.
+                if let Ok(sig) = serde_json::to_string(item) {
+                    content.push(Content::Thinking(crate::types::ThinkingContent {
+                        thinking: crate::shared_text::SharedText::default(),
+                        thinking_signature: Some(sig),
+                        redacted: None,
+                    }));
+                }
+            }
+            _ => {}
+        }
+    }
+    content
+}
+
 async fn acquire_session_handle(
     session_id: &str,
     url: &str,
@@ -498,27 +616,53 @@ async fn acquire_session_handle(
     connector: Arc<dyn WebSocketConnector>,
 ) -> Result<SessionWsHandle, String> {
     let now = Instant::now();
-    {
+    let busy_cached = {
         let mut guard = SESSION_WS_CACHE.lock();
         if let Some(existing) = guard.get(session_id).cloned() {
             if session_handle_is_live(&existing, now) {
-                if let Some(entry) = guard.get_mut(session_id) {
-                    entry.last_used = now;
+                // Oracle :1091 — busy cached socket → ephemeral (no reuse).
+                if existing.busy.load(std::sync::atomic::Ordering::SeqCst) {
+                    true
+                } else {
+                    if let Some(entry) = guard.get_mut(session_id) {
+                        entry.last_used = now;
+                        entry
+                            .busy
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    existing
+                        .busy
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    return Ok(existing);
                 }
-                return Ok(existing);
+            } else {
+                guard.remove(session_id);
+                false
             }
-            guard.remove(session_id);
+        } else {
+            false
         }
+    };
+    if busy_cached {
+        return connect_ephemeral_session_handle(url, headers, connector).await;
     }
 
     let socket = connector.connect(url, headers).await?;
     let (tx, rx) = mpsc::channel::<SessionCommand>(8);
     let created_at = Instant::now();
-    tokio::spawn(session_ws_task(session_id.to_owned(), socket, rx, created_at));
+    let busy = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    tokio::spawn(session_ws_task(
+        session_id.to_owned(),
+        socket,
+        rx,
+        created_at,
+        busy.clone(),
+    ));
     let handle = SessionWsHandle {
         tx,
         created_at,
         last_used: created_at,
+        busy,
     };
     SESSION_WS_CACHE
         .lock()
@@ -526,24 +670,89 @@ async fn acquire_session_handle(
     Ok(handle)
 }
 
+/// Ephemeral one-shot session task (oracle busy-path: connect without caching reuse).
+async fn connect_ephemeral_session_handle(
+    url: &str,
+    headers: &[(String, String)],
+    connector: Arc<dyn WebSocketConnector>,
+) -> Result<SessionWsHandle, String> {
+    let socket = connector.connect(url, headers).await?;
+    let (tx, rx) = mpsc::channel::<SessionCommand>(8);
+    let created_at = Instant::now();
+    let busy = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    // Empty session_id → task does not register in SESSION_WS_CACHE.
+    tokio::spawn(session_ws_task(
+        String::new(),
+        socket,
+        rx,
+        created_at,
+        busy.clone(),
+    ));
+    Ok(SessionWsHandle {
+        tx,
+        created_at,
+        last_used: created_at,
+        busy,
+    })
+}
+
 async fn session_ws_task(
     session_id: String,
     mut socket: Box<dyn WebSocketConn>,
     mut rx: mpsc::Receiver<SessionCommand>,
     created_at: Instant,
+    busy: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let mut continuation: Option<WsContinuation> = None;
     let mut last_used = Instant::now();
+    // Oracle scheduleSessionWebSocketExpiry: proactive close after idle TTL.
+    let idle_ttl = Duration::from_millis(SESSION_WEBSOCKET_CACHE_TTL_MS);
+    let max_age = Duration::from_millis(SESSION_WEBSOCKET_MAX_AGE_MS);
 
-    while let Some(cmd) = rx.recv().await {
+    loop {
+        let now = Instant::now();
+        let idle_deadline = last_used + idle_ttl;
+        let age_deadline = created_at + max_age;
+        let next_deadline = idle_deadline.min(age_deadline);
+        let wait = next_deadline.saturating_duration_since(now);
+
+        let cmd = tokio::select! {
+            biased;
+            maybe = rx.recv() => maybe,
+            _ = tokio::time::sleep(wait) => {
+                // Proactive eviction: only when not mid-turn (oracle idleTimer skips if busy).
+                if busy.load(std::sync::atomic::Ordering::SeqCst) {
+                    continue;
+                }
+                let now = Instant::now();
+                if is_session_ws_expired(created_at, now) || is_session_ws_idle_expired(last_used, now)
+                {
+                    break;
+                }
+                continue;
+            }
+        };
+
+        let Some(cmd) = cmd else {
+            break;
+        };
+
         let now = Instant::now();
         if is_session_ws_expired(created_at, now) || is_session_ws_idle_expired(last_used, now) {
             let _ = cmd
                 .events
                 .send(TurnEvent::Error("websocket session expired".into()))
                 .await;
+            while let Ok(queued) = rx.try_recv() {
+                let _ = queued
+                    .events
+                    .send(TurnEvent::Error("websocket session expired".into()))
+                    .await;
+            }
             break;
         }
+
+        busy.store(true, std::sync::atomic::Ordering::SeqCst);
 
         let full_body = cmd.body;
         let request_body = if cmd.use_cached_context {
@@ -566,65 +775,90 @@ async fn session_ws_task(
             Ok(s) => s,
             Err(error) => {
                 let _ = cmd.events.send(TurnEvent::Error(error.to_string())).await;
+                busy.store(false, std::sync::atomic::Ordering::SeqCst);
                 continue;
             }
         };
 
         if let Err(error) = socket.send_text(payload).await {
             let _ = cmd.events.send(TurnEvent::Error(error)).await;
+            while let Ok(queued) = rx.try_recv() {
+                let _ = queued
+                    .events
+                    .send(TurnEvent::Error("websocket session closed".into()))
+                    .await;
+            }
             break;
         }
 
         match stream_ws_turn(&mut *socket, &cmd.events).await {
-            Ok(response_id) => {
+            Ok(outcome) => {
                 last_used = Instant::now();
-                if let Some(rid) = response_id.clone() {
-                    continuation = Some(WsContinuation {
-                        last_request_body: full_body,
-                        last_response_id: rid,
-                        // Full response-item conversion is not ported; empty items
-                        // still enable previous_response_id chaining when input grows
-                        // only by assistant-visible deltas the client appends.
-                        last_response_items: Vec::new(),
-                    });
+                if let Some(rid) = outcome.response_id.clone() {
+                    if cmd.use_cached_context {
+                        continuation = Some(WsContinuation {
+                            last_request_body: full_body,
+                            last_response_id: rid,
+                            last_response_items: outcome.response_items,
+                        });
+                    } else {
+                        continuation = None;
+                    }
                 } else {
                     continuation = None;
                 }
-                if let Some(entry) = SESSION_WS_CACHE.lock().get_mut(&session_id) {
+                if !session_id.is_empty()
+                    && let Some(entry) = SESSION_WS_CACHE.lock().get_mut(&session_id)
+                {
                     entry.last_used = last_used;
                 }
                 let _ = cmd
                     .events
                     .send(TurnEvent::Done {
-                        response_id,
+                        response_id: outcome.response_id,
                         reused,
                     })
                     .await;
+                busy.store(false, std::sync::atomic::Ordering::SeqCst);
+                // Busy-path sockets are one-shot and intentionally never cached.
+                if session_id.is_empty() {
+                    break;
+                }
             }
             Err(error) => {
                 // Socket is no longer reusable after a mid-turn failure.
                 let _ = cmd.events.send(TurnEvent::Error(error)).await;
+                while let Ok(queued) = rx.try_recv() {
+                    let _ = queued
+                        .events
+                        .send(TurnEvent::Error("websocket session closed".into()))
+                        .await;
+                }
                 break;
             }
         }
     }
 
     let _ = socket.close().await;
-    let mut guard = SESSION_WS_CACHE.lock();
-    if guard
-        .get(&session_id)
-        .is_some_and(|h| h.created_at == created_at)
-    {
-        guard.remove(&session_id);
+    if !session_id.is_empty() {
+        let mut guard = SESSION_WS_CACHE.lock();
+        if guard
+            .get(&session_id)
+            .is_some_and(|h| h.created_at == created_at)
+        {
+            guard.remove(&session_id);
+        }
     }
 }
 
-/// Read one WS turn, forwarding each frame immediately. Returns response_id.
+/// Read one WS turn, forwarding each frame immediately.
+/// Returns response_id + converted last_response_items for continuation baseline.
 async fn stream_ws_turn(
     socket: &mut dyn WebSocketConn,
     events: &mpsc::Sender<TurnEvent>,
-) -> Result<Option<String>, String> {
+) -> Result<TurnOutcome, String> {
     let mut response_id = None;
+    let mut response_items = Vec::new();
 
     loop {
         match socket.next().await? {
@@ -676,8 +910,37 @@ async fn stream_ws_turn(
                             return Err(message.into());
                         }
                         Some("response.completed" | "response.done" | "response.incomplete") => {
+                            // Capture response.output → last_response_items via responses_input.
+                            if let Some(output) =
+                                parsed.pointer("/response/output").and_then(Value::as_array)
+                            {
+                                let model = Model {
+                                    id: parsed
+                                        .pointer("/response/model")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("gpt-test")
+                                        .to_owned(),
+                                    name: String::new(),
+                                    api: crate::types::Api::from("openai-codex-responses"),
+                                    provider: "openai-codex".into(),
+                                    base_url: String::new(),
+                                    reasoning: false,
+                                    thinking_level_map: None,
+                                    input: vec![],
+                                    cost: crate::types::ModelCost::default(),
+                                    context_window: 0,
+                                    max_tokens: 0,
+                                    headers: None,
+                                    compat: None,
+                                };
+                                let content = content_from_response_output(output);
+                                response_items = last_response_items_from_output(&model, content);
+                            }
                             let _ = events.send(TurnEvent::Frame(text)).await;
-                            return Ok(response_id);
+                            return Ok(TurnOutcome {
+                                response_id,
+                                response_items,
+                            });
                         }
                         _ => {
                             let _ = events.send(TurnEvent::Frame(text)).await;
@@ -948,6 +1211,7 @@ async fn process_websocket_stream(
             .await
             .map_err(|_| "websocket session closed".to_owned())?;
 
+        let mut saw_terminal = false;
         while let Some(event) = events_rx.recv().await {
             match event {
                 TurnEvent::Frame(frame) => {
@@ -961,11 +1225,23 @@ async fn process_websocket_stream(
                     reused,
                 } => {
                     let _ = (response_id, reused);
+                    saw_terminal = true;
                     break;
                 }
                 TurnEvent::Error(error) => return Err(error),
             }
         }
+        // Finding #1: channel closed without Done/Error → orphaned turn is an error.
+        if !saw_terminal {
+            handle
+                .busy
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            return Err("websocket session closed before turn completed".into());
+        }
+        // Successful turn: release busy so idle timer can fire (oracle release keep=true).
+        handle
+            .busy
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     } else {
         // Ephemeral connection (no session id) — no reuse; still stream frames.
         let mut socket = connector.connect(url, headers).await?;
@@ -977,10 +1253,10 @@ async fn process_websocket_stream(
         let read = async {
             let result = stream_ws_turn(&mut *socket, &events_tx).await;
             match result {
-                Ok(response_id) => {
+                Ok(outcome) => {
                     let _ = events_tx
                         .send(TurnEvent::Done {
-                            response_id,
+                            response_id: outcome.response_id,
                             reused: false,
                         })
                         .await;
@@ -992,6 +1268,7 @@ async fn process_websocket_stream(
             let _ = socket.close().await;
         };
         let consume = async {
+            let mut saw_terminal = false;
             while let Some(event) = events_rx.recv().await {
                 match event {
                     TurnEvent::Frame(frame) => {
@@ -1005,10 +1282,14 @@ async fn process_websocket_stream(
                         reused,
                     } => {
                         let _ = (response_id, reused);
+                        saw_terminal = true;
                         break;
                     }
                     TurnEvent::Error(error) => return Err(error),
                 }
+            }
+            if !saw_terminal {
+                return Err("websocket session closed before turn completed".into());
             }
             Ok::<(), String>(())
         };
@@ -1094,6 +1375,8 @@ mod tests {
                 "output": [{
                     "type": "message",
                     "role": "assistant",
+                    "status": "completed",
+                    "id": format!("msg_{id}"),
                     "content": [{"type": "output_text", "text": text}]
                 }],
                 "usage": {
@@ -1103,6 +1386,48 @@ mod tests {
             }
         })
         .to_string()
+    }
+
+    /// Context that continues a prior turn: prior user + assistant reply + new user.
+    /// Assistant text_signature matches completed_frame's message id so
+    /// `responses_input` baseline equals lastInput + lastResponseItems.
+    fn continued_context(prior_user: &str, assistant_text: &str, response_id: &str, next_user: &str) -> Context {
+        let text_signature = serde_json::to_string(&crate::types::TextSignatureV1 {
+            v: 1,
+            id: format!("msg_{response_id}"),
+            phase: None,
+        })
+        .unwrap();
+        Context {
+            messages: vec![
+                Message::User(UserMessage {
+                    content: UserContent::Text(prior_user.into()),
+                    timestamp: 0,
+                }),
+                Message::Assistant(AssistantMessage {
+                    content: vec![Content::Text(TextContent {
+                        text: crate::shared_text::SharedText::from_str(assistant_text),
+                        text_signature: Some(text_signature),
+                    })],
+                    api: Api::from("openai-codex-responses"),
+                    provider: "openai-codex".into(),
+                    model: "gpt-test".into(),
+                    response_model: None,
+                    response_id: Some(response_id.into()),
+                    diagnostics: None,
+                    usage: Usage::default(),
+                    stop_reason: StopReason::Stop,
+                    error_message: None,
+                    timestamp: 0,
+                }),
+                Message::User(UserMessage {
+                    content: UserContent::Text(next_user.into()),
+                    timestamp: 1,
+                }),
+            ],
+            tools: vec![],
+            system_prompt: None,
+        }
     }
 
     // ----- mock WS -----
@@ -1544,9 +1869,11 @@ mod tests {
         );
         while s1.next().await.is_some() {}
 
+        // Second request extends first input with assistant items + new user turn.
+        // baseline = lastInput + lastResponseItems; delta is the single new user item.
         let mut s2 = stream_with_ws_connector(
             test_model(),
-            test_context("second"),
+            continued_context("first", "one", "resp-1", "second"),
             options,
             connector,
             None,
@@ -1560,10 +1887,125 @@ mod tests {
         );
         let sent = shared.sent.lock().clone();
         assert_eq!(sent.len(), 2, "two response.create frames on one socket");
-        for frame in &sent {
-            let parsed: Value = serde_json::from_str(frame).unwrap();
-            assert_eq!(parsed["type"], "response.create");
+        let first: Value = serde_json::from_str(&sent[0]).unwrap();
+        let second: Value = serde_json::from_str(&sent[1]).unwrap();
+        assert_eq!(first["type"], "response.create");
+        assert_eq!(second["type"], "response.create");
+        assert_eq!(
+            second["previous_response_id"].as_str(),
+            Some("resp-1"),
+            "reused socket must send previous_response_id delta, got {second}"
+        );
+        let delta = second["input"].as_array().expect("delta input array");
+        assert_eq!(
+            delta.len(),
+            1,
+            "delta must be exactly one new input item, got {delta:?}"
+        );
+        // New user turn is the sole delta item.
+        assert_eq!(delta[0]["role"], "user");
+        close_session_websockets(Some(&session));
+        clear_websocket_sse_fallback(Some(&session));
+    }
+
+    #[tokio::test]
+    async fn orphaned_turn_channel_close_is_error() {
+        // Empty inbound → socket returns None mid-turn → Error (not silent Ok).
+        let session = format!("sess-orphan-{}", common::now_ms());
+        clear_websocket_sse_fallback(Some(&session));
+        close_session_websockets(Some(&session));
+
+        let shared = MockWsShared::default();
+        {
+            let mut inbound = shared.inbound.lock().await;
+            // Explicit empty queue for the connection: next() → None immediately.
+            inbound.push(vec![]);
         }
+        let connector = Arc::new(MockWsConnector {
+            shared: shared.clone(),
+        });
+        // Force websocket-only so we don't fall back to SSE and mask the error.
+        let options = StreamOptions {
+            transport: Some(Transport::Websocket),
+            session_id: Some(session.clone()),
+            api_key: Some("tok".into()),
+            ..Default::default()
+        };
+        let mut stream = stream_with_ws_connector(
+            test_model(),
+            test_context("orphan"),
+            options,
+            connector,
+            None,
+        );
+        let mut saw_error = false;
+        while let Some(event) = stream.next().await {
+            if matches!(event, AssistantMessageEvent::Error { .. }) {
+                saw_error = true;
+            }
+        }
+        assert!(
+            saw_error,
+            "orphaned/closed turn must surface Error, not silent Ok"
+        );
+        close_session_websockets(Some(&session));
+        clear_websocket_sse_fallback(Some(&session));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn session_ws_proactive_idle_eviction() {
+        let session = format!("sess-idle-{}", common::now_ms());
+        clear_websocket_sse_fallback(Some(&session));
+        close_session_websockets(Some(&session));
+
+        let shared = MockWsShared::default();
+        {
+            let mut inbound = shared.inbound.lock().await;
+            // First connection: one successful turn, then idle-evicted.
+            inbound.push(vec![WsMessage::Text(completed_frame("resp-idle-1", "a"))]);
+            // Second connection after eviction.
+            inbound.push(vec![WsMessage::Text(completed_frame("resp-idle-2", "b"))]);
+        }
+        let connector = Arc::new(MockWsConnector {
+            shared: shared.clone(),
+        });
+        let options = StreamOptions {
+            transport: Some(Transport::WebsocketCached),
+            session_id: Some(session.clone()),
+            api_key: Some("tok".into()),
+            ..Default::default()
+        };
+
+        let mut s1 = stream_with_ws_connector(
+            test_model(),
+            test_context("idle-1"),
+            options.clone(),
+            connector.clone(),
+            None,
+        );
+        while s1.next().await.is_some() {}
+        assert_eq!(shared.connect_count.load(Ordering::SeqCst), 1);
+
+        // Advance past idle TTL; proactive timer must close the parked session task.
+        tokio::time::advance(Duration::from_millis(SESSION_WEBSOCKET_CACHE_TTL_MS + 50)).await;
+        // Yield so the session task's sleep wakes and removes itself.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        let mut s2 = stream_with_ws_connector(
+            test_model(),
+            test_context("idle-2"),
+            options,
+            connector,
+            None,
+        );
+        while s2.next().await.is_some() {}
+
+        assert_eq!(
+            shared.connect_count.load(Ordering::SeqCst),
+            2,
+            "idle eviction must force a new websocket connection"
+        );
         close_session_websockets(Some(&session));
         clear_websocket_sse_fallback(Some(&session));
     }

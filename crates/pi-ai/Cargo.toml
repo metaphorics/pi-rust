@@ -50,5 +50,5 @@ zstd = "0.13"
 tokio-tungstenite = { version = "0.26", default-features = true, features = ["rustls-tls-webpki-roots"] }
 
 [dev-dependencies]
-# Async test runtime and test macros.
-tokio = { workspace = true, features = ["macros", "rt"] }
+# Async test runtime, test macros, and paused clock for WebSocket TTL tests.
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
