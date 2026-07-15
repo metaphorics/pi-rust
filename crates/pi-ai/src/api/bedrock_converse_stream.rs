@@ -25,7 +25,7 @@ fn bedrock_messages(context: &Context) -> Vec<Value> {
 }
 
 pub fn build_request_body(model: &Model, context: &Context, options: &StreamOptions) -> Value {
-    let mut body = json!({"modelId":model.id,"messages":bedrock_messages(context),"inferenceConfig":{"maxTokens":options.max_tokens.unwrap_or(model.max_tokens)}});
+    let mut body = json!({"messages":bedrock_messages(context),"inferenceConfig":{"maxTokens":options.max_tokens.unwrap_or(model.max_tokens)}});
     if let Some(system) = &context.system_prompt {
         body["system"] = json!([{"text":system}]);
     }
