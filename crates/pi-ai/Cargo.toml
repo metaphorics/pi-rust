@@ -40,6 +40,14 @@ http = "1"
 percent-encoding = "2"
 # Low-overhead in-memory credential and stream synchronization.
 parking_lot = "0.12"
+# HMAC-SHA256 for hand-rolled AWS SigV4 (avoids aws-sigv4/smithy tree).
+hmac = "0.12"
+# CRC-32 for AWS eventstream prelude/message integrity checks.
+crc32fast = "1"
+# Codex SSE request body compression (Content-Encoding: zstd, level 3).
+zstd = "0.13"
+# Codex responses WebSocket transport (oracle uses WS with SSE fallback).
+tokio-tungstenite = { version = "0.26", default-features = true, features = ["rustls-tls-webpki-roots"] }
 
 [dev-dependencies]
 # Async test runtime and test macros.

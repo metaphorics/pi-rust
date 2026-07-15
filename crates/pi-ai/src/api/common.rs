@@ -319,12 +319,12 @@ pub trait WireEventDecoder: Send {
 }
 
 #[derive(Default)]
-struct JsonLineParser {
+pub(crate) struct JsonLineParser {
     pending: Vec<u8>,
 }
 
 impl JsonLineParser {
-    fn push(&mut self, bytes: &[u8]) -> Vec<String> {
+    pub(crate) fn push(&mut self, bytes: &[u8]) -> Vec<String> {
         self.pending.extend_from_slice(bytes);
         let mut lines = Vec::new();
         while let Some(newline) = self.pending.iter().position(|byte| *byte == b'\n') {
@@ -340,7 +340,7 @@ impl JsonLineParser {
         lines
     }
 
-    fn finish(mut self) -> Vec<String> {
+    pub(crate) fn finish(mut self) -> Vec<String> {
         if self.pending.is_empty() {
             Vec::new()
         } else {

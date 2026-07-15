@@ -10,6 +10,8 @@ mod common;
 mod incremental;
 pub use common::EventBuilder;
 
+pub(crate) mod aws_eventstream;
+pub(crate) mod aws_sigv4;
 pub mod anthropic_messages;
 pub mod azure_openai_responses;
 pub mod bedrock_converse_stream;
