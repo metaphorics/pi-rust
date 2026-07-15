@@ -1,0 +1,41 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # stable
+        with:
+          components: clippy, rustfmt
+      - name: cargo build
+        run: cargo build --workspace
+      - name: cargo test
+        run: cargo test --workspace
+      - name: cargo clippy
+        run: cargo clippy --workspace -- -D warnings
+      - name: cargo fmt
+        run: cargo fmt --check
+      - name: inkferro workspace build
+        working-directory: inkferro
+        run: cargo build --workspace
+
+  sidecar:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sidecar
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+      - name: bun install
+        run: bun install
+      - name: bun test
+        run: bun test
