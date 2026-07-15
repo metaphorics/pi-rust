@@ -60,14 +60,58 @@ fn segment_text(text: &str, is_atomic: Option<&dyn Fn(&str) -> bool>) -> Vec<Seg
     segment_word_bounds(text)
 }
 
+fn is_cjk_letter(c: char) -> bool {
+    // Ideographs / kana / hangul that ICU groups into single word-like runs.
+    let u = c as u32;
+    c.is_alphanumeric()
+        && ((0x3400..=0x4DBF).contains(&u)
+            || (0x4E00..=0x9FFF).contains(&u)
+            || (0xF900..=0xFAFF).contains(&u)
+            || (0x3040..=0x309F).contains(&u)
+            || (0x30A0..=0x30FF).contains(&u)
+            || (0xAC00..=0xD7AF).contains(&u))
+}
+
+fn is_cjk_word_run(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(is_cjk_letter)
+}
+
 fn segment_word_bounds(text: &str) -> Vec<Segment> {
-    let mut out = Vec::new();
+    let mut raw = Vec::new();
     for piece in text.split_word_bounds() {
-        out.push(Segment {
+        raw.push(Segment {
             len_utf16: utf16_len(piece),
             text: piece.to_owned(),
             is_word_like: is_word_like_segment(piece),
         });
+    }
+    merge_cjk_word_runs(raw)
+}
+
+fn merge_cjk_word_runs(raw: Vec<Segment>) -> Vec<Segment> {
+    // Intl.Segmenter groups consecutive CJK letters (你好) as one word-like
+    // segment. unicode-segmentation emits per-ideograph bounds; merge them.
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < raw.len() {
+        if raw[i].is_word_like && is_cjk_word_run(&raw[i].text) {
+            let mut combined = raw[i].text.clone();
+            let mut len = raw[i].len_utf16;
+            i += 1;
+            while i < raw.len() && raw[i].is_word_like && is_cjk_word_run(&raw[i].text) {
+                combined.push_str(&raw[i].text);
+                len += raw[i].len_utf16;
+                i += 1;
+            }
+            out.push(Segment {
+                len_utf16: len,
+                text: combined,
+                is_word_like: true,
+            });
+        } else {
+            out.push(raw[i].clone());
+            i += 1;
+        }
     }
     out
 }
@@ -106,7 +150,7 @@ fn segment_with_atomic(text: &str, is_atomic: &dyn Fn(&str) -> bool) -> Vec<Segm
         });
         byte += piece.len();
     }
-    out
+    merge_cjk_word_runs(out)
 }
 
 /// Longest atomic prefix of `text[byte..]` accepted by `is_atomic`, if any.
