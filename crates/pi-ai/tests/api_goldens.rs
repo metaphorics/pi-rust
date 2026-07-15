@@ -1,6 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use futures_util::{StreamExt, stream};
+use parking_lot::Mutex;
 use pi_ai::{
     api::{
         self, anthropic_messages, azure_openai_responses, bedrock_converse_stream,
@@ -200,7 +201,7 @@ fn final_text(message: &AssistantMessage) -> String {
         .content
         .iter()
         .filter_map(|content| match content {
-            Content::Text(text) => Some(text.text.as_str()),
+            Content::Text(text) => Some(text.text.as_string()),
             _ => None,
         })
         .collect()
@@ -331,6 +332,80 @@ impl MockHttp {
             Ok(body)
         })
     }
+}
+
+type HttpChunkReceiver = tokio::sync::mpsc::Receiver<Result<Vec<u8>, HttpError>>;
+
+struct GatedHttp {
+    receiver: Mutex<Option<HttpChunkReceiver>>,
+}
+
+impl StreamHttpClient for GatedHttp {
+    fn post_sse<'a>(
+        &'a self,
+        _url: &'a str,
+        _headers: &'a [(String, String)],
+        _body: &'a Value,
+    ) -> HttpFuture<'a> {
+        let receiver = self.receiver.lock().take().expect("single request");
+        Box::pin(async move {
+            let body: HttpByteStream = Box::pin(stream::unfold(receiver, |mut receiver| async {
+                receiver.recv().await.map(|item| (item, receiver))
+            }));
+            Ok(body)
+        })
+    }
+
+    fn post_json_stream<'a>(
+        &'a self,
+        url: &'a str,
+        headers: &'a [(String, String)],
+        body: &'a Value,
+    ) -> HttpFuture<'a> {
+        self.post_sse(url, headers, body)
+    }
+}
+
+#[tokio::test]
+async fn emits_provider_deltas_before_http_eof() {
+    let (sender, receiver) = tokio::sync::mpsc::channel(2);
+    let client = Arc::new(GatedHttp {
+        receiver: Mutex::new(Some(receiver)),
+    });
+    let mut events = api::stream_dispatch_with_client(
+        "openai-completions",
+        model("openai-completions"),
+        context(),
+        options(),
+        client,
+    );
+
+    let start = tokio::time::timeout(Duration::from_millis(250), events.next())
+        .await
+        .expect("start must arrive while HTTP remains open")
+        .unwrap();
+    assert_eq!(event_type(&start), "start");
+
+    sender
+        .send(Ok(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"finish_reason\":null}]}\n\n"
+                .to_vec(),
+        ))
+        .await
+        .unwrap();
+    let text_start = tokio::time::timeout(Duration::from_millis(250), events.next())
+        .await
+        .expect("text start must arrive before EOF")
+        .unwrap();
+    let text_delta = tokio::time::timeout(Duration::from_millis(250), events.next())
+        .await
+        .expect("text delta must arrive before EOF")
+        .unwrap();
+    assert_eq!(event_type(&text_start), "text_start");
+    assert_eq!(event_type(&text_delta), "text_delta");
+
+    drop(sender);
+    while events.next().await.is_some() {}
 }
 
 #[tokio::test]

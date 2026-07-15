@@ -8,7 +8,7 @@ use crate::{
     types::{AssistantMessageEvent, Context, Model, StopReason, StreamOptions},
 };
 
-use super::{common, openai_responses, openai_responses_shared};
+use super::{common, openai_responses};
 
 pub const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const CODEX_INSTRUCTIONS: &str = "You are a helpful assistant.";
@@ -67,7 +67,7 @@ where
     I: IntoIterator<Item = B>,
     B: AsRef<[u8]>,
 {
-    openai_responses_shared::parse_responses_stream(chunks, model)
+    common::decode_sse_chunks(chunks, super::incremental::decoder(model))
 }
 
 pub fn stream_with_client(
@@ -90,7 +90,6 @@ pub fn stream_with_client(
             body,
             json_stream: false,
         },
-        parse_stream_events,
     )
 }
 

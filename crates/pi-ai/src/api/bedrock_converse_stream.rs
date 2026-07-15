@@ -1,3 +1,6 @@
+//! Current transport covers bearer authentication and JSON/NDJSON fixtures.
+//! AWS SigV4 signing and binary eventstream decoding are budgeted separately.
+
 use std::sync::Arc;
 
 use serde_json::{Value, json};
@@ -11,7 +14,7 @@ use crate::{
     },
 };
 
-use super::common::{self, ApiResult, EventBuilder};
+use super::common::{self, ApiResult};
 
 fn bedrock_messages(context: &Context) -> Vec<Value> {
     context.messages.iter().map(|message| match message {
@@ -20,7 +23,7 @@ fn bedrock_messages(context: &Context) -> Vec<Value> {
             json!({"role":"user","content":blocks})
         }
         Message::Assistant(assistant) => json!({"role":"assistant","content":assistant.content.iter().filter_map(|item| match item { Content::Text(text) => Some(json!({"text":text.text})), Content::Thinking(thinking) => Some(json!({"reasoningContent":{"reasoningText":{"text":thinking.thinking,"signature":thinking.thinking_signature}}})), Content::ToolCall(call) => Some(json!({"toolUse":{"toolUseId":call.id,"name":call.name,"input":call.arguments}})), Content::Image(_) => None }).collect::<Vec<_>>() }),
-        Message::ToolResult(result) => json!({"role":"user","content":[{"toolResult":{"toolUseId":result.tool_call_id,"status":if result.is_error {"error"} else {"success"},"content":[{"text":result.content.iter().filter_map(|item| if let Content::Text(text)=item {Some(text.text.as_str())} else {None}).collect::<Vec<_>>().join("\n")} ]}}]}),
+        Message::ToolResult(result) => json!({"role":"user","content":[{"toolResult":{"toolUseId":result.tool_call_id,"status":if result.is_error {"error"} else {"success"},"content":[{"text":result.content.iter().filter_map(|item| if let Content::Text(text)=item {Some(text.text.as_string())} else {None}).collect::<Vec<_>>().join("\n")} ]}}]}),
     }).collect()
 }
 
@@ -57,78 +60,7 @@ where
     I: IntoIterator<Item = B>,
     B: AsRef<[u8]>,
 {
-    let mut bytes = Vec::new();
-    for chunk in chunks {
-        bytes.extend_from_slice(chunk.as_ref());
-    }
-    let text = String::from_utf8(bytes)
-        .map_err(|error| format!("invalid Bedrock JSON stream UTF-8: {error}"))?;
-    let mut builder = EventBuilder::new(model);
-    let mut reason = StopReason::Stop;
-    let mut block_keys = std::collections::HashMap::<u64, String>::new();
-    for line in text.lines().filter(|line| !line.trim().is_empty()) {
-        let event: Value = serde_json::from_str(line)
-            .map_err(|error| format!("invalid Bedrock stream JSON: {error}"))?;
-        if let Some(start) = event.get("contentBlockStart") {
-            let index = start["contentBlockIndex"].as_u64().unwrap_or(0);
-            let tool = &start["start"]["toolUse"];
-            if tool.is_object() {
-                let key = index.to_string();
-                block_keys.insert(index, key.clone());
-                builder.tool_call_start(
-                    &key,
-                    tool["toolUseId"].as_str().unwrap_or(&key),
-                    tool["name"].as_str().unwrap_or(""),
-                );
-            }
-        }
-        if let Some(delta) = event.get("contentBlockDelta") {
-            let index = delta["contentBlockIndex"].as_u64().unwrap_or(0);
-            let value = &delta["delta"];
-            if let Some(text) = value["text"].as_str() {
-                builder.text_delta(text);
-            }
-            if let Some(text) = value
-                .pointer("/reasoningContent/text")
-                .and_then(Value::as_str)
-            {
-                builder.thinking_delta(text);
-            }
-            if let Some(signature) = value
-                .pointer("/reasoningContent/signature")
-                .and_then(Value::as_str)
-            {
-                builder.set_thinking_signature(signature.to_owned());
-            }
-            if let Some(args) = value.pointer("/toolUse/input").and_then(Value::as_str) {
-                let key = block_keys
-                    .get(&index)
-                    .cloned()
-                    .unwrap_or_else(|| index.to_string());
-                builder.tool_call_delta(&key, args);
-            }
-        }
-        if let Some(stop) = event.get("messageStop") {
-            reason = common::stop_reason(stop["stopReason"].as_str());
-        }
-        if let Some(metadata) = event.get("metadata") {
-            let usage = &metadata["usage"];
-            builder.set_usage(
-                usage["inputTokens"].as_u64(),
-                usage["outputTokens"].as_u64(),
-                usage["cacheReadInputTokens"].as_u64(),
-                usage["cacheWriteInputTokens"].as_u64(),
-                None,
-            );
-        }
-        if let Some(message) = event
-            .pointer("/modelStreamErrorException/message")
-            .and_then(Value::as_str)
-        {
-            return Err(message.to_owned());
-        }
-    }
-    Ok(builder.finish(reason))
+    common::decode_json_chunks(chunks, super::incremental::decoder(model))
 }
 
 pub fn stream_with_client(
@@ -153,7 +85,6 @@ pub fn stream_with_client(
             body,
             json_stream: true,
         },
-        parse_stream_events,
     )
 }
 

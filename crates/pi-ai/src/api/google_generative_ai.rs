@@ -39,7 +39,7 @@ where
     I: IntoIterator<Item = B>,
     B: AsRef<[u8]>,
 {
-    google_shared::parse_google_stream(chunks, model)
+    common::decode_sse_chunks(chunks, super::incremental::decoder(model))
 }
 
 pub fn stream_with_client(
@@ -60,7 +60,6 @@ pub fn stream_with_client(
             body,
             json_stream: false,
         },
-        parse_stream_events,
     )
 }
 

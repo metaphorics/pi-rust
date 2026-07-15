@@ -7,6 +7,8 @@ use crate::{
 };
 
 mod common;
+mod incremental;
+pub use common::EventBuilder;
 
 pub mod anthropic_messages;
 pub mod azure_openai_responses;

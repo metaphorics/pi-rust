@@ -6,7 +6,7 @@ fn text_blocks(content: &[Content]) -> String {
     content
         .iter()
         .filter_map(|item| match item {
-            Content::Text(text) => Some(text.text.as_str()),
+            Content::Text(text) => Some(text.text.as_string()),
             _ => None,
         })
         .collect::<Vec<_>>()

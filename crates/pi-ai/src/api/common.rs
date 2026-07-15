@@ -11,6 +11,7 @@ use crate::{
     event_stream::AssistantMessageEventStream,
     http::StreamHttpClient,
     json_parse::parse_streaming_json,
+    sse::SseParser,
     types::{
         AssistantMessage, AssistantMessageEvent, Content, Model, StopReason, TextContent,
         ThinkingContent, ToolCall, Usage,
@@ -79,7 +80,7 @@ impl EventBuilder {
         let index = *self.text_index.get_or_insert_with(|| {
             let index = self.message.content.len();
             self.message.content.push(Content::Text(TextContent {
-                text: String::new(),
+                text: Default::default(),
                 text_signature: None,
             }));
             self.events.push(AssistantMessageEvent::TextStart {
@@ -89,7 +90,7 @@ impl EventBuilder {
             index
         });
         if let Content::Text(text) = &mut self.message.content[index] {
-            text.text.push_str(delta);
+            text.text = text.text.append(delta);
         }
         self.events.push(AssistantMessageEvent::TextDelta {
             content_index: index,
@@ -107,7 +108,7 @@ impl EventBuilder {
             self.message
                 .content
                 .push(Content::Thinking(ThinkingContent {
-                    thinking: String::new(),
+                    thinking: Default::default(),
                     thinking_signature: None,
                     redacted: None,
                 }));
@@ -118,7 +119,7 @@ impl EventBuilder {
             index
         });
         if let Content::Thinking(thinking) = &mut self.message.content[index] {
-            thinking.thinking.push_str(delta);
+            thinking.thinking = thinking.thinking.append(delta);
         }
         self.events.push(AssistantMessageEvent::ThinkingDelta {
             content_index: index,
@@ -183,6 +184,54 @@ impl EventBuilder {
         }
     }
 
+    pub fn end_tool_call(&mut self, key: &str) {
+        let Some(index) = self.tool_indexes.remove(key) else {
+            return;
+        };
+        self.tool_arguments.remove(key);
+        if let Content::ToolCall(tool_call) = self.message.content[index].clone() {
+            self.events.push(AssistantMessageEvent::ToolcallEnd {
+                content_index: index,
+                tool_call,
+                partial: self.message.clone(),
+            });
+        }
+    }
+
+    pub fn end_text(&mut self) {
+        let Some(index) = self.text_index.take() else {
+            return;
+        };
+        let content = match &self.message.content[index] {
+            Content::Text(text) => text.text.as_string(),
+            _ => String::new(),
+        };
+        self.events.push(AssistantMessageEvent::TextEnd {
+            content_index: index,
+            content,
+            partial: self.message.clone(),
+        });
+    }
+
+    pub fn end_thinking(&mut self) {
+        let Some(index) = self.thinking_index.take() else {
+            return;
+        };
+        let content = match &self.message.content[index] {
+            Content::Thinking(thinking) => thinking.thinking.as_string(),
+            _ => String::new(),
+        };
+        self.events.push(AssistantMessageEvent::ThinkingEnd {
+            content_index: index,
+            content,
+            partial: self.message.clone(),
+        });
+    }
+
+    pub fn drain_events(&mut self) -> Vec<AssistantMessageEvent> {
+        std::mem::take(&mut self.events)
+    }
+
     pub fn set_usage(
         &mut self,
         input: Option<u64>,
@@ -210,45 +259,27 @@ impl EventBuilder {
             + self.message.usage.cache_write;
     }
 
-    pub fn finish(mut self, reason: StopReason) -> Vec<AssistantMessageEvent> {
-        if let Some(index) = self.text_index {
-            let text = match &self.message.content[index] {
-                Content::Text(text) => text.text.clone(),
-                _ => String::new(),
-            };
-            self.events.push(AssistantMessageEvent::TextEnd {
-                content_index: index,
-                content: text,
-                partial: self.message.clone(),
-            });
-        }
-        if let Some(index) = self.thinking_index {
-            let content = match &self.message.content[index] {
-                Content::Thinking(value) => value.thinking.clone(),
-                _ => String::new(),
-            };
-            self.events.push(AssistantMessageEvent::ThinkingEnd {
-                content_index: index,
-                content,
-                partial: self.message.clone(),
-            });
-        }
-        let mut tools: Vec<_> = self.tool_indexes.into_iter().collect();
+    pub fn finalize(&mut self, reason: StopReason) {
+        self.end_text();
+        self.end_thinking();
+        let mut tools: Vec<_> = self
+            .tool_indexes
+            .iter()
+            .map(|(key, index)| (key.clone(), *index))
+            .collect();
         tools.sort_by_key(|(_, index)| *index);
-        for (_, index) in tools {
-            if let Content::ToolCall(call) = self.message.content[index].clone() {
-                self.events.push(AssistantMessageEvent::ToolcallEnd {
-                    content_index: index,
-                    tool_call: call,
-                    partial: self.message.clone(),
-                });
-            }
+        for (key, _) in tools {
+            self.end_tool_call(&key);
         }
         self.message.stop_reason = reason;
         self.events.push(AssistantMessageEvent::Done {
             reason,
-            message: self.message,
+            message: self.message.clone(),
         });
+    }
+
+    pub fn finish(mut self, reason: StopReason) -> Vec<AssistantMessageEvent> {
+        self.finalize(reason);
         self.events
     }
 }
@@ -279,6 +310,104 @@ pub fn merged_headers(
     result.into_iter().collect()
 }
 
+pub trait WireEventDecoder: Send {
+    fn initial_events(&mut self) -> Vec<AssistantMessageEvent> {
+        Vec::new()
+    }
+    fn push_frame(&mut self, frame: &str) -> ApiResult<Vec<AssistantMessageEvent>>;
+    fn finish(self: Box<Self>) -> ApiResult<Vec<AssistantMessageEvent>>;
+}
+
+#[derive(Default)]
+struct JsonLineParser {
+    pending: Vec<u8>,
+}
+
+impl JsonLineParser {
+    fn push(&mut self, bytes: &[u8]) -> Vec<String> {
+        self.pending.extend_from_slice(bytes);
+        let mut lines = Vec::new();
+        while let Some(newline) = self.pending.iter().position(|byte| *byte == b'\n') {
+            let mut line: Vec<u8> = self.pending.drain(..=newline).collect();
+            line.pop();
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            if !line.is_empty() {
+                lines.push(String::from_utf8_lossy(&line).into_owned());
+            }
+        }
+        lines
+    }
+
+    fn finish(mut self) -> Vec<String> {
+        if self.pending.is_empty() {
+            Vec::new()
+        } else {
+            vec![String::from_utf8_lossy(&std::mem::take(&mut self.pending)).into_owned()]
+        }
+    }
+}
+
+enum FrameParser {
+    Sse(SseParser),
+    JsonLines(JsonLineParser),
+}
+
+impl FrameParser {
+    fn push(&mut self, bytes: &[u8]) -> Vec<String> {
+        match self {
+            Self::Sse(parser) => parser.push(bytes),
+            Self::JsonLines(parser) => parser.push(bytes),
+        }
+    }
+
+    fn finish(self) -> Vec<String> {
+        match self {
+            Self::Sse(parser) => parser.finish(),
+            Self::JsonLines(parser) => parser.finish(),
+        }
+    }
+}
+
+pub fn decode_sse_chunks<I, B>(
+    chunks: I,
+    mut decoder: Box<dyn WireEventDecoder>,
+) -> ApiResult<Vec<AssistantMessageEvent>>
+where
+    I: IntoIterator<Item = B>,
+    B: AsRef<[u8]>,
+{
+    let mut events = decoder.initial_events();
+    for frame in crate::sse::parse_sse_chunks(chunks) {
+        events.extend(decoder.push_frame(&frame)?);
+    }
+    events.extend(decoder.finish()?);
+    Ok(events)
+}
+
+pub fn decode_json_chunks<I, B>(
+    chunks: I,
+    mut decoder: Box<dyn WireEventDecoder>,
+) -> ApiResult<Vec<AssistantMessageEvent>>
+where
+    I: IntoIterator<Item = B>,
+    B: AsRef<[u8]>,
+{
+    let mut parser = JsonLineParser::default();
+    let mut events = decoder.initial_events();
+    for chunk in chunks {
+        for frame in parser.push(chunk.as_ref()) {
+            events.extend(decoder.push_frame(&frame)?);
+        }
+    }
+    for frame in parser.finish() {
+        events.extend(decoder.push_frame(&frame)?);
+    }
+    events.extend(decoder.finish()?);
+    Ok(events)
+}
+
 pub struct WireRequest {
     pub url: String,
     pub headers: Vec<(String, String)>,
@@ -286,19 +415,16 @@ pub struct WireRequest {
     pub json_stream: bool,
 }
 
-pub fn spawn_stream<F>(
+pub fn spawn_stream(
     model: Model,
     client: Arc<dyn StreamHttpClient>,
     request: WireRequest,
-    parser: F,
-) -> AssistantMessageEventStream
-where
-    F: Fn(Vec<Vec<u8>>, &Model) -> ApiResult<Vec<AssistantMessageEvent>> + Send + Sync + 'static,
-{
+) -> AssistantMessageEventStream {
+    let mut decoder = super::incremental::decoder(&model);
     let stream = AssistantMessageEventStream::new();
     let producer = stream.clone();
     tokio::spawn(async move {
-        let result = async {
+        let result: ApiResult<()> = async {
             let mut response = if request.json_stream {
                 client
                     .post_json_stream(&request.url, &request.headers, &request.body)
@@ -309,28 +435,41 @@ where
                     .await
             }
             .map_err(|error| error.to_string())?;
-            let mut chunks = Vec::new();
-            while let Some(chunk) = response.next().await {
-                chunks.push(chunk.map_err(|error| error.to_string())?);
+            let mut frames = if request.json_stream {
+                FrameParser::JsonLines(JsonLineParser::default())
+            } else {
+                FrameParser::Sse(SseParser::default())
+            };
+            for event in decoder.initial_events() {
+                producer.push(event);
             }
-            parser(chunks, &model)
-        }
-        .await;
-        match result {
-            Ok(events) => {
-                for event in events {
+            while let Some(chunk) = response.next().await {
+                let chunk = chunk.map_err(|error| error.to_string())?;
+                for frame in frames.push(&chunk) {
+                    for event in decoder.push_frame(&frame)? {
+                        producer.push(event);
+                    }
+                }
+            }
+            for frame in frames.finish() {
+                for event in decoder.push_frame(&frame)? {
                     producer.push(event);
                 }
             }
-            Err(error) => {
-                let mut message = empty_message(&model);
-                message.stop_reason = StopReason::Error;
-                message.error_message = Some(error);
-                producer.push(AssistantMessageEvent::Error {
-                    reason: StopReason::Error,
-                    error: message,
-                });
+            for event in decoder.finish()? {
+                producer.push(event);
             }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = result {
+            let mut message = empty_message(&model);
+            message.stop_reason = StopReason::Error;
+            message.error_message = Some(error);
+            producer.push(AssistantMessageEvent::Error {
+                reason: StopReason::Error,
+                error: message,
+            });
         }
         producer.end(None);
     });
