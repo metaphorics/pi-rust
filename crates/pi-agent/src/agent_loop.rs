@@ -768,7 +768,10 @@ async fn execute_prepared_tool_call(
     emit: &AgentEventSink,
 ) -> ExecutedToolCallOutcome {
     let accepting = Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let update_events = Arc::new(parking_lot::Mutex::new(Vec::<()>::new()));
+    // JoinHandles for each tool_execution_update emit — awaited after execute
+    // settles (mirrors TS Promise.all(updateEvents) before tool_execution_end).
+    let update_handles =
+        Arc::new(parking_lot::Mutex::new(Vec::<tokio::task::JoinHandle<()>>::new()));
 
     let on_update: crate::types::AgentToolUpdateCallback = {
         let accepting = accepting.clone();
@@ -776,21 +779,16 @@ async fn execute_prepared_tool_call(
         let tool_call_id = prepared.tool_call.id.clone();
         let tool_name = prepared.tool_call.name.clone();
         let args = Value::Object(prepared.tool_call.arguments.clone().into_iter().collect());
-        let update_events = update_events.clone();
+        let update_handles = update_handles.clone();
         Arc::new(move |partial_result: AgentToolResult| {
             if !accepting.load(std::sync::atomic::Ordering::Acquire) {
                 return;
             }
-            // Fire-and-forget: schedule emit. The loop awaits a barrier after
-            // execute settles (mirrors TS Promise.all on updateEvents).
             let emit = emit.clone();
             let tool_call_id = tool_call_id.clone();
             let tool_name = tool_name.clone();
             let args = args.clone();
-            let update_events = update_events.clone();
-            // Record a slot so the post-execute barrier can wait for count.
-            update_events.lock().push(());
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 emit(AgentEvent::ToolExecutionUpdate {
                     tool_call_id,
                     tool_name,
@@ -799,6 +797,7 @@ async fn execute_prepared_tool_call(
                 })
                 .await;
             });
+            update_handles.lock().push(handle);
         })
     };
 
@@ -810,9 +809,14 @@ async fn execute_prepared_tool_call(
     )
     .await;
 
+    // Stop accepting new updates (oracle: both try and catch paths).
     accepting.store(false, std::sync::atomic::Ordering::Release);
-    // Best-effort drain: yield so spawned update tasks can run.
-    tokio::task::yield_now().await;
+    // Promise.all-style barrier: every scheduled update emit finishes before we
+    // return, so the caller emits tool_execution_end strictly after updates.
+    let handles = std::mem::take(&mut *update_handles.lock());
+    for handle in handles {
+        let _ = handle.await;
+    }
 
     match execute_result {
         Ok(result) => ExecutedToolCallOutcome {

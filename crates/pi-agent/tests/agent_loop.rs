@@ -1222,6 +1222,303 @@ async fn injects_steering_messages_after_tools() {
     assert!(saw_interrupt.load(Ordering::SeqCst));
 }
 
+/// Progress tool: emits mid-execute updates via the on_update callback, then
+/// optionally delays so a missing Promise.all-style barrier would let
+/// tool_execution_end race ahead of the update emits.
+fn progress_tool(
+    name: &str,
+    updates: usize,
+    hold_ms: u64,
+) -> Arc<ToolDefinition> {
+    let name_owned = name.to_owned();
+    Arc::new(ToolDefinition {
+        name: name_owned.clone(),
+        label: name_owned.clone(),
+        description: format!("{name_owned} with progress"),
+        parameters: object_schema(json!({"value": {"type": "string"}}), &["value"]),
+        execution_mode: None,
+        prepare_arguments: None,
+        execute: Arc::new(move |_id, params, _cancel, on_update| {
+            let hold_ms = hold_ms;
+            let updates = updates;
+            Box::pin(async move {
+                let value = params
+                    .get("value")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                if let Some(on_update) = on_update {
+                    for i in 0..updates {
+                        on_update(AgentToolResult {
+                            content: vec![text_content(format!("progress {i}: {value}"))],
+                            details: json!({ "step": i, "value": value }),
+                            added_tool_names: None,
+                            terminate: None,
+                        });
+                    }
+                }
+                if hold_ms > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(hold_ms)).await;
+                }
+                Ok(AgentToolResult {
+                    content: vec![text_content(format!("done: {value}"))],
+                    details: json!({ "value": value }),
+                    added_tool_names: None,
+                    terminate: None,
+                })
+            })
+        }),
+        renderer: None,
+    })
+}
+
+/// Sink that artificially delays tool_execution_update emits so a missing
+/// post-execute join barrier would surface as update-after-end ordering.
+fn delayed_update_sink(
+    events: Arc<Mutex<Vec<AgentEvent>>>,
+    update_delay: std::time::Duration,
+) -> pi_agent::AgentEventSink {
+    Arc::new(move |event| {
+        let events = events.clone();
+        let delay = update_delay;
+        Box::pin(async move {
+            if matches!(event, AgentEvent::ToolExecutionUpdate { .. }) {
+                tokio::time::sleep(delay).await;
+            }
+            events.lock().push(event);
+        })
+    })
+}
+
+/// For each tool_call_id, every tool_execution_update must appear before that
+/// tool's tool_execution_end (oracle: Promise.all(updateEvents) before end).
+fn assert_updates_precede_end_per_tool(events: &[AgentEvent]) {
+    use std::collections::HashMap;
+    let mut end_index: HashMap<&str, usize> = HashMap::new();
+    for (i, e) in events.iter().enumerate() {
+        if let AgentEvent::ToolExecutionEnd { tool_call_id, .. } = e {
+            end_index.insert(tool_call_id.as_str(), i);
+        }
+    }
+    assert!(
+        !end_index.is_empty(),
+        "expected at least one tool_execution_end, got {events:?}"
+    );
+    let mut saw_update = false;
+    for (i, e) in events.iter().enumerate() {
+        if let AgentEvent::ToolExecutionUpdate { tool_call_id, .. } = e {
+            saw_update = true;
+            let end_i = end_index
+                .get(tool_call_id.as_str())
+                .unwrap_or_else(|| panic!("update for {tool_call_id} without end"));
+            assert!(
+                i < *end_i,
+                "tool_execution_update for {tool_call_id} at index {i} must precede \
+                 tool_execution_end at {end_i}; types={:?}",
+                event_types(events)
+            );
+        }
+    }
+    assert!(saw_update, "expected at least one tool_execution_update");
+}
+
+/// After any tool_execution_end, no later tool_execution_update may belong to
+/// that same tool_call_id (no cross-tool interleave of a finished tool's updates).
+fn assert_no_update_after_own_end(events: &[AgentEvent]) {
+    use std::collections::HashSet;
+    let mut ended: HashSet<&str> = HashSet::new();
+    for e in events {
+        match e {
+            AgentEvent::ToolExecutionEnd { tool_call_id, .. } => {
+                ended.insert(tool_call_id.as_str());
+            }
+            AgentEvent::ToolExecutionUpdate { tool_call_id, .. } => {
+                assert!(
+                    !ended.contains(tool_call_id.as_str()),
+                    "tool_execution_update for {tool_call_id} after its tool_execution_end; \
+                     types={:?}",
+                    event_types(events)
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test]
+async fn tool_progress_updates_precede_execution_end() {
+    let tool = progress_tool("progress", 3, 0);
+    let context = AgentContext {
+        system_prompt: String::new(),
+        messages: vec![],
+        tools: vec![tool],
+    };
+    let mut config = base_config();
+    config.tool_execution = ToolExecutionMode::Sequential;
+
+    let first = create_assistant_message(
+        vec![tool_call("tool-p", "progress", json!({"value": "mid"}))],
+        StopReason::ToolUse,
+    );
+    let second = create_assistant_message(vec![text_block("done")], StopReason::Stop);
+    let stream_fn = scripted_stream_fn(vec![vec![done_message(first)], vec![done_message(second)]]);
+    let events = Arc::new(Mutex::new(Vec::new()));
+
+    let _ = run_agent_loop(
+        vec![create_user_message("progress once")],
+        context,
+        config,
+        // Delay update emits so a missing join barrier races end ahead of updates.
+        delayed_update_sink(events.clone(), std::time::Duration::from_millis(15)),
+        None,
+        stream_fn,
+    )
+    .await;
+
+    let events = events.lock();
+    let updates: Vec<_> = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::ToolExecutionUpdate { .. }))
+        .collect();
+    assert_eq!(updates.len(), 3, "expected 3 mid-execute progress updates");
+    assert_updates_precede_end_per_tool(&events);
+    assert_no_update_after_own_end(&events);
+}
+
+#[tokio::test]
+async fn parallel_tool_progress_updates_precede_each_end() {
+    // Two tools both emit progress; staggered completion + delayed update sink
+    // stress-tests that no tool's updates appear after its own end (and that
+    // the barrier is per-execute, not a global best-effort yield).
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let release = Arc::new(Mutex::new(Some(tx)));
+    let rx = Arc::new(Mutex::new(Some(rx)));
+
+    let rx2 = rx.clone();
+    let slow = Arc::new(ToolDefinition {
+        name: "slow".into(),
+        label: "Slow".into(),
+        description: "Slow tool with progress".into(),
+        parameters: object_schema(json!({"value": {"type": "string"}}), &["value"]),
+        execution_mode: None,
+        prepare_arguments: None,
+        execute: Arc::new(move |_id, params, _c, on_update| {
+            let rx2 = rx2.clone();
+            Box::pin(async move {
+                let value = params
+                    .get("value")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                if let Some(on_update) = on_update {
+                    on_update(AgentToolResult {
+                        content: vec![text_content(format!("slow-progress: {value}"))],
+                        details: json!({ "value": value, "step": 0 }),
+                        added_tool_names: None,
+                        terminate: None,
+                    });
+                    on_update(AgentToolResult {
+                        content: vec![text_content(format!("slow-progress-2: {value}"))],
+                        details: json!({ "value": value, "step": 1 }),
+                        added_tool_names: None,
+                        terminate: None,
+                    });
+                }
+                let rx = rx2.lock().take();
+                if let Some(rx) = rx {
+                    let _ = rx.await;
+                }
+                Ok(AgentToolResult {
+                    content: vec![text_content(format!("slow-done: {value}"))],
+                    details: json!({ "value": value }),
+                    added_tool_names: None,
+                    terminate: None,
+                })
+            })
+        }),
+        renderer: None,
+    });
+
+    let fast = progress_tool("fast", 2, 0);
+
+    let context = AgentContext {
+        system_prompt: String::new(),
+        messages: vec![],
+        tools: vec![slow, fast],
+    };
+    let mut config = base_config();
+    config.tool_execution = ToolExecutionMode::Parallel;
+
+    let first = create_assistant_message(
+        vec![
+            tool_call("tool-slow", "slow", json!({"value": "a"})),
+            tool_call("tool-fast", "fast", json!({"value": "b"})),
+        ],
+        StopReason::ToolUse,
+    );
+    let second = create_assistant_message(vec![text_block("done")], StopReason::Stop);
+    let stream_fn = scripted_stream_fn(vec![vec![done_message(first)], vec![done_message(second)]]);
+    let events = Arc::new(Mutex::new(Vec::new()));
+
+    let run = tokio::spawn({
+        let events = events.clone();
+        async move {
+            run_agent_loop(
+                vec![create_user_message("parallel progress")],
+                context,
+                config,
+                delayed_update_sink(events, std::time::Duration::from_millis(20)),
+                None,
+                stream_fn,
+            )
+            .await
+        }
+    });
+
+    // Let fast finish (and emit end) while slow is still held; without a join
+    // barrier, delayed slow updates could interleave after fast's end — or
+    // worse, after slow's own end once released.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    if let Some(tx) = release.lock().take() {
+        let _ = tx.send(());
+    }
+    let _ = run.await.unwrap();
+
+    let events = events.lock();
+    let update_ids: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolExecutionUpdate { tool_call_id, .. } => Some(tool_call_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        update_ids.iter().filter(|id| **id == "tool-slow").count(),
+        2,
+        "slow tool updates: {update_ids:?}"
+    );
+    assert_eq!(
+        update_ids.iter().filter(|id| **id == "tool-fast").count(),
+        2,
+        "fast tool updates: {update_ids:?}"
+    );
+
+    assert_updates_precede_end_per_tool(&events);
+    assert_no_update_after_own_end(&events);
+
+    // Cross-tool: once a tool ends, later events must not include that tool's
+    // updates (already covered), and each end is preceded by its own updates.
+    let types = event_types(&events);
+    assert!(
+        types.contains(&"tool_execution_update"),
+        "missing updates in {types:?}"
+    );
+    assert!(
+        types.contains(&"tool_execution_end"),
+        "missing ends in {types:?}"
+    );
+}
+
 // Silence unused import in create_model if ModelCostRates not needed.
 const _: ModelCostRates = ModelCostRates {
     input: 0.0,
