@@ -31,6 +31,14 @@ pub trait StreamHttpClient: Send + Sync {
         headers: &'a [(String, String)],
         body: &'a Value,
     ) -> HttpFuture<'a>;
+
+    /// POST raw bytes (zstd-compressed Codex SSE bodies, eventstream fixtures).
+    fn post_bytes<'a>(
+        &'a self,
+        url: &'a str,
+        headers: &'a [(String, String)],
+        body: &'a [u8],
+    ) -> HttpFuture<'a>;
 }
 
 #[derive(Clone, Debug)]
@@ -53,7 +61,20 @@ impl ReqwestStreamHttpClient {
         headers: &[(String, String)],
         body: &Value,
     ) -> Result<HttpByteStream, HttpError> {
-        let mut request = self.client.post(url).json(body);
+        let bytes = serde_json::to_vec(body).map_err(|error| HttpError::Status {
+            status: 0,
+            body: error.to_string(),
+        })?;
+        self.post_raw(url, headers, bytes).await
+    }
+
+    async fn post_raw(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+        body: Vec<u8>,
+    ) -> Result<HttpByteStream, HttpError> {
+        let mut request = self.client.post(url).body(body);
         for (name, value) in headers {
             request = request.header(name, value);
         }
@@ -91,5 +112,15 @@ impl StreamHttpClient for ReqwestStreamHttpClient {
         body: &'a Value,
     ) -> HttpFuture<'a> {
         Box::pin(self.post(url, headers, body))
+    }
+
+    fn post_bytes<'a>(
+        &'a self,
+        url: &'a str,
+        headers: &'a [(String, String)],
+        body: &'a [u8],
+    ) -> HttpFuture<'a> {
+        let body = body.to_vec();
+        Box::pin(async move { self.post_raw(url, headers, body).await })
     }
 }
