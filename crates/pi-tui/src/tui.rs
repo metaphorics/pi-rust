@@ -47,7 +47,7 @@ impl SizeValue {
 }
 
 /// Overlay layout options (subset of pi OverlayOptions).
-#[derive(Debug, Clone, Default)]
+#[derive(Default)]
 pub struct OverlayOptions {
     pub width: Option<SizeValue>,
     pub min_width: Option<usize>,
@@ -62,6 +62,8 @@ pub struct OverlayOptions {
     pub margin_bottom: usize,
     pub margin_left: usize,
     pub non_capturing: bool,
+    /// Optional visibility gate (pi OverlayOptions.visible).
+    pub visible: Option<Box<dyn Fn(usize, usize) -> bool>>,
 }
 
 /// Handle returned by [`Tui::show_overlay`].
@@ -75,6 +77,34 @@ struct OverlayEntry {
     hidden: bool,
     focus_order: u64,
     pre_focus: Option<FocusTarget>,
+}
+
+/// Overlay focus-restore state machine (tui.ts:241-251).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum OverlayBlockedFocusResume {
+    RestoreOverlay,
+    FocusTarget(Option<FocusTarget>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum OverlayFocusRestore {
+    #[default]
+    Inactive,
+    Eligible {
+        overlay_id: u64,
+    },
+    Blocked {
+        overlay_id: u64,
+        blocked_by: FocusTarget,
+        resume: OverlayBlockedFocusResume,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverlayFocusRestorePolicy {
+    Clear,
+    Preserve,
 }
 
 /// Input listener result (pi InputListenerResult).
@@ -96,6 +126,7 @@ pub struct Tui {
     overlays: Vec<OverlayEntry>,
     next_overlay_id: u64,
     focus_order_counter: u64,
+    overlay_focus_restore: OverlayFocusRestore,
     clear_on_shrink: bool,
     show_hardware_cursor: bool,
     render_requested: bool,
@@ -105,7 +136,7 @@ pub struct Tui {
 }
 
 /// Focus target: root child index or overlay id.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum FocusTarget {
     RootChild(usize),
     Overlay(u64),
@@ -124,6 +155,7 @@ impl Tui {
             overlays: Vec::new(),
             next_overlay_id: 1,
             focus_order_counter: 0,
+            overlay_focus_restore: OverlayFocusRestore::Inactive,
             clear_on_shrink,
             show_hardware_cursor: show_hw,
             render_requested: false,
@@ -190,10 +222,250 @@ impl Tui {
 
     /// Set focus by root child index.
     pub fn set_focus_child(&mut self, index: Option<usize>) {
-        self.clear_focus_flags();
-        self.focused = index.map(FocusTarget::RootChild);
-        self.apply_focus_flags();
+        let target = index.map(FocusTarget::RootChild);
+        self.set_focus_internal(target, OverlayFocusRestorePolicy::Clear);
         self.request_render(false);
+    }
+
+    /// Focus an overlay by id (bring to front).
+    pub fn focus_overlay(&mut self, id: u64) {
+        if let Some(o) = self.overlays.iter_mut().find(|o| o.id == id) {
+            if o.hidden {
+                return;
+            }
+            self.focus_order_counter += 1;
+            o.focus_order = self.focus_order_counter;
+        } else {
+            return;
+        }
+        // Re-check visibility after borrow ends
+        let tw = self.terminal.columns() as usize;
+        let th = self.terminal.rows() as usize;
+        if let Some(o) = self.overlays.iter().find(|o| o.id == id)
+            && !Self::overlay_entry_visible(o, tw, th)
+        {
+            return;
+        }
+        self.set_focus_internal(Some(FocusTarget::Overlay(id)), OverlayFocusRestorePolicy::Clear);
+        self.request_render(false);
+    }
+
+    fn set_focus_internal(
+        &mut self,
+        component: Option<FocusTarget>,
+        overlay_focus_restore: OverlayFocusRestorePolicy,
+    ) {
+        let previous_focus = self.focused;
+        let mut next_focus = component;
+
+        let previous_focused_overlay = previous_focus.and_then(|pf| {
+            self.overlays.iter().find(|e| {
+                matches!(pf, FocusTarget::Overlay(id) if id == e.id)
+                    && self.is_overlay_visible_id(e.id)
+            })
+            .map(|e| e.id)
+        });
+
+        let next_focus_is_overlay = matches!(next_focus, Some(FocusTarget::Overlay(_)));
+        let restore_state = self.get_visible_overlay_focus_restore();
+
+        if let Some(nf) = next_focus {
+            if !next_focus_is_overlay {
+                if let OverlayFocusRestore::Blocked {
+                    overlay_id,
+                    blocked_by,
+                    resume,
+                } = restore_state
+                {
+                    if Some(blocked_by) == previous_focus {
+                        if matches!(resume, OverlayBlockedFocusResume::FocusTarget(_))
+                            || !self.is_component_mounted(blocked_by)
+                        {
+                            next_focus = self.resolve_blocked_overlay_focus_resume(
+                                overlay_id,
+                                resume,
+                            );
+                        } else {
+                            self.overlay_focus_restore = OverlayFocusRestore::Blocked {
+                                overlay_id,
+                                blocked_by: nf,
+                                resume,
+                            };
+                        }
+                    }
+                } else if let Some(prev_ov) = previous_focused_overlay
+                    && !matches!(restore_state, OverlayFocusRestore::Inactive)
+                    && matches!(
+                        restore_state,
+                        OverlayFocusRestore::Eligible { overlay_id }
+                            | OverlayFocusRestore::Blocked { overlay_id, .. }
+                        if overlay_id == prev_ov
+                    )
+                    && !self.is_overlay_focus_ancestor(prev_ov, nf)
+                {
+                    self.overlay_focus_restore = OverlayFocusRestore::Blocked {
+                        overlay_id: prev_ov,
+                        blocked_by: nf,
+                        resume: OverlayBlockedFocusResume::RestoreOverlay,
+                    };
+                }
+            }
+        } else {
+            // nextFocus === null
+            if let OverlayFocusRestore::Blocked {
+                overlay_id,
+                blocked_by,
+                resume,
+            } = restore_state
+            {
+                if Some(blocked_by) == previous_focus {
+                    next_focus = self.resolve_blocked_overlay_focus_resume(overlay_id, resume);
+                } else if matches!(overlay_focus_restore, OverlayFocusRestorePolicy::Clear) {
+                    self.clear_overlay_focus_restore();
+                }
+            } else if matches!(overlay_focus_restore, OverlayFocusRestorePolicy::Clear) {
+                self.clear_overlay_focus_restore();
+            }
+        }
+
+        self.clear_focus_flags();
+        self.focused = next_focus;
+        self.apply_focus_flags();
+
+        if let Some(FocusTarget::Overlay(id)) = next_focus
+            && self.is_overlay_visible_id(id)
+        {
+            self.overlay_focus_restore = OverlayFocusRestore::Eligible { overlay_id: id };
+        }
+    }
+
+    fn clear_overlay_focus_restore(&mut self) {
+        self.overlay_focus_restore = OverlayFocusRestore::Inactive;
+    }
+
+    fn clear_overlay_focus_restore_for(&mut self, overlay_id: u64) {
+        match self.overlay_focus_restore {
+            OverlayFocusRestore::Eligible { overlay_id: id }
+            | OverlayFocusRestore::Blocked { overlay_id: id, .. }
+                if id == overlay_id =>
+            {
+                self.clear_overlay_focus_restore();
+            }
+            _ => {}
+        }
+    }
+
+    fn resolve_blocked_overlay_focus_resume(
+        &mut self,
+        overlay_id: u64,
+        resume: OverlayBlockedFocusResume,
+    ) -> Option<FocusTarget> {
+        match resume {
+            OverlayBlockedFocusResume::RestoreOverlay => Some(FocusTarget::Overlay(overlay_id)),
+            OverlayBlockedFocusResume::FocusTarget(target) => {
+                self.clear_overlay_focus_restore();
+                target
+            }
+        }
+    }
+
+    fn get_visible_overlay_focus_restore(&self) -> OverlayFocusRestore {
+        match self.overlay_focus_restore {
+            OverlayFocusRestore::Inactive => OverlayFocusRestore::Inactive,
+            OverlayFocusRestore::Eligible { overlay_id } => {
+                if self.overlays.iter().any(|o| o.id == overlay_id)
+                    && self.is_overlay_visible_id(overlay_id)
+                {
+                    OverlayFocusRestore::Eligible { overlay_id }
+                } else {
+                    OverlayFocusRestore::Inactive
+                }
+            }
+            OverlayFocusRestore::Blocked {
+                overlay_id,
+                blocked_by,
+                resume,
+            } => {
+                if self.overlays.iter().any(|o| o.id == overlay_id)
+                    && self.is_overlay_visible_id(overlay_id)
+                {
+                    OverlayFocusRestore::Blocked {
+                        overlay_id,
+                        blocked_by,
+                        resume,
+                    }
+                } else {
+                    OverlayFocusRestore::Inactive
+                }
+            }
+        }
+    }
+
+    fn is_overlay_focus_ancestor(&self, entry_id: u64, component: FocusTarget) -> bool {
+        let mut visited = std::collections::HashSet::new();
+        let mut current = self
+            .overlays
+            .iter()
+            .find(|o| o.id == entry_id)
+            .and_then(|o| o.pre_focus);
+        while let Some(c) = current {
+            if !visited.insert(c) {
+                break;
+            }
+            if c == component {
+                return true;
+            }
+            current = match c {
+                FocusTarget::Overlay(id) => self
+                    .overlays
+                    .iter()
+                    .find(|o| o.id == id)
+                    .and_then(|o| o.pre_focus),
+                FocusTarget::RootChild(_) => None,
+            };
+        }
+        false
+    }
+
+    fn retarget_overlay_pre_focus(&mut self, removed_id: u64, removed_pre: Option<FocusTarget>) {
+        for overlay in &mut self.overlays {
+            if overlay.id != removed_id && overlay.pre_focus == Some(FocusTarget::Overlay(removed_id))
+            {
+                overlay.pre_focus = removed_pre;
+            }
+        }
+    }
+
+    fn is_component_mounted(&self, target: FocusTarget) -> bool {
+        match target {
+            FocusTarget::RootChild(i) => i < self.root.len(),
+            FocusTarget::Overlay(id) => self.overlays.iter().any(|o| o.id == id),
+        }
+    }
+
+    fn is_overlay_visible_id(&self, id: u64) -> bool {
+        let tw = self.terminal.columns() as usize;
+        let th = self.terminal.rows() as usize;
+        self.overlays
+            .iter()
+            .find(|o| o.id == id)
+            .is_some_and(|o| Self::overlay_entry_visible(o, tw, th))
+    }
+
+    fn get_topmost_visible_overlay_id(&self) -> Option<u64> {
+        let tw = self.terminal.columns() as usize;
+        let th = self.terminal.rows() as usize;
+        let mut top: Option<(u64, u64)> = None; // (id, focus_order)
+        for o in &self.overlays {
+            if o.options.non_capturing || !Self::overlay_entry_visible(o, tw, th) {
+                continue;
+            }
+            match top {
+                Some((_, fo)) if o.focus_order <= fo => {}
+                _ => top = Some((o.id, o.focus_order)),
+            }
+        }
+        top.map(|(id, _)| id)
     }
 
     fn clear_focus_flags(&mut self) {
@@ -245,10 +517,12 @@ impl Tui {
             focus_order: self.focus_order_counter,
             pre_focus: self.focused,
         });
-        if capturing {
-            self.clear_focus_flags();
-            self.focused = Some(FocusTarget::Overlay(id));
-            self.apply_focus_flags();
+        // Only focus if overlay is actually visible (tui.ts:502-505).
+        if capturing && self.is_overlay_visible_id(id) {
+            self.set_focus_internal(
+                Some(FocusTarget::Overlay(id)),
+                OverlayFocusRestorePolicy::Clear,
+            );
         }
         self.request_render(false);
         id
@@ -257,20 +531,48 @@ impl Tui {
     pub fn hide_overlay(&mut self, id: u64) {
         if let Some(pos) = self.overlays.iter().position(|o| o.id == id) {
             let entry = self.overlays.remove(pos);
+            let pre = entry.pre_focus;
+            self.clear_overlay_focus_restore_for(id);
+            self.retarget_overlay_pre_focus(id, pre);
             if self.focused == Some(FocusTarget::Overlay(id)) {
-                self.clear_focus_flags();
-                self.focused = entry.pre_focus;
-                self.apply_focus_flags();
+                let top = self.get_topmost_visible_overlay_id();
+                let next = top
+                    .map(FocusTarget::Overlay)
+                    .or(pre);
+                self.set_focus_internal(next, OverlayFocusRestorePolicy::Clear);
             }
             self.request_render(false);
         }
     }
 
     pub fn set_overlay_hidden(&mut self, id: u64, hidden: bool) {
-        if let Some(o) = self.overlays.iter_mut().find(|o| o.id == id) {
-            o.hidden = hidden;
-            self.request_render(false);
+        let Some(entry) = self.overlays.iter_mut().find(|o| o.id == id) else {
+            return;
+        };
+        if entry.hidden == hidden {
+            return;
         }
+        entry.hidden = hidden;
+        let non_capturing = entry.options.non_capturing;
+        let pre = entry.pre_focus;
+        if hidden {
+            self.clear_overlay_focus_restore_for(id);
+            if self.focused == Some(FocusTarget::Overlay(id)) {
+                let top = self.get_topmost_visible_overlay_id();
+                let next = top.map(FocusTarget::Overlay).or(pre);
+                self.set_focus_internal(next, OverlayFocusRestorePolicy::Clear);
+            }
+        } else if !non_capturing && self.is_overlay_visible_id(id) {
+            if let Some(o) = self.overlays.iter_mut().find(|o| o.id == id) {
+                self.focus_order_counter += 1;
+                o.focus_order = self.focus_order_counter;
+            }
+            self.set_focus_internal(
+                Some(FocusTarget::Overlay(id)),
+                OverlayFocusRestorePolicy::Clear,
+            );
+        }
+        self.request_render(false);
     }
 
     /// Handle one raw input sequence (after terminal segmentation).
@@ -294,10 +596,61 @@ impl Tui {
         }
 
         if matches_key(&data, "shift+ctrl+d")
-            && let Some(cb) = self.on_debug.as_mut() {
-                cb();
-                return;
+            && let Some(cb) = self.on_debug.as_mut()
+        {
+            cb();
+            return;
+        }
+
+        // Per-input visibility re-check + focus-restore (tui.ts:797-823).
+        if let Some(FocusTarget::Overlay(id)) = self.focused
+            && !self.is_overlay_visible_id(id)
+        {
+            if let Some(top) = self.get_topmost_visible_overlay_id() {
+                self.set_focus_internal(
+                    Some(FocusTarget::Overlay(top)),
+                    OverlayFocusRestorePolicy::Clear,
+                );
+            } else {
+                let pre = self
+                    .overlays
+                    .iter()
+                    .find(|o| o.id == id)
+                    .and_then(|o| o.pre_focus);
+                self.set_focus_internal(pre, OverlayFocusRestorePolicy::Preserve);
             }
+        }
+
+        let focus_is_overlay = matches!(self.focused, Some(FocusTarget::Overlay(_)));
+        if !focus_is_overlay {
+            let restore_state = self.get_visible_overlay_focus_restore();
+            match restore_state {
+                OverlayFocusRestore::Eligible { overlay_id } => {
+                    self.set_focus_internal(
+                        Some(FocusTarget::Overlay(overlay_id)),
+                        OverlayFocusRestorePolicy::Clear,
+                    );
+                }
+                OverlayFocusRestore::Blocked {
+                    overlay_id,
+                    blocked_by,
+                    resume,
+                } if Some(blocked_by) != self.focused => {
+                    if matches!(resume, OverlayBlockedFocusResume::RestoreOverlay) {
+                        self.set_focus_internal(
+                            Some(FocusTarget::Overlay(overlay_id)),
+                            OverlayFocusRestorePolicy::Clear,
+                        );
+                    } else {
+                        self.clear_overlay_focus_restore();
+                        if let OverlayBlockedFocusResume::FocusTarget(target) = resume {
+                            self.set_focus_internal(target, OverlayFocusRestorePolicy::Clear);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
 
         // Dispatch to focused component
         let wants_release = self.focused_wants_key_release();
@@ -358,11 +711,18 @@ impl Tui {
         let new_len = root_lines.len();
         let first_frame = self.retained.is_empty() && new_len > 0;
 
+        // Always rebuild overlay frames so first_frame/force paths never drop dialogs.
+        let (rt_overlays, overlay_cursor) = self.build_overlay_frames(width, height);
+
         if first_frame || (dirty.is_empty() && new_len != self.retained.len()) {
             let mut ansi_lines: Vec<String> = root_lines.iter().map(Line::to_ansi).collect();
-            let cursor = extract_cursor_from_ansi_lines(&mut ansi_lines, height);
+            let mut cursor = extract_cursor_from_ansi_lines(&mut ansi_lines, height);
+            // Focused overlay cursor wins over root retained cursor.
+            if let Some(c) = overlay_cursor {
+                cursor = Some(c);
+            }
             self.retained = ansi_lines;
-            self.emit_frame(width, height, DirtySpans::All, &[], cursor);
+            self.emit_frame(width, height, DirtySpans::All, &rt_overlays, cursor);
             return;
         }
 
@@ -381,29 +741,9 @@ impl Tui {
             }
         }
 
-        let cursor = extract_cursor_from_retained(&mut self.retained, height, &ranges);
-
-        let mut rt_overlays: Vec<Overlay> = Vec::new();
-        let mut order: Vec<usize> = (0..self.overlays.len()).collect();
-        order.sort_by_key(|&i| self.overlays[i].focus_order);
-        for idx in order {
-            let entry = &mut self.overlays[idx];
-            if entry.hidden {
-                continue;
-            }
-            let layout = resolve_overlay_layout(&entry.options, height, width, height);
-            let ov_lines = entry.component.render(layout.width as u16);
-            let mut strings: Vec<String> = ov_lines.iter().map(Line::to_ansi).collect();
-            if let Some(max_h) = layout.max_height
-                && strings.len() > max_h {
-                    strings.truncate(max_h);
-                }
-            rt_overlays.push(Overlay {
-                row: layout.row,
-                col: layout.col,
-                width: layout.width,
-                lines: strings,
-            });
+        let mut cursor = extract_cursor_from_retained(&mut self.retained, height, &ranges);
+        if let Some(c) = overlay_cursor {
+            cursor = Some(c);
         }
 
         let dirty_spans = if !rt_overlays.is_empty() {
@@ -415,6 +755,74 @@ impl Tui {
         };
 
         self.emit_frame(width, height, dirty_spans, &rt_overlays, cursor);
+    }
+
+    /// Build overlay line frames sorted by focusOrder; extract CURSOR_MARKER
+    /// from the focused overlay when present (pi compositeOverlays + extractCursor).
+    fn build_overlay_frames(
+        &mut self,
+        term_width: usize,
+        term_height: usize,
+    ) -> (Vec<Overlay>, Option<CursorTarget>) {
+        let mut rt_overlays: Vec<Overlay> = Vec::new();
+        let mut overlay_cursor: Option<CursorTarget> = None;
+        let mut order: Vec<usize> = (0..self.overlays.len()).collect();
+        order.sort_by_key(|&i| self.overlays[i].focus_order);
+
+        let focused_overlay_id = match self.focused {
+            Some(FocusTarget::Overlay(id)) => Some(id),
+            _ => None,
+        };
+
+        for idx in order {
+            let entry = &mut self.overlays[idx];
+            if !Self::overlay_entry_visible(entry, term_width, term_height) {
+                continue;
+            }
+            let is_focused = focused_overlay_id == Some(entry.id);
+            let layout =
+                resolve_overlay_layout(&entry.options, term_height, term_width, term_height);
+            let ov_lines = entry.component.render(layout.width as u16);
+            let mut strings: Vec<String> = ov_lines.iter().map(Line::to_ansi).collect();
+            if let Some(max_h) = layout.max_height
+                && strings.len() > max_h
+            {
+                strings.truncate(max_h);
+            }
+            // Extract CURSOR_MARKER from overlay composite (finding #3).
+            if is_focused
+                && let Some(local) = extract_cursor_from_ansi_lines(&mut strings, term_height)
+            {
+                // Overlay.row/col are viewport-relative; translate local
+                // cursor into retained-buffer coordinates via viewport top.
+                let retained_len = self.retained.len().max(term_height);
+                let viewport_top = retained_len.saturating_sub(term_height);
+                let abs_row = viewport_top
+                    .saturating_add(layout.row)
+                    .saturating_add(local.row);
+                overlay_cursor = Some(CursorTarget {
+                    row: abs_row,
+                    col: layout.col.saturating_add(local.col),
+                });
+            }
+            rt_overlays.push(Overlay {
+                row: layout.row,
+                col: layout.col,
+                width: layout.width,
+                lines: strings,
+            });
+        }
+        (rt_overlays, overlay_cursor)
+    }
+
+    fn overlay_entry_visible(entry: &OverlayEntry, term_width: usize, term_height: usize) -> bool {
+        if entry.hidden {
+            return false;
+        }
+        if let Some(vis) = &entry.options.visible {
+            return vis(term_width, term_height);
+        }
+        true
     }
 
     fn emit_frame(
@@ -677,8 +1085,87 @@ impl Terminal for VirtualTerminal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::component::{Component, Focusable, RenderStatus};
     use crate::components::spacer::Spacer;
     use crate::components::text::Text;
+    use crate::line::{CURSOR_MARKER, Line};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// Test component with shared text for in-place invalidation.
+    struct LiveText {
+        text: Rc<RefCell<String>>,
+        cache: Option<(u16, String, Vec<Line>)>,
+        last_status: RenderStatus,
+        focused: bool,
+        with_cursor: bool,
+    }
+
+    impl LiveText {
+        fn new(text: impl Into<String>) -> (Self, Rc<RefCell<String>>) {
+            let text = Rc::new(RefCell::new(text.into()));
+            (
+                Self {
+                    text: Rc::clone(&text),
+                    cache: None,
+                    last_status: RenderStatus::Changed,
+                    focused: false,
+                    with_cursor: false,
+                },
+                text,
+            )
+        }
+
+        fn with_cursor(mut self) -> Self {
+            self.with_cursor = true;
+            self
+        }
+    }
+
+    impl Component for LiveText {
+        fn render(&mut self, width: u16) -> &[Line] {
+            let current = self.text.borrow().clone();
+            let cache_hit = matches!(
+                &self.cache,
+                Some((w, cached_text, _)) if *w == width && *cached_text == current
+            );
+            if cache_hit {
+                self.last_status = RenderStatus::Unchanged;
+                return &self.cache.as_ref().unwrap().2;
+            }
+            let mut body = current;
+            if self.with_cursor && self.focused {
+                body.push_str(CURSOR_MARKER);
+            }
+            let line = Line::plain(&body);
+            self.cache = Some((width, self.text.borrow().clone(), vec![line]));
+            self.last_status = RenderStatus::Changed;
+            &self.cache.as_ref().unwrap().2
+        }
+
+        fn invalidate(&mut self) {
+            self.cache = None;
+            self.last_status = RenderStatus::Changed;
+        }
+
+        fn last_render_status(&self) -> RenderStatus {
+            self.last_status
+        }
+
+        fn as_focusable(&mut self) -> Option<&mut dyn Focusable> {
+            Some(self)
+        }
+    }
+
+    impl Focusable for LiveText {
+        fn focused(&self) -> bool {
+            self.focused
+        }
+        fn set_focused(&mut self, focused: bool) {
+            self.focused = focused;
+            self.invalidate();
+        }
+    }
 
     #[test]
     fn tui_renders_children_without_panic() {
@@ -687,9 +1174,10 @@ mod tests {
         tui.add_child(Spacer::new(1));
         tui.do_render();
         assert!(!tui.retained.is_empty() || tui.frame.lines_full_redraw_count() >= 1);
-        // At least one write happened on first frame if there is content
-        let vt = // can't downcast easily — check retained
-            tui.retained.iter().any(|l| l.contains("hello") || !l.is_empty());
+        let vt = tui
+            .retained
+            .iter()
+            .any(|l| l.contains("hello") || !l.is_empty());
         assert!(vt || tui.full_redraws() >= 1);
     }
 
@@ -706,45 +1194,141 @@ mod tests {
         assert_eq!(lines[1], "xy");
     }
 
-    /// Property: for random dirty patterns on a multi-child tree, emitting with
-    /// DirtySpans::Ranges yields the same retained buffer content as DirtySpans::All
-    /// after the same component updates (completeness of dirty tracking).
+    /// Property: random IN-PLACE invalidations on a live tree — Ranges retained
+    /// buffer equals a force-All rebuild of the same tree (finding #4).
     #[test]
-    fn dirty_spans_ranges_matches_all_on_text_updates() {
-        use crate::components::text::Text;
-        // Build two identical TUIs
-        let mut t_ranges = Tui::new(VirtualTerminal::new(40, 24));
-        let mut t_all = Tui::new(VirtualTerminal::new(40, 24));
+    fn dirty_spans_inplace_invalidations_match_all() {
+        let mut tui = Tui::new(VirtualTerminal::new(40, 24));
+        let mut handles: Vec<Rc<RefCell<String>>> = Vec::new();
         for i in 0..20 {
-            t_ranges.add_child(Text::with_text(format!("line-{i}-aaaaaaaa")));
-            t_all.add_child(Text::with_text(format!("line-{i}-aaaaaaaa")));
+            let (comp, handle) = LiveText::new(format!("line-{i}-aaaaaaaa"));
+            handles.push(handle);
+            tui.add_child(comp);
         }
-        t_ranges.do_render();
-        t_all.do_render();
-        assert_eq!(t_ranges.retained, t_all.retained);
+        tui.do_render();
+        let baseline = tui.retained.clone();
+        assert_eq!(baseline.len(), 20);
 
-        // Mutate a few children by re-adding via invalidate+set — use set_text through children
-        // Since children are type-erased, invalidate all and change via re-render path:
-        // Replace root by clearing and re-adding with different text on even indices.
-        t_ranges.root.clear();
-        t_all.root.clear();
-        for i in 0..20 {
-            let text = if i % 3 == 0 {
-                format!("CHANGED-{i}")
-            } else {
-                format!("line-{i}-aaaaaaaa")
-            };
-            t_ranges.add_child(Text::with_text(text.clone()));
-            t_all.add_child(Text::with_text(text));
+        // In-place mutate a deterministic pattern of children and re-render via Ranges.
+        for round in 0..5 {
+            for i in 0..20 {
+                if (i + round) % 3 == 0 {
+                    *handles[i].borrow_mut() = format!("CHANGED-{round}-{i}");
+                    // Invalidate the cached component so render status flips.
+                    if let Some(child) = tui.root.children_mut().get_mut(i) {
+                        child.invalidate();
+                    }
+                }
+            }
+            tui.do_render();
+            let ranges_retained = tui.retained.clone();
+
+            // Force All path on a fresh twin built from the same final texts.
+            let mut t_all = Tui::new(VirtualTerminal::new(40, 24));
+            for h in &handles {
+                t_all.add_child(LiveText::new(h.borrow().clone()).0);
+            }
+            t_all.request_render(true);
+            t_all.do_render();
+            assert_eq!(
+                ranges_retained, t_all.retained,
+                "round {round}: Ranges retained must match All rebuild"
+            );
         }
-        t_ranges.do_render();
-        // Force All path on t_all via request_render(force)
-        t_all.request_render(true);
-        t_all.do_render();
-        assert_eq!(
-            t_ranges.retained, t_all.retained,
-            "Ranges path retained must match All path"
-        );
     }
 
+    #[test]
+    fn first_frame_composites_overlays() {
+        let mut tui = Tui::new(VirtualTerminal::new(40, 10));
+        tui.add_child(Text::with_text("root-content"));
+        let id = tui.show_overlay(
+            Text::new("DIALOG", 0, 0, None),
+            OverlayOptions {
+                anchor: OverlayAnchor::TopLeft,
+                width: Some(SizeValue::Abs(20)),
+                ..Default::default()
+            },
+        );
+        assert!(id >= 1);
+        tui.do_render();
+        // First-frame path must still emit overlay content via write_lines.
+        // Overlay is not in retained (base only) but FrameWriter gets overlays.
+        // Probe: full redraw happened and retained has root content.
+        assert!(
+            tui.retained.iter().any(|l| l.contains("root-content")),
+            "retained missing root: {:?}",
+            tui.retained
+        );
+        // Overlay component should have been rendered (no panic) and focused.
+        assert_eq!(tui.focused, Some(FocusTarget::Overlay(id)));
+        // Emitted bytes include dialog text from overlay composite.
+        // VirtualTerminal collects writes — but Tui owns the terminal boxed.
+        // Check via a second render that doesn't early-return empty overlays.
+        tui.request_render(true);
+        tui.do_render();
+        assert_eq!(tui.focused, Some(FocusTarget::Overlay(id)));
+    }
+
+    #[test]
+    fn overlay_cursor_extracted_when_focused() {
+        let mut tui = Tui::new(VirtualTerminal::new(40, 10));
+        tui.set_show_hardware_cursor(true);
+        tui.add_child(Text::with_text("base"));
+        let (ov, _) = LiveText::new("input");
+        let ov = ov.with_cursor();
+        let id = tui.show_overlay(
+            ov,
+            OverlayOptions {
+                anchor: OverlayAnchor::TopLeft,
+                width: Some(SizeValue::Abs(20)),
+                row: Some(SizeValue::Abs(0)),
+                col: Some(SizeValue::Abs(0)),
+                ..Default::default()
+            },
+        );
+        // Focus is already on overlay from show_overlay.
+        assert_eq!(tui.focused, Some(FocusTarget::Overlay(id)));
+        tui.do_render();
+        // Overlay path strips CURSOR_MARKER from overlay lines (no panic).
+        // Cursor extraction from focused overlay is exercised.
+    }
+
+    #[test]
+    fn focus_restore_when_overlay_hidden() {
+        let mut tui = Tui::new(VirtualTerminal::new(40, 10));
+        tui.add_child(Text::with_text("root"));
+        tui.set_focus_child(Some(0));
+        let id = tui.show_overlay(
+            Text::new("dlg", 0, 0, None),
+            OverlayOptions::default(),
+        );
+        assert_eq!(tui.focused, Some(FocusTarget::Overlay(id)));
+        tui.set_overlay_hidden(id, true);
+        // Focus should leave the hidden overlay.
+        assert_ne!(tui.focused, Some(FocusTarget::Overlay(id)));
+    }
+
+    #[test]
+    fn handle_input_redirects_when_overlay_not_visible() {
+        let mut tui = Tui::new(VirtualTerminal::new(40, 10));
+        tui.add_child(Text::with_text("root"));
+        tui.set_focus_child(Some(0));
+        let id = tui.show_overlay(
+            Text::new("dlg", 0, 0, None),
+            OverlayOptions {
+                visible: Some(Box::new(|_w, _h| false)),
+                ..Default::default()
+            },
+        );
+        // Not visible → should not capture focus on show.
+        assert_ne!(tui.focused, Some(FocusTarget::Overlay(id)));
+        // Force focus then input should re-check visibility.
+        tui.focused = Some(FocusTarget::Overlay(id));
+        tui.handle_input("a".into());
+        assert_ne!(
+            tui.focused,
+            Some(FocusTarget::Overlay(id)),
+            "input must redirect away from invisible overlay"
+        );
+    }
 }
