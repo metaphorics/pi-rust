@@ -629,6 +629,59 @@ fn selects_first_prefix_match_on_enter_when_typed_arg_not_exact() {
     assert_eq!(e.get_text(), "/argtest two");
 }
 
+/// Oracle: selects first prefix match when multiple items match.
+#[test]
+fn selects_first_prefix_match_when_multiple_items_match() {
+    struct P;
+    impl AutocompleteProvider for P {
+        fn get_suggestions(
+            &self,
+            lines: &[String],
+            _: usize,
+            col: usize,
+            _: SuggestionOptions,
+        ) -> Option<AutocompleteSuggestions> {
+            let text = &lines[0];
+            let before = &text[..utf16_to_byte(text, col)];
+            let re = regex::Regex::new(r"^/argtest\s+(\S+)$").unwrap();
+            let caps = re.captures(before)?;
+            let argument_text = caps.get(1)?.as_str();
+            Some(AutocompleteSuggestions {
+                // Deliberately unfiltered, as in the TypeScript oracle.
+                items: ["one", "two", "three"]
+                    .into_iter()
+                    .map(|value| AutocompleteItem {
+                        value: value.into(),
+                        label: value.into(),
+                        description: None,
+                    })
+                    .collect(),
+                prefix: argument_text.into(),
+            })
+        }
+        fn apply_completion(
+            &self,
+            lines: &[String],
+            line: usize,
+            col: usize,
+            item: &AutocompleteItem,
+            prefix: &str,
+        ) -> AppliedCompletion {
+            apply_completion(lines, line, col, item, prefix)
+        }
+    }
+    let t = tui();
+    let mut e = editor(&t);
+    e.set_autocomplete_provider(Box::new(P));
+    for ch in "/argtest t".chars() {
+        e.handle_input(&ch.to_string());
+    }
+    e.flush_autocomplete();
+    assert!(e.is_showing_autocomplete());
+    e.handle_input("\r");
+    assert_eq!(e.get_text(), "/argtest two");
+}
+
 #[test]
 fn awaits_async_slash_command_argument_completions() {
     fn load_skills_args(prefix: &str) -> Option<Vec<AutocompleteItem>> {

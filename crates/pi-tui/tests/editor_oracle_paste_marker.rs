@@ -354,6 +354,121 @@ fn snaps_to_the_paste_marker_start_when_navigating_down_into_it() {
     assert_eq!(e.get_cursor(), (2, 6));
 }
 
+/// Oracle: preserves sticky column when navigating through paste marker line.
+#[test]
+fn preserves_sticky_column_when_navigating_through_paste_marker_line() {
+    let t = tui_size(30, 24);
+    let mut e = editor(&t);
+
+    // Line 0: "1234567890123456" (16 chars)
+    // Line 1: "" (empty)
+    // Line 2: paste marker (~22 chars)
+    // Line 3: "" (empty)
+    // Line 4: "abcdefghijklmnop" (16 chars)
+    for ch in "1234567890123456".chars() {
+        e.handle_input(&ch.to_string());
+    }
+    e.handle_input("\n");
+    e.handle_input("\n");
+    e.handle_input(&format!("\x1b[200~{}\x1b[201~", "x".repeat(2000)));
+    e.handle_input("\n");
+    e.handle_input("\n");
+    for ch in "abcdefghijklmnop".chars() {
+        e.handle_input(&ch.to_string());
+    }
+    let _ = e.render(30);
+
+    // Navigate to line 0, col 10
+    for _ in 0..4 {
+        e.handle_input("\x1b[A");
+    }
+    e.handle_input("\x01");
+    for _ in 0..10 {
+        e.handle_input("\x1b[C");
+    }
+    assert_eq!(e.get_cursor(), (0, 10));
+
+    // Down to empty line - sticky col 10 established
+    e.handle_input("\x1b[B");
+    assert_eq!(e.get_cursor(), (1, 0));
+
+    // Down to paste marker - cursor snapped to col 0 (start of marker)
+    e.handle_input("\x1b[B");
+    assert_eq!(e.get_cursor(), (2, 0));
+
+    // Down to empty line
+    e.handle_input("\x1b[B");
+    assert_eq!(e.get_cursor(), (3, 0));
+
+    // Down to last line - should restore sticky col 10
+    e.handle_input("\x1b[B");
+    assert_eq!(e.get_cursor(), (4, 10));
+}
+
+/// Oracle: does not get stuck moving down from a multi-visual-line paste marker.
+#[test]
+fn does_not_get_stuck_moving_down_from_a_multi_visual_line_paste_marker() {
+    let t = tui_size(20, 24);
+    let mut e = editor(&t);
+
+    // Logical line 0: "abcdefgh" + marker(21 chars) + "ijklmnopqr"
+    // Logical line 1: "123456789012345678"
+    // Marker "[paste #1 +100 lines]" (21 chars) wider than terminal (20).
+    for ch in "abcdefgh".chars() {
+        e.handle_input(&ch.to_string());
+    }
+    let big_content = "line\n".repeat(100);
+    let big_content = big_content.trim_end();
+    e.handle_input(&format!("\x1b[200~{big_content}\x1b[201~"));
+    for ch in "ijklmnopqr".chars() {
+        e.handle_input(&ch.to_string());
+    }
+    e.handle_input("\n");
+    for ch in "123456789012345678".chars() {
+        e.handle_input(&ch.to_string());
+    }
+    let _ = e.render(20);
+
+    let text = e.get_text();
+    let re = regex::Regex::new(r"\[paste #\d+ \+\d+ lines\]").unwrap();
+    let marker = re
+        .find(&text)
+        .expect("paste marker should be created")
+        .as_str();
+    let marker_len = utf16_len(marker); // 21
+    assert!(marker_len > 20, "marker should be wider than terminal");
+    let marker_start = 8usize;
+    let marker_end = marker_start + marker_len; // 29
+
+    // Navigate to line 0, col 6 (on "g"). Preferred col 6 is past the
+    // marker tail on VL3, so the cursor should land on content ("i" at
+    // col 29) without snapping back.
+    e.handle_input("\x1b[A"); // Up to line 0
+    e.handle_input("\x01"); // Ctrl+A
+    for _ in 0..6 {
+        e.handle_input("\x1b[C");
+    }
+    assert_eq!(e.get_cursor(), (0, 6));
+
+    // Down: cursor lands on paste marker start
+    e.handle_input("\x1b[B");
+    assert_eq!(e.get_cursor(), (0, marker_start));
+
+    // Down again: preferred col 6 lands at VL3 col 29 ("i"), which is
+    // past the marker. Cursor stays on line 0.
+    e.handle_input("\x1b[B");
+    assert_eq!(e.get_cursor().0, 0);
+    assert_eq!(e.get_cursor().1, marker_end); // col 29 = "i"
+
+    // Up: back to paste marker
+    e.handle_input("\x1b[A");
+    assert_eq!(e.get_cursor(), (0, marker_start));
+
+    // Up again: back to col 6 ("g")
+    e.handle_input("\x1b[A");
+    assert_eq!(e.get_cursor(), (0, 6));
+}
+
 #[test]
 fn does_not_crash_when_text_plus_paste_marker_exceeds_width_with_cursor_on_marker() {
     let t = tui();

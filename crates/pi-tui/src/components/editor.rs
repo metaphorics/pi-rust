@@ -158,32 +158,7 @@ fn word_wrap_line_inner(
         }
         // Oversized atomic marker: split only for layout, retaining atomic editor behavior.
         if gwidth > max_width && atomic_markers && is_marker(grapheme) {
-            let mut pieces = Vec::new();
-            let mut piece = String::new();
-            let mut piece_width = 0;
-            let mut piece_start = 0;
-            for g in grapheme.graphemes(true) {
-                let gw = visible_width(g);
-                if !piece.is_empty() && piece_width + gw > max_width {
-                    let end = piece_start + utf16_len(&piece);
-                    pieces.push(TextChunk {
-                        text: std::mem::take(&mut piece),
-                        start_index: piece_start,
-                        end_index: end,
-                    });
-                    piece_start = end;
-                    piece_width = 0;
-                }
-                piece.push_str(g);
-                piece_width += gw;
-            }
-            if !piece.is_empty() {
-                pieces.push(TextChunk {
-                    end_index: piece_start + utf16_len(&piece),
-                    start_index: piece_start,
-                    text: piece,
-                });
-            }
+            let mut pieces = word_wrap_line_inner(grapheme, max_width, false, None);
             let last = pieces.pop().expect("marker has graphemes");
             for sub in pieces {
                 chunks.push(TextChunk {
