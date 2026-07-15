@@ -1050,9 +1050,18 @@ fn decode_mok_printable(data: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn kitty_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
 
     #[test]
     fn enter_and_ctrl_c() {
+        let _g = kitty_test_lock();
         set_kitty_protocol_active(false);
         assert!(matches_key("\r", "enter"));
         assert!(matches_key("\x03", "ctrl+c"));
@@ -1062,6 +1071,7 @@ mod tests {
 
     #[test]
     fn shift_enter_kitty_mode() {
+        let _g = kitty_test_lock();
         set_kitty_protocol_active(true);
         assert!(matches_key("\x1b\r", "shift+enter"));
         assert!(matches_key("\n", "shift+enter"));
@@ -1072,8 +1082,120 @@ mod tests {
 
     #[test]
     fn parse_key_basic() {
+        let _g = kitty_test_lock();
         set_kitty_protocol_active(false);
         assert_eq!(parse_key("\r").as_deref(), Some("enter"));
         assert_eq!(parse_key("\x03").as_deref(), Some("ctrl+c"));
+    }
+
+    #[test]
+    fn kitty_base_layout_non_latin() {
+        let _g = kitty_test_lock();
+        set_kitty_protocol_active(true);
+        // Cyrillic 'с' + base Latin 'c' with ctrl
+        assert!(matches_key("\x1b[1089::99;5u", "ctrl+c"));
+        assert!(matches_key("\x1b[1074::100;5u", "ctrl+d"));
+        assert!(matches_key("\x1b[1103::122;5u", "ctrl+z"));
+        // ctrl+shift+p via base layout
+        assert!(matches_key("\x1b[1079::112;6u", "ctrl+shift+p"));
+        // Latin without base still matches
+        assert!(matches_key("\x1b[99;5u", "ctrl+c"));
+        // Wrong key / wrong modifiers
+        assert!(!matches_key("\x1b[1089::99;5u", "ctrl+d"));
+        assert!(!matches_key("\x1b[1089::99;5u", "ctrl+shift+c"));
+        set_kitty_protocol_active(false);
+    }
+
+    #[test]
+    fn kitty_super_and_combined_modifiers() {
+        let _g = kitty_test_lock();
+        set_kitty_protocol_active(true);
+        assert!(matches_key("\x1b[107;9u", "super+k"));
+        assert!(matches_key("\x1b[13;9u", "super+enter"));
+        assert!(matches_key("\x1b[107;13u", "ctrl+super+k"));
+        assert!(matches_key("\x1b[107;14u", "ctrl+shift+super+k"));
+        assert!(!matches_key("\x1b[107;13u", "super+k"));
+        assert_eq!(parse_key("\x1b[107;9u").as_deref(), Some("super+k"));
+        assert_eq!(parse_key("\x1b[13;9u").as_deref(), Some("super+enter"));
+        assert_eq!(parse_key("\x1b[107;13u").as_deref(), Some("ctrl+super+k"));
+        set_kitty_protocol_active(false);
+    }
+
+    #[test]
+    fn kitty_digits_and_keypad_functional() {
+        let _g = kitty_test_lock();
+        set_kitty_protocol_active(true);
+        assert!(matches_key("\x1b[49u", "1"));
+        assert!(matches_key("\x1b[49;5u", "ctrl+1"));
+        assert!(!matches_key("\x1b[49;5u", "ctrl+2"));
+        assert_eq!(parse_key("\x1b[49u").as_deref(), Some("1"));
+        assert_eq!(parse_key("\x1b[49;5u").as_deref(), Some("ctrl+1"));
+
+        assert!(matches_key("\x1b[57400u", "1"));
+        assert!(matches_key("\x1b[57410u", "/"));
+        assert!(matches_key("\x1b[57417u", "left"));
+        assert!(matches_key("\x1b[57426u", "delete"));
+        assert_eq!(parse_key("\x1b[57399u").as_deref(), Some("0"));
+        assert_eq!(parse_key("\x1b[57409u").as_deref(), Some("."));
+        assert_eq!(parse_key("\x1b[57417u").as_deref(), Some("left"));
+        assert_eq!(parse_key("\x1b[57426u").as_deref(), Some("delete"));
+        set_kitty_protocol_active(false);
+    }
+
+    #[test]
+    fn kitty_shifted_and_event_type_formats() {
+        let _g = kitty_test_lock();
+        set_kitty_protocol_active(true);
+        assert!(matches_key("\x1b[99:67:99;2u", "shift+c"));
+        assert!(matches_key("\x1b[1089::99;5:3u", "ctrl+c")); // release still matches
+        assert!(matches_key("\x1b[1089:1057:99;6:2u", "ctrl+shift+c"));
+        // Prefer codepoint over base for Latin / symbols
+        assert!(matches_key("\x1b[107::118;5u", "ctrl+k"));
+        assert!(!matches_key("\x1b[107::118;5u", "ctrl+v"));
+        assert!(matches_key("\x1b[47::91;5u", "ctrl+/"));
+        assert!(!matches_key("\x1b[47::91;5u", "ctrl+["));
+        set_kitty_protocol_active(false);
+    }
+
+    #[test]
+    fn modify_other_keys_matching() {
+        let _g = kitty_test_lock();
+        set_kitty_protocol_active(false);
+        assert!(matches_key("\x1b[27;5;99~", "ctrl+c"));
+        assert_eq!(decode_printable_key("\x1b[27;2;69~").as_deref(), Some("E"));
+        assert_eq!(decode_printable_key("\x1b[27;2;196~").as_deref(), Some("Ä"));
+        assert_eq!(decode_printable_key("\x1b[27;2;32~").as_deref(), Some(" "));
+        assert_eq!(decode_printable_key("\x1b[27;2;13~"), None);
+    }
+
+    #[test]
+    fn decode_kitty_printable_keypad() {
+        let _g = kitty_test_lock();
+        assert_eq!(decode_kitty_printable("\x1b[57399u").as_deref(), Some("0"));
+        assert_eq!(decode_kitty_printable("\x1b[57400u").as_deref(), Some("1"));
+        assert_eq!(decode_kitty_printable("\x1b[57409u").as_deref(), Some("."));
+        assert_eq!(decode_kitty_printable("\x1b[57410u").as_deref(), Some("/"));
+        assert_eq!(decode_kitty_printable("\x1b[57411u").as_deref(), Some("*"));
+        assert_eq!(decode_kitty_printable("\x1b[57412u").as_deref(), Some("-"));
+        assert_eq!(decode_kitty_printable("\x1b[57413u").as_deref(), Some("+"));
+        assert_eq!(decode_kitty_printable("\x1b[57415u").as_deref(), Some("="));
+        assert_eq!(decode_kitty_printable("\x1b[57416u").as_deref(), Some(","));
+        // left arrow functional — not printable
+        assert_eq!(decode_kitty_printable("\x1b[57417u"), None);
+    }
+
+    #[test]
+    fn enter_mode_dependent_legacy_vs_kitty() {
+        let _g = kitty_test_lock();
+        set_kitty_protocol_active(false);
+        assert!(matches_key("\r", "enter"));
+        // Legacy: \x1b\r is alt+enter
+        assert!(matches_key("\x1b\r", "alt+enter"));
+        set_kitty_protocol_active(true);
+        // Kitty: \n and \x1b\r are shift+enter
+        assert!(matches_key("\n", "shift+enter"));
+        assert!(matches_key("\x1b\r", "shift+enter"));
+        assert!(!matches_key("\x1b\r", "alt+enter"));
+        set_kitty_protocol_active(false);
     }
 }
