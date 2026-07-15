@@ -6,3 +6,49 @@ license.workspace = true
 description = "pi-ai: types, event stream, wire protocols, auth, model catalog"
 
 [dependencies]
+# Wire-compatible JSON models and fixtures.
+serde = { workspace = true }
+# Dynamic provider metadata and OAuth extension fields.
+serde_json = { workspace = true }
+# Stable public errors for storage and OAuth operations.
+thiserror = { workspace = true }
+# Async streams, synchronization, filesystem, and timers.
+tokio = { workspace = true }
+# Rustls HTTP client for OAuth refresh and provider calls.
+reqwest = { workspace = true }
+# Millisecond-safe wall-clock timestamps without platform-specific code.
+jiff = { workspace = true }
+# Stream combinators used by SSE and event consumers.
+futures-util = "0.3"
+# Zero-copy HTTP body chunks.
+bytes = "1"
+# OAuth client constants, JWT payloads, and PKCE encoding.
+base64 = "0.22"
+# PKCE S256 challenge hashing.
+sha2 = "0.10"
+# Cryptographically secure PKCE verifier and OAuth state generation.
+rand = "0.8"
+# Wire-identical retry and overflow classifiers.
+regex = "1"
+# OAuth authorization URL construction and callback parsing.
+url = "2"
+# Object-safe async credential and OAuth provider interfaces.
+async-trait = "0.1"
+# Typed HTTP header maps shared by provider auth.
+http = "1"
+# Standards-compliant OAuth form encoding.
+percent-encoding = "2"
+# Low-overhead in-memory credential and stream synchronization.
+parking_lot = "0.12"
+# HMAC-SHA256 for hand-rolled AWS SigV4 (avoids aws-sigv4/smithy tree).
+hmac = "0.12"
+# CRC-32 for AWS eventstream prelude/message integrity checks.
+crc32fast = "1"
+# Codex SSE request body compression (Content-Encoding: zstd, level 3).
+zstd = "0.13"
+# Codex responses WebSocket transport (oracle uses WS with SSE fallback).
+tokio-tungstenite = { version = "0.26", default-features = true, features = ["rustls-tls-webpki-roots"] }
+
+[dev-dependencies]
+# Async test runtime, test macros, and paused clock for WebSocket TTL tests.
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }

@@ -1,0 +1,39 @@
+{
+  "max_tokens": 64,
+  "messages": [
+    {
+      "content": "Be concise.",
+      "role": "system"
+    },
+    {
+      "content": "Hello",
+      "role": "user"
+    }
+  ],
+  "model": "test-model",
+  "reasoning": {
+    "effort": "medium"
+  },
+  "stream": true,
+  "temperature": 0.2,
+  "tools": [
+    {
+      "function": {
+        "description": "Get weather",
+        "name": "get_weather",
+        "parameters": {
+          "properties": {
+            "city": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "city"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    }
+  ]
+}

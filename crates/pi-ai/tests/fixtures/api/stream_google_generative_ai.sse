@@ -1,0 +1,2 @@
+data: {"candidates":[{"content":{"parts":[{"text":"Think","thought":true,"thoughtSignature":"sig"},{"text":"Hello"},{"functionCall":{"id":"call-1","name":"get_weather","args":{"city":"Paris"}},"thoughtSignature":"tool-sig"}]},"finishReason":"TOOL_USE"}],"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":8,"thoughtsTokenCount":2}}
+

@@ -1,0 +1,31 @@
+{
+  "types": [
+    "start",
+    "thinking_start",
+    "thinking_delta",
+    "text_start",
+    "text_delta",
+    "toolcall_start",
+    "toolcall_delta",
+    "text_end",
+    "thinking_end",
+    "toolcall_end",
+    "done"
+  ],
+  "finalText": "Hello",
+  "thinkingText": "Think",
+  "toolName": "get_weather",
+  "toolArgsCity": "Paris",
+  "textDeltas": [
+    "Hello"
+  ],
+  "thinkingDeltas": [
+    "Think"
+  ],
+  "usageInput": 3,
+  "usageOutput": 8,
+  "stopReason": "toolUse",
+  "toolDeltas": [
+    "{\"city\":\"Paris\"}"
+  ]
+}

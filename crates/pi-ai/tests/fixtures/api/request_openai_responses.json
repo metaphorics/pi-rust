@@ -1,0 +1,45 @@
+{
+  "input": [
+    {
+      "content": [
+        {
+          "text": "Be concise.",
+          "type": "input_text"
+        }
+      ],
+      "role": "system"
+    },
+    {
+      "content": [
+        {
+          "text": "Hello",
+          "type": "input_text"
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "max_output_tokens": 64,
+  "model": "test-model",
+  "store": false,
+  "stream": true,
+  "temperature": 0.2,
+  "tools": [
+    {
+      "description": "Get weather",
+      "name": "get_weather",
+      "parameters": {
+        "properties": {
+          "city": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "city"
+        ],
+        "type": "object"
+      },
+      "type": "function"
+    }
+  ]
+}

@@ -1,0 +1,45 @@
+{
+  "include": [
+    "reasoning.encrypted_content"
+  ],
+  "input": [
+    {
+      "content": [
+        {
+          "text": "Hello",
+          "type": "input_text"
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "instructions": "Be concise.",
+  "model": "test-model",
+  "parallel_tool_calls": true,
+  "store": false,
+  "stream": true,
+  "temperature": 0.2,
+  "text": {
+    "verbosity": "low"
+  },
+  "tool_choice": "auto",
+  "tools": [
+    {
+      "description": "Get weather",
+      "name": "get_weather",
+      "parameters": {
+        "properties": {
+          "city": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "city"
+        ],
+        "type": "object"
+      },
+      "strict": null,
+      "type": "function"
+    }
+  ]
+}

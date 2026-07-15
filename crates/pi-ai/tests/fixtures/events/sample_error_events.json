@@ -1,0 +1,30 @@
+[
+  {
+    "type": "error",
+    "reason": "error",
+    "error": {
+      "role": "assistant",
+      "content": [],
+      "api": "openai-responses",
+      "provider": "openai",
+      "model": "gpt-5.4",
+      "usage": {
+        "input": 1,
+        "output": 1,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 2,
+        "cost": {
+          "input": 0.0,
+          "output": 0.0,
+          "cacheRead": 0.0,
+          "cacheWrite": 0.0,
+          "total": 0.0
+        }
+      },
+      "stopReason": "error",
+      "timestamp": 1740000000000,
+      "errorMessage": "fixture failure"
+    }
+  }
+]

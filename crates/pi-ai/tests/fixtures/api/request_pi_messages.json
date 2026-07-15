@@ -1,0 +1,34 @@
+{
+  "context": {
+    "messages": [
+      {
+        "content": "Hello",
+        "role": "user",
+        "timestamp": 0
+      }
+    ],
+    "systemPrompt": "Be concise.",
+    "tools": [
+      {
+        "description": "Get weather",
+        "name": "get_weather",
+        "parameters": {
+          "properties": {
+            "city": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "city"
+          ],
+          "type": "object"
+        }
+      }
+    ]
+  },
+  "model": "test-model",
+  "options": {
+    "maxTokens": 64,
+    "temperature": 0.2
+  }
+}
