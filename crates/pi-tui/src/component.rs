@@ -309,6 +309,7 @@ fn merge_ranges(mut ranges: Vec<std::ops::Range<usize>>) -> Vec<std::ops::Range<
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 mod tests {
     use super::*;
     use crate::line::Line;
@@ -537,6 +538,6 @@ mod tests {
         let _ = c.render(40);
         assert_eq!(c.cached.len(), 6);
         // Suffix from previous start of first child (0) through max(5,6)=6.
-        assert_eq!(c.dirty_ranges(), &[0..6]);
+        assert_eq!(c.dirty_ranges(), vec![0..6]);
     }
 }

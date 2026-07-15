@@ -14,7 +14,8 @@ pub mod truncated_text;
 
 pub use box_widget::BoxWidget;
 pub use editor::{
-    Editor, EditorOptions, EditorTheme, EditorTui, TextChunk, word_wrap_line, wordWrapLine,
+    Editor, EditorOptions, EditorTheme, EditorTui, TextChunk, word_wrap_line,
+    word_wrap_line_atomic, word_wrap_line_with_segments, wordWrapLine,
 };
 pub use image::{Image, ImageOptions, ImageTheme};
 pub use input::{Input, byte_to_utf16, utf16_len, utf16_to_byte};

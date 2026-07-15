@@ -2,9 +2,20 @@
 //!
 //! Cursor positions are **UTF-16 code-unit offsets** (JS string indices),
 //! matching TypeScript and `components::input::Input`.
+//!
+//! Segmentation strategy:
+//! - Default path uses `unicode-segmentation` word bounds (UAX #29 rule-based),
+//!   matching Node's `Intl.Segmenter` for Latin/punctuation cases that rely on
+//!   in-segment `PUNCTUATION_REGEX` splitting (`foo.bar`, `foo:bar`, …).
+//! - Consecutive CJK letter runs are re-segmented with ICU's dictionary-based
+//!   `WordSegmenter` so `你好世界` becomes `你好|世界` (not one glued run and
+//!   not four per-ideograph pieces). Justification for `icu_segmenter`:
+//!   unicode-segmentation is rule-only and cannot produce dictionary CJK
+//!   breaks; ICU4X matches V8/Node for the oracle cases.
 
 use std::sync::LazyLock;
 
+use icu_segmenter::WordSegmenter;
 use regex::Regex;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -17,6 +28,13 @@ static PUNCTUATION_IN_WORD: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"[(){}\[\]<>.,;:'"!?+\-=*/\\|&%^$#@~`]"#).expect("punct in word")
 });
 
+// Shared ICU auto word segmenter (dictionary for CJK, LSTM for other scripts).
+// WordSegmenter holds non-Sync DataPayload (Rc). Thread-local is enough:
+// editor word-nav is single-threaded per TUI thread, and construction is cheap
+// relative to the static data it references.
+thread_local! {
+    static ICU_WORD: WordSegmenter = WordSegmenter::new_auto();
+}
 #[derive(Debug, Clone)]
 struct Segment {
     /// UTF-16 length of this segment.
@@ -41,7 +59,9 @@ fn utf16_to_byte(s: &str, utf16_offset: usize) -> usize {
 }
 
 /// Word-like ≈ UAX #29 word piece that contains alphanumeric content
-/// (Intl.Segmenter `isWordLike`).
+/// (Intl.Segmenter `isWordLike`). Intentionally independent of ICU's
+/// `WordType` tag — ICU4X can mark later dictionary pieces non-word-like
+/// while Node still reports `isWordLike: true` for 你好 and 世界 alike.
 fn is_word_like_segment(seg: &str) -> bool {
     // Whole-segment Unicode punctuation is never word-like.
     if is_punctuation(seg) {
@@ -60,16 +80,87 @@ fn segment_text(text: &str, is_atomic: Option<&dyn Fn(&str) -> bool>) -> Vec<Seg
     segment_word_bounds(text)
 }
 
+/// CJK letter class used to detect runs that need dictionary re-segmentation.
+/// Includes BMP ideographs/kana/hangul plus CJK Unified Ideographs Extension
+/// B–H and compatibility ideographs (U+20000..U+3FFFF).
+fn is_cjk_letter(c: char) -> bool {
+    let u = c as u32;
+    c.is_alphanumeric()
+        && ((0x3400..=0x4DBF).contains(&u) // CJK Ext A
+            || (0x4E00..=0x9FFF).contains(&u) // CJK Unified
+            || (0xF900..=0xFAFF).contains(&u) // CJK Compatibility
+            || (0x3040..=0x309F).contains(&u) // Hiragana
+            || (0x30A0..=0x30FF).contains(&u) // Katakana
+            || (0xAC00..=0xD7AF).contains(&u) // Hangul Syllables
+            || (0x20000..=0x3FFFF).contains(&u)) // Ext B–H + compat supplement
+}
+
+fn is_cjk_word_run(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(is_cjk_letter)
+}
+
 fn segment_word_bounds(text: &str) -> Vec<Segment> {
-    let mut out = Vec::new();
+    let mut raw = Vec::new();
     for piece in text.split_word_bounds() {
-        out.push(Segment {
+        raw.push(Segment {
             len_utf16: utf16_len(piece),
             text: piece.to_owned(),
             is_word_like: is_word_like_segment(piece),
         });
     }
+    resegment_cjk_word_runs(raw)
+}
+
+/// Re-segment consecutive CJK letter pieces with ICU dictionary so that
+/// `你好世界` → `你好|世界` (matching Node Intl.Segmenter / V8 ICU).
+/// Non-CJK segments pass through unchanged so `foo.bar` still arrives as one
+/// word-like piece for `PUNCTUATION_IN_WORD` to split.
+fn resegment_cjk_word_runs(raw: Vec<Segment>) -> Vec<Segment> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < raw.len() {
+        if raw[i].is_word_like && is_cjk_word_run(&raw[i].text) {
+            let mut combined = raw[i].text.clone();
+            i += 1;
+            while i < raw.len() && raw[i].is_word_like && is_cjk_word_run(&raw[i].text) {
+                combined.push_str(&raw[i].text);
+                i += 1;
+            }
+            out.extend(icu_segment_cjk_run(&combined));
+        } else {
+            out.push(raw[i].clone());
+            i += 1;
+        }
+    }
     out
+}
+
+/// Dictionary-segment a pure CJK run. Boundaries come from ICU; word-like
+/// classification uses the alphanumeric heuristic (not ICU WordType).
+fn icu_segment_cjk_run(run: &str) -> Vec<Segment> {
+    ICU_WORD.with(|segmenter| {
+        let mut out = Vec::new();
+        let mut prev = 0usize;
+        for b in segmenter.segment_str(run) {
+            if b > prev {
+                let piece = &run[prev..b];
+                out.push(Segment {
+                    len_utf16: utf16_len(piece),
+                    text: piece.to_owned(),
+                    is_word_like: is_word_like_segment(piece),
+                });
+                prev = b;
+            }
+        }
+        if out.is_empty() && !run.is_empty() {
+            out.push(Segment {
+                len_utf16: utf16_len(run),
+                text: run.to_owned(),
+                is_word_like: is_word_like_segment(run),
+            });
+        }
+        out
+    })
 }
 
 fn segment_with_atomic(text: &str, is_atomic: &dyn Fn(&str) -> bool) -> Vec<Segment> {
@@ -106,7 +197,7 @@ fn segment_with_atomic(text: &str, is_atomic: &dyn Fn(&str) -> bool) -> Vec<Segm
         });
         byte += piece.len();
     }
-    out
+    resegment_cjk_word_runs(out)
 }
 
 /// Longest atomic prefix of `text[byte..]` accepted by `is_atomic`, if any.
@@ -339,5 +430,92 @@ mod tests {
         // skip "bye"
         let f3 = find_word_forward(t, f2, None);
         assert_eq!(f3, end);
+    }
+
+    /// Oracle word-navigation.test.ts "CJK mixed" — Node Intl.Segmenter
+    /// dictionary breaks 你好世界 as 你好|世界.
+    #[test]
+    fn cjk_mixed_oracle_backward() {
+        let text = "你好世界 test";
+        assert_eq!(find_word_backward(text, utf16_len(text), None), 5);
+        assert_eq!(find_word_backward(text, 5, None), 2);
+        assert_eq!(find_word_backward(text, 2, None), 0);
+    }
+
+    #[test]
+    fn cjk_mixed_oracle_forward() {
+        let text = "你好世界 test";
+        let first_end = find_word_forward(text, 0, None);
+        assert!(first_end > 0);
+        assert!(first_end <= 4);
+        let mut pos = 0;
+        while pos < utf16_len(text) {
+            let next = find_word_forward(text, pos, None);
+            if next == pos {
+                break;
+            }
+            pos = next;
+        }
+        assert_eq!(pos, utf16_len(text));
+    }
+
+    /// input.test.ts: "你好世界。你好，世界" segments as 你好|世界|。|你好|，|世界
+    #[test]
+    fn cjk_with_punctuation_oracle_segmentation() {
+        let text = "你好世界。你好，世界";
+        // From end: 世界 → ， → 你好 → 。 → 世界 → 你好
+        let end = utf16_len(text);
+        let c1 = find_word_backward(text, end, None);
+        assert_eq!(c1, utf16_len("你好世界。你好，"));
+        let c2 = find_word_backward(text, c1, None);
+        assert_eq!(c2, utf16_len("你好世界。你好"));
+        let c3 = find_word_backward(text, c2, None);
+        assert_eq!(c3, utf16_len("你好世界。"));
+        let c4 = find_word_backward(text, c3, None);
+        assert_eq!(c4, utf16_len("你好世界"));
+        let c5 = find_word_backward(text, c4, None);
+        assert_eq!(c5, utf16_len("你好"));
+        let c6 = find_word_backward(text, c5, None);
+        assert_eq!(c6, 0);
+    }
+
+    #[test]
+    fn dotted_identifier_oracle() {
+        let text = "foo.bar";
+        assert_eq!(find_word_backward(text, 7, None), 4);
+        assert_eq!(find_word_backward(text, 4, None), 3);
+        assert_eq!(find_word_backward(text, 3, None), 0);
+        assert_eq!(find_word_forward(text, 0, None), 3);
+        assert_eq!(find_word_forward(text, 3, None), 4);
+        assert_eq!(find_word_forward(text, 4, None), 7);
+    }
+
+    #[test]
+    fn path_oracle() {
+        let text = "path/to/file";
+        assert_eq!(find_word_backward(text, 12, None), 8);
+        assert_eq!(find_word_backward(text, 8, None), 7);
+        assert_eq!(find_word_backward(text, 7, None), 5);
+        assert_eq!(find_word_backward(text, 5, None), 4);
+        assert_eq!(find_word_backward(text, 4, None), 0);
+    }
+
+    #[test]
+    fn is_cjk_letter_includes_ext_b() {
+        // U+20000 CJK Ext B ideograph 𠀀
+        let c = char::from_u32(0x20000).expect("valid");
+        assert!(is_cjk_letter(c));
+        let c2 = char::from_u32(0x2A6DF).expect("valid Ext B end-ish");
+        assert!(is_cjk_letter(c2));
+        assert!(!is_cjk_letter('a'));
+        assert!(is_cjk_letter('你'));
+    }
+
+    #[test]
+    fn icu_dictionary_breaks_nihao_shijie() {
+        let segs = icu_segment_cjk_run("你好世界");
+        let texts: Vec<&str> = segs.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, ["你好", "世界"]);
+        assert!(segs.iter().all(|s| s.is_word_like));
     }
 }
