@@ -1,0 +1,674 @@
+//! Settings manager against `~/.pi/agent/settings.json` and project `.pi/settings.json`.
+//!
+//! Port of `packages/coding-agent/src/core/settings-manager.ts` (load/migrate/merge surface).
+
+use crate::config::{CONFIG_DIR_NAME, get_agent_dir, resolve_path};
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+use thiserror::Error;
+
+/// Result alias for settings operations.
+pub type Result<T, E = SettingsError> = std::result::Result<T, E>;
+
+#[derive(Debug, Error)]
+pub enum SettingsError {
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error("{0}")]
+    Message(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettingsScope {
+    Global,
+    Project,
+}
+
+/// Settings document — open object so unknown keys and field order round-trip.
+///
+/// Known fields are documented on the TypeScript `Settings` interface; we store
+/// the document as an ordered map for byte-compat and expose typed getters.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Settings(pub Map<String, Value>);
+
+impl Settings {
+    pub fn new() -> Self {
+        Self(Map::new())
+    }
+
+    pub fn get(&self, key: &str) -> Option<&Value> {
+        self.0.get(key)
+    }
+
+    pub fn get_str(&self, key: &str) -> Option<&str> {
+        self.0.get(key).and_then(|v| v.as_str())
+    }
+
+    pub fn get_bool(&self, key: &str) -> Option<bool> {
+        self.0.get(key).and_then(|v| v.as_bool())
+    }
+
+    pub fn insert(&mut self, key: impl Into<String>, value: Value) {
+        self.0.insert(key.into(), value);
+    }
+
+    pub fn as_map(&self) -> &Map<String, Value> {
+        &self.0
+    }
+
+    pub fn as_map_mut(&mut self) -> &mut Map<String, Value> {
+        &mut self.0
+    }
+}
+
+/// Deep merge: overrides win; nested objects merge one level (oracle `deepMergeSettings`).
+pub fn deep_merge_settings(base: &Settings, overrides: &Settings) -> Settings {
+    let mut result = base.clone();
+    for (key, override_value) in &overrides.0 {
+        if override_value.is_null() {
+            // still apply null? TS skips undefined only; null is an object-ish — apply.
+        }
+        let base_value = result.0.get(key);
+        if override_value.is_object()
+            && !override_value.as_object().map(|o| o.is_empty()).unwrap_or(true)
+            && base_value.map(|b| b.is_object()).unwrap_or(false)
+        {
+            let mut merged = base_value
+                .and_then(|b| b.as_object())
+                .cloned()
+                .unwrap_or_default();
+            if let Some(ov) = override_value.as_object() {
+                for (nk, nv) in ov {
+                    merged.insert(nk.clone(), nv.clone());
+                }
+            }
+            result.0.insert(key.clone(), Value::Object(merged));
+        } else {
+            result.0.insert(key.clone(), override_value.clone());
+        }
+    }
+    result
+}
+
+/// Migrate old settings shape to current (oracle `migrateSettings`). Idempotent.
+pub fn migrate_settings(mut settings: Map<String, Value>) -> Settings {
+    // queueMode → steeringMode
+    if settings.contains_key("queueMode") && !settings.contains_key("steeringMode") {
+        if let Some(v) = settings.remove("queueMode") {
+            settings.insert("steeringMode".into(), v);
+        }
+    } else {
+        settings.remove("queueMode");
+    }
+
+    // websockets boolean → transport enum
+    if !settings.contains_key("transport") {
+        if let Some(Value::Bool(ws)) = settings.remove("websockets") {
+            settings.insert(
+                "transport".into(),
+                Value::String(if ws { "websocket" } else { "sse" }.into()),
+            );
+        }
+    } else {
+        settings.remove("websockets");
+    }
+
+    // skills object → array + enableSkillCommands
+    if let Some(Value::Object(skills_obj)) = settings.get("skills").cloned()
+        && !skills_obj.contains_key("0") {
+            // treat as object form (not array — arrays deserialize as Array)
+        }
+    if let Some(Value::Object(skills_obj)) = settings.get("skills").cloned() {
+        // Only migrate object form
+        if let Some(enable) = skills_obj.get("enableSkillCommands")
+            && !settings.contains_key("enableSkillCommands") {
+                settings.insert("enableSkillCommands".into(), enable.clone());
+            }
+        if let Some(Value::Array(dirs)) = skills_obj.get("customDirectories") {
+            if !dirs.is_empty() {
+                settings.insert("skills".into(), Value::Array(dirs.clone()));
+            } else {
+                settings.remove("skills");
+            }
+        } else {
+            settings.remove("skills");
+        }
+    }
+
+    // retry.maxDelayMs → retry.provider.maxRetryDelayMs
+    if let Some(Value::Object(mut retry)) = settings.get("retry").cloned() {
+        let provider = retry
+            .get("provider")
+            .and_then(|p| p.as_object())
+            .cloned()
+            .unwrap_or_default();
+        if let Some(max_delay) = retry.get("maxDelayMs").cloned() {
+            let needs = provider
+                .get("maxRetryDelayMs")
+                .map(|v| v.is_null())
+                .unwrap_or(true);
+            if needs {
+                let mut provider = provider;
+                provider.insert("maxRetryDelayMs".into(), max_delay);
+                retry.insert("provider".into(), Value::Object(provider));
+            }
+        }
+        retry.remove("maxDelayMs");
+        settings.insert("retry".into(), Value::Object(retry));
+    }
+
+    Settings(settings)
+}
+
+fn parse_settings_text(content: &str) -> Result<Settings> {
+    let value: Value = serde_json::from_str(content)?;
+    let map = match value {
+        Value::Object(m) => m,
+        _ => Map::new(),
+    };
+    Ok(migrate_settings(map))
+}
+
+/// Storage backend for settings scopes.
+pub trait SettingsStorage {
+    fn with_lock(
+        &mut self,
+        scope: SettingsScope,
+        f: &mut dyn FnMut(Option<&str>) -> Option<String>,
+    );
+}
+
+/// File-backed settings storage.
+pub struct FileSettingsStorage {
+    global_settings_path: PathBuf,
+    project_settings_path: PathBuf,
+}
+
+impl FileSettingsStorage {
+    pub fn new(cwd: impl AsRef<Path>, agent_dir: impl AsRef<Path>) -> Self {
+        let cwd = resolve_path(&cwd.as_ref().to_string_lossy(), None);
+        let agent_dir = resolve_path(&agent_dir.as_ref().to_string_lossy(), None);
+        Self {
+            global_settings_path: agent_dir.join("settings.json"),
+            project_settings_path: cwd.join(CONFIG_DIR_NAME).join("settings.json"),
+        }
+    }
+
+    fn path(&self, scope: SettingsScope) -> &Path {
+        match scope {
+            SettingsScope::Global => &self.global_settings_path,
+            SettingsScope::Project => &self.project_settings_path,
+        }
+    }
+}
+
+impl SettingsStorage for FileSettingsStorage {
+    fn with_lock(
+        &mut self,
+        scope: SettingsScope,
+        f: &mut dyn FnMut(Option<&str>) -> Option<String>,
+    ) {
+        let path = self.path(scope).to_path_buf();
+        let current = fs::read_to_string(&path).ok();
+        let next = f(current.as_deref());
+        if let Some(content) = next {
+            if let Some(parent) = path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let _ = fs::write(&path, content);
+        }
+    }
+}
+
+/// In-memory settings storage (tests / ephemeral).
+#[derive(Default)]
+pub struct InMemorySettingsStorage {
+    global: Option<String>,
+    project: Option<String>,
+}
+
+impl SettingsStorage for InMemorySettingsStorage {
+    fn with_lock(
+        &mut self,
+        scope: SettingsScope,
+        f: &mut dyn FnMut(Option<&str>) -> Option<String>,
+    ) {
+        let current = match scope {
+            SettingsScope::Global => self.global.as_deref(),
+            SettingsScope::Project => self.project.as_deref(),
+        };
+        let next = f(current);
+        if let Some(content) = next {
+            match scope {
+                SettingsScope::Global => self.global = Some(content),
+                SettingsScope::Project => self.project = Some(content),
+            }
+        }
+    }
+}
+
+/// Loaded settings with global/project merge.
+pub struct SettingsManager {
+    storage: Box<dyn SettingsStorage + Send>,
+    global_settings: Settings,
+    project_settings: Settings,
+    settings: Settings,
+    project_trusted: bool,
+    modified_fields: HashSet<String>,
+    modified_nested_fields: HashMap<String, HashSet<String>>,
+    modified_project_fields: HashSet<String>,
+    modified_project_nested_fields: HashMap<String, HashSet<String>>,
+    global_settings_load_error: Option<String>,
+    project_settings_load_error: Option<String>,
+}
+
+impl SettingsManager {
+    fn from_parts(
+        storage: Box<dyn SettingsStorage + Send>,
+        global: Settings,
+        project: Settings,
+        global_err: Option<String>,
+        project_err: Option<String>,
+        project_trusted: bool,
+    ) -> Self {
+        let settings = deep_merge_settings(&global, &project);
+        Self {
+            storage,
+            global_settings: global,
+            project_settings: project,
+            settings,
+            project_trusted,
+            modified_fields: HashSet::new(),
+            modified_nested_fields: HashMap::new(),
+            modified_project_fields: HashSet::new(),
+            modified_project_nested_fields: HashMap::new(),
+            global_settings_load_error: global_err,
+            project_settings_load_error: project_err,
+        }
+    }
+
+    fn try_load(
+        storage: &mut dyn SettingsStorage,
+        scope: SettingsScope,
+        project_trusted: bool,
+    ) -> (Settings, Option<String>) {
+        if scope == SettingsScope::Project && !project_trusted {
+            return (Settings::new(), None);
+        }
+        let mut content: Option<String> = None;
+        storage.with_lock(scope, &mut |current| {
+            content = current.map(str::to_string);
+            None
+        });
+        match content {
+            None => (Settings::new(), None),
+            Some(text) => match parse_settings_text(&text) {
+                Ok(s) => (s, None),
+                Err(e) => (Settings::new(), Some(e.to_string())),
+            },
+        }
+    }
+
+    pub fn create(cwd: impl AsRef<Path>, agent_dir: Option<PathBuf>) -> Self {
+        let agent = agent_dir.unwrap_or_else(get_agent_dir);
+        let mut storage = FileSettingsStorage::new(cwd, agent);
+        let project_trusted = true;
+        let (global, gerr) = Self::try_load(&mut storage, SettingsScope::Global, project_trusted);
+        let (project, perr) = Self::try_load(&mut storage, SettingsScope::Project, project_trusted);
+        Self::from_parts(Box::new(storage), global, project, gerr, perr, project_trusted)
+    }
+
+    pub fn from_storage(
+        mut storage: Box<dyn SettingsStorage + Send>,
+        project_trusted: bool,
+    ) -> Self {
+        let (global, gerr) = Self::try_load(storage.as_mut(), SettingsScope::Global, project_trusted);
+        let (project, perr) =
+            Self::try_load(storage.as_mut(), SettingsScope::Project, project_trusted);
+        Self::from_parts(storage, global, project, gerr, perr, project_trusted)
+    }
+
+    pub fn in_memory(settings: Settings, project_trusted: bool) -> Self {
+        let mut storage = InMemorySettingsStorage::default();
+        let text = serde_json::to_string_pretty(&settings.0).unwrap_or_else(|_| "{}".into());
+        storage.with_lock(SettingsScope::Global, &mut |_| Some(text.clone()));
+        Self::from_storage(Box::new(storage), project_trusted)
+    }
+
+    pub fn settings(&self) -> &Settings {
+        &self.settings
+    }
+
+    pub fn global_settings(&self) -> &Settings {
+        &self.global_settings
+    }
+
+    pub fn project_settings(&self) -> &Settings {
+        &self.project_settings
+    }
+
+    pub fn is_project_trusted(&self) -> bool {
+        self.project_trusted
+    }
+
+    pub fn set_project_trusted(&mut self, trusted: bool) {
+        if self.project_trusted == trusted {
+            return;
+        }
+        self.project_trusted = trusted;
+        self.modified_project_fields.clear();
+        self.modified_project_nested_fields.clear();
+        if !trusted {
+            self.project_settings = Settings::new();
+            self.project_settings_load_error = None;
+            self.settings = deep_merge_settings(&self.global_settings, &self.project_settings);
+            return;
+        }
+        let (project, perr) =
+            Self::try_load(self.storage.as_mut(), SettingsScope::Project, true);
+        self.project_settings = project;
+        self.project_settings_load_error = perr;
+        self.settings = deep_merge_settings(&self.global_settings, &self.project_settings);
+    }
+
+    pub fn reload(&mut self) {
+        let (global, gerr) =
+            Self::try_load(self.storage.as_mut(), SettingsScope::Global, true);
+        if gerr.is_none() {
+            self.global_settings = global;
+            self.global_settings_load_error = None;
+        } else {
+            self.global_settings_load_error = gerr;
+        }
+        self.modified_fields.clear();
+        self.modified_nested_fields.clear();
+        self.modified_project_fields.clear();
+        self.modified_project_nested_fields.clear();
+        let (project, perr) =
+            Self::try_load(self.storage.as_mut(), SettingsScope::Project, self.project_trusted);
+        if perr.is_none() {
+            self.project_settings = project;
+            self.project_settings_load_error = None;
+        } else {
+            self.project_settings_load_error = perr;
+        }
+        self.settings = deep_merge_settings(&self.global_settings, &self.project_settings);
+    }
+
+    pub fn apply_overrides(&mut self, overrides: &Settings) {
+        self.settings = deep_merge_settings(&self.settings, overrides);
+    }
+
+    fn mark_modified(&mut self, field: &str, nested: Option<&str>) {
+        self.modified_fields.insert(field.to_string());
+        if let Some(n) = nested {
+            self.modified_nested_fields
+                .entry(field.to_string())
+                .or_default()
+                .insert(n.to_string());
+        }
+    }
+
+    fn save_global(&mut self) {
+        self.settings = deep_merge_settings(&self.global_settings, &self.project_settings);
+        if self.global_settings_load_error.is_some() {
+            return;
+        }
+        let snapshot = self.global_settings.clone();
+        let modified = self.modified_fields.clone();
+        let nested = self.modified_nested_fields.clone();
+        Self::persist_scoped(
+            self.storage.as_mut(),
+            SettingsScope::Global,
+            &snapshot,
+            &modified,
+            &nested,
+        );
+        self.modified_fields.clear();
+        self.modified_nested_fields.clear();
+    }
+
+    fn persist_scoped(
+        storage: &mut dyn SettingsStorage,
+        scope: SettingsScope,
+        snapshot: &Settings,
+        modified_fields: &HashSet<String>,
+        modified_nested: &HashMap<String, HashSet<String>>,
+    ) {
+        storage.with_lock(scope, &mut |current| {
+            let mut current_file = match current {
+                Some(text) => parse_settings_text(text).unwrap_or_default(),
+                None => Settings::new(),
+            };
+            for field in modified_fields {
+                let value = snapshot.get(field);
+                if let Some(nested_keys) = modified_nested.get(field)
+                    && let Some(Value::Object(in_mem)) = value {
+                        let mut base_nested = current_file
+                            .get(field)
+                            .and_then(|v| v.as_object())
+                            .cloned()
+                            .unwrap_or_default();
+                        for nk in nested_keys {
+                            if let Some(nv) = in_mem.get(nk) {
+                                base_nested.insert(nk.clone(), nv.clone());
+                            }
+                        }
+                        current_file.insert(field.clone(), Value::Object(base_nested));
+                        continue;
+                    }
+                if let Some(v) = value {
+                    current_file.insert(field.clone(), v.clone());
+                }
+            }
+            // Match TS JSON.stringify(obj, null, 2) — pretty, no trailing newline.
+            Some(pretty_json_map(&current_file.0))
+        });
+    }
+
+    // --- typed getters matching oracle defaults ---
+
+    pub fn get_default_provider(&self) -> Option<&str> {
+        self.settings.get_str("defaultProvider")
+    }
+
+    pub fn get_default_model(&self) -> Option<&str> {
+        self.settings.get_str("defaultModel")
+    }
+
+    pub fn set_default_provider(&mut self, provider: impl Into<String>) {
+        self.global_settings
+            .insert("defaultProvider", Value::String(provider.into()));
+        self.mark_modified("defaultProvider", None);
+        self.save_global();
+    }
+
+    pub fn set_default_model(&mut self, model_id: impl Into<String>) {
+        self.global_settings
+            .insert("defaultModel", Value::String(model_id.into()));
+        self.mark_modified("defaultModel", None);
+        self.save_global();
+    }
+
+    pub fn get_steering_mode(&self) -> &str {
+        self.settings
+            .get_str("steeringMode")
+            .unwrap_or("one-at-a-time")
+    }
+
+    pub fn get_follow_up_mode(&self) -> &str {
+        self.settings
+            .get_str("followUpMode")
+            .unwrap_or("one-at-a-time")
+    }
+
+    pub fn get_theme(&self) -> Option<&str> {
+        let theme = self.settings.get_str("theme")?;
+        if theme.contains('/') {
+            None
+        } else {
+            Some(theme)
+        }
+    }
+
+    pub fn set_theme(&mut self, theme: impl Into<String>) {
+        self.global_settings
+            .insert("theme", Value::String(theme.into()));
+        self.mark_modified("theme", None);
+        self.save_global();
+    }
+
+    pub fn get_default_thinking_level(&self) -> Option<&str> {
+        self.settings.get_str("defaultThinkingLevel")
+    }
+
+    pub fn get_transport(&self) -> &str {
+        self.settings.get_str("transport").unwrap_or("auto")
+    }
+
+    pub fn get_compaction_enabled(&self) -> bool {
+        self.settings
+            .get("compaction")
+            .and_then(|c| c.get("enabled"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true)
+    }
+
+    pub fn get_compaction_reserve_tokens(&self) -> u64 {
+        self.settings
+            .get("compaction")
+            .and_then(|c| c.get("reserveTokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(16384)
+    }
+
+    pub fn get_compaction_keep_recent_tokens(&self) -> u64 {
+        self.settings
+            .get("compaction")
+            .and_then(|c| c.get("keepRecentTokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(20000)
+    }
+
+    pub fn get_retry_enabled(&self) -> bool {
+        self.settings
+            .get("retry")
+            .and_then(|c| c.get("enabled"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true)
+    }
+
+    pub fn get_extensions(&self) -> Vec<String> {
+        self.settings
+            .get("extensions")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn get_skills(&self) -> Vec<String> {
+        self.settings
+            .get("skills")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn get_prompts(&self) -> Vec<String> {
+        self.settings
+            .get("prompts")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn get_themes(&self) -> Vec<String> {
+        self.settings
+            .get("themes")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn get_session_dir(&self) -> Option<String> {
+        self.settings
+            .get_str("sessionDir")
+            .map(|s| crate::config::normalize_path(s).to_string_lossy().into_owned())
+    }
+
+    pub fn get_packages(&self) -> Vec<Value> {
+        self.settings
+            .get("packages")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+/// Pretty-print a JSON object like `JSON.stringify(obj, null, 2)`.
+pub fn pretty_json_map(map: &Map<String, Value>) -> String {
+    serde_json::to_string_pretty(&Value::Object(map.clone())).unwrap_or_else(|_| "{}".into())
+}
+
+/// Parse settings JSON text into a migrated [`Settings`] (public for goldens).
+pub fn parse_settings_json(text: &str) -> Result<Settings> {
+    parse_settings_text(text)
+}
+
+/// Serialize settings with the same pretty layout pi uses for settings.json.
+pub fn serialize_settings_json(settings: &Settings) -> String {
+    pretty_json_map(&settings.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn migrate_queue_mode_idempotent() {
+        let mut m = Map::new();
+        m.insert("queueMode".into(), Value::String("all".into()));
+        let s = migrate_settings(m);
+        assert_eq!(s.get_str("steeringMode"), Some("all"));
+        assert!(s.get("queueMode").is_none());
+        // second migrate
+        let s2 = migrate_settings(s.0.clone());
+        assert_eq!(s2.get_str("steeringMode"), Some("all"));
+    }
+
+    #[test]
+    fn deep_merge_nested() {
+        let mut base = Settings::new();
+        base.insert(
+            "compaction",
+            serde_json::json!({"enabled": true, "reserveTokens": 1}),
+        );
+        let mut over = Settings::new();
+        over.insert("compaction", serde_json::json!({"reserveTokens": 2}));
+        let m = deep_merge_settings(&base, &over);
+        assert_eq!(m.get("compaction").unwrap()["enabled"], true);
+        assert_eq!(m.get("compaction").unwrap()["reserveTokens"], 2);
+    }
+}
