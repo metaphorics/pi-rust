@@ -588,7 +588,9 @@ fn wrap_single_line(line: &str, width: usize) -> Vec<String> {
         let token_vis = visible_width(&token);
         let is_ws = token.trim().is_empty();
 
-        if token_vis > width {
+        // Token itself is too long - break character by character.
+        // Whitespace-only tokens are never hard-broken (utils.ts:741).
+        if token_vis > width && !is_ws {
             if !current_line.is_empty() {
                 let mut line_end = current_line.clone();
                 let reset = tracker.get_line_end_reset();
@@ -629,7 +631,17 @@ fn wrap_single_line(line: &str, width: usize) -> Vec<String> {
     if !current_line.is_empty() || wrapped.is_empty() {
         wrapped.push(current_line);
     }
-    wrapped
+
+    // Trailing whitespace can cause lines to exceed the requested width
+    // (utils.ts:796-797 final trimEnd).
+    if wrapped.is_empty() {
+        vec![String::new()]
+    } else {
+        wrapped
+            .into_iter()
+            .map(|line| line.trim_end().to_owned())
+            .collect()
+    }
 }
 
 /// pi `wrapTextWithAnsi` (utils.ts:694-717). Word wrap only — no padding.

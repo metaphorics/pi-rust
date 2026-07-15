@@ -2,7 +2,8 @@
 //!
 //! Cases ported from packages/tui/test/wrap-ansi.test.ts and
 //! truncate-to-width.test.ts (visibleWidth section). Fixtures live as
-//! inline constants matching the TS assertions.
+//! inline constants matching the TS assertions (no separate fixtures/
+//! payload — the empty dir was removed).
 
 use pi_tui::util::{normalize_terminal_output, visible_width, wrap_text_with_ansi};
 
@@ -124,26 +125,55 @@ fn normalize_terminal_output_am() {
 
 #[test]
 fn underline_line_end_reset_not_full_reset() {
-    // Underlined text that wraps: line ends with underline-off (\x1b[24m), not \x1b[0m.
+    // Underlined text that wraps: non-final lines MUST end with underline-off
+    // (\x1b[24m) from getLineEndReset, NOT full SGR reset (\x1b[0m).
     let ul = "\x1b[4m";
     let text = format!("{ul}abcdefghijklmnopqrstuvwxyz");
     let wrapped = wrap_text_with_ansi(&text, 10);
-    assert!(wrapped.len() > 1);
-    for line in wrapped.iter().take(wrapped.len() - 1) {
-        // Must not end with full SGR reset if underline-only close is used
-        // (pi getLineEndReset → \x1b[24m).
-        if line.contains("\x1b[4m") || line.contains('a') {
-            // continuation reopen may omit; first lines should close underline
-            let _ = line;
-        }
+    assert!(wrapped.len() > 1, "expected wrap: {wrapped:?}");
+    for (i, line) in wrapped.iter().enumerate().take(wrapped.len() - 1) {
+        assert!(
+            line.ends_with("\x1b[24m"),
+            "non-final line {i} must end with underline-only reset \\x1b[24m, got {line:?}"
+        );
+        assert!(
+            !line.ends_with("\x1b[0m"),
+            "non-final line {i} must not end with full SGR reset: {line:?}"
+        );
+        // Byte-strict: the last 5 bytes of a non-final underlined wrap are ESC [ 2 4 m
+        let bytes = line.as_bytes();
+        assert!(
+            bytes.len() >= 5 && &bytes[bytes.len() - 5..] == b"\x1b[24m",
+            "byte-strict underline-off suffix missing on line {i}: {line:?}"
+        );
     }
-    // At least one non-final line should contain underline-off when underline active
-    let has_ul_off = wrapped
-        .iter()
-        .take(wrapped.len().saturating_sub(1))
-        .any(|l| l.contains("\x1b[24m"));
-    assert!(
-        has_ul_off || wrapped.len() == 1,
-        "expected underline-only line-end reset on wrapped lines: {wrapped:?}"
-    );
+}
+
+#[test]
+fn wrap_final_trim_end_strips_trailing_spaces() {
+    // Trailing whitespace must not push a line over width (utils.ts final trimEnd).
+    let text = "hello     world";
+    let wrapped = wrap_text_with_ansi(text, 8);
+    for line in &wrapped {
+        assert!(
+            visible_width(line) <= 8,
+            "line exceeds width after trimEnd: {line:?} (vw={})",
+            visible_width(line)
+        );
+        assert!(!line.ends_with(' '), "trailing space left: {line:?}");
+    }
+}
+
+#[test]
+fn wrap_long_whitespace_token_not_hard_broken() {
+    // Whitespace-only tokens wider than width must not enter breakLongWord
+    // (utils.ts:741 `&& !isWhitespace`).
+    let spaces = " ".repeat(20);
+    let text = format!("ab{spaces}cd");
+    let wrapped = wrap_text_with_ansi(&text, 5);
+    // Should still wrap words without panicking / producing empty garbage lines.
+    assert!(!wrapped.is_empty());
+    for line in &wrapped {
+        assert!(visible_width(line) <= 5, "line {line:?}");
+    }
 }
