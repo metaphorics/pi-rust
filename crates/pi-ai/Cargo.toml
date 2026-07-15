@@ -6,3 +6,11 @@ license.workspace = true
 description = "pi-ai: types, event stream, wire protocols, auth, model catalog"
 
 [dependencies]
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
