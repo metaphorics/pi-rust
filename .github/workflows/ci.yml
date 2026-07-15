@@ -40,3 +40,18 @@ jobs:
         run: bun install
       - name: bun test
         run: bun test
+
+  models-catalog:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2.0.2
+      - name: install pinned pi-ai catalog package
+        working-directory: scripts
+        run: bun install
+      - name: regenerate model catalog and check zero-diff
+        # .references/ is gitignored and absent in CI; gen-models resolves the
+        # published @earendil-works/pi-ai@0.80.7 dist/ tree via PI_AI_REF.
+        run: |
+          PI_AI_REF="$PWD/scripts/node_modules/@earendil-works/pi-ai" bun scripts/gen-models.ts
+          git diff --exit-code crates/pi-ai/src/models_generated.rs
