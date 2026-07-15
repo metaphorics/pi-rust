@@ -65,13 +65,6 @@ fn valid_unicode_is_already_sanitized_by_rust_string_invariants() {
 
 #[test]
 fn utf16_boundary_removes_unpaired_surrogates_and_keeps_pairs() {
-    let units = [
-        b'A' as u16,
-        0xD83D,
-        0xDE48,
-        0xD83D,
-        b'B' as u16,
-        0xDE48,
-    ];
+    let units = [b'A' as u16, 0xD83D, 0xDE48, 0xD83D, b'B' as u16, 0xDE48];
     assert_eq!(sanitize_utf16_surrogates(&units), "A🙈B");
 }
