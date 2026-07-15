@@ -1,3 +1,7 @@
-{"contentBlockDelta":{"contentBlockIndex":0,"delta":{"text":"Hello"}}}
-{"messageStop":{"stopReason":"end_turn"}}
-{"metadata":{"usage":{"inputTokens":3,"outputTokens":1}}}
+{"contentBlockDelta":{"contentBlockIndex":0,"delta":{"reasoningContent":{"text":"Think","signature":"sig"}}}}
+{"contentBlockDelta":{"contentBlockIndex":1,"delta":{"text":"Hello"}}}
+{"contentBlockStart":{"contentBlockIndex":2,"start":{"toolUse":{"toolUseId":"call-1","name":"get_weather"}}}}
+{"contentBlockDelta":{"contentBlockIndex":2,"delta":{"toolUse":{"input":"{\"city\":"}}}}
+{"contentBlockDelta":{"contentBlockIndex":2,"delta":{"toolUse":{"input":"\"Paris\"}"}}}}
+{"messageStop":{"stopReason":"tool_use"}}
+{"metadata":{"usage":{"inputTokens":3,"outputTokens":8}}}

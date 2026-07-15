@@ -1,10 +1,24 @@
 data: {"type":"start"}
 
-data: {"type":"text_start","contentIndex":0}
+data: {"type":"thinking_start","contentIndex":0}
 
-data: {"type":"text_delta","contentIndex":0,"delta":"Hello"}
+data: {"type":"thinking_delta","contentIndex":0,"delta":"Think"}
 
-data: {"type":"text_end","contentIndex":0,"content":"Hello"}
+data: {"type":"thinking_end","contentIndex":0,"content":"Think","contentSignature":"sig"}
 
-data: {"type":"done","reason":"stop","usage":{"input":3,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":4}}
+data: {"type":"text_start","contentIndex":1}
+
+data: {"type":"text_delta","contentIndex":1,"delta":"Hello"}
+
+data: {"type":"text_end","contentIndex":1,"content":"Hello"}
+
+data: {"type":"toolcall_start","contentIndex":2,"id":"call-1","toolName":"get_weather"}
+
+data: {"type":"toolcall_delta","contentIndex":2,"delta":"{\"city\":"}
+
+data: {"type":"toolcall_delta","contentIndex":2,"delta":"\"Paris\"}"}
+
+data: {"type":"toolcall_end","contentIndex":2,"toolCall":{"type":"toolCall","id":"call-1","name":"get_weather","arguments":{"city":"Paris"}}}
+
+data: {"type":"done","reason":"toolUse","usage":{"input":3,"output":8,"cacheRead":0,"cacheWrite":0,"totalTokens":11}}
 

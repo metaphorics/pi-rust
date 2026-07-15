@@ -3,7 +3,14 @@
     "start",
     "text_start",
     "text_delta",
+    "thinking_start",
+    "thinking_delta",
+    "toolcall_start",
+    "toolcall_delta",
+    "toolcall_delta",
     "text_end",
+    "thinking_end",
+    "toolcall_end",
     "done"
   ],
   "finalText": "Hello"
