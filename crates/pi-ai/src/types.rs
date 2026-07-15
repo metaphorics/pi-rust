@@ -395,7 +395,9 @@ pub enum Message {
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AssistantMessageEvent {
-    Start { partial: AssistantMessage },
+    Start {
+        partial: AssistantMessage,
+    },
     TextStart {
         #[serde(rename = "contentIndex")]
         content_index: usize,
@@ -469,21 +471,72 @@ impl Serialize for AssistantMessageEvent {
         #[derive(Serialize)]
         #[serde(tag = "type", rename_all = "snake_case")]
         enum Wire<'a> {
-            Start { partial: &'a AssistantMessage },
-            TextStart { #[serde(rename = "contentIndex")] content_index: usize, partial: &'a AssistantMessage },
-            TextDelta { #[serde(rename = "contentIndex")] content_index: usize, delta: &'a str, partial: &'a AssistantMessage },
-            TextEnd { #[serde(rename = "contentIndex")] content_index: usize, content: &'a str, partial: &'a AssistantMessage },
-            ThinkingStart { #[serde(rename = "contentIndex")] content_index: usize, partial: &'a AssistantMessage },
-            ThinkingDelta { #[serde(rename = "contentIndex")] content_index: usize, delta: &'a str, partial: &'a AssistantMessage },
-            ThinkingEnd { #[serde(rename = "contentIndex")] content_index: usize, content: &'a str, partial: &'a AssistantMessage },
+            Start {
+                partial: &'a AssistantMessage,
+            },
+            TextStart {
+                #[serde(rename = "contentIndex")]
+                content_index: usize,
+                partial: &'a AssistantMessage,
+            },
+            TextDelta {
+                #[serde(rename = "contentIndex")]
+                content_index: usize,
+                delta: &'a str,
+                partial: &'a AssistantMessage,
+            },
+            TextEnd {
+                #[serde(rename = "contentIndex")]
+                content_index: usize,
+                content: &'a str,
+                partial: &'a AssistantMessage,
+            },
+            ThinkingStart {
+                #[serde(rename = "contentIndex")]
+                content_index: usize,
+                partial: &'a AssistantMessage,
+            },
+            ThinkingDelta {
+                #[serde(rename = "contentIndex")]
+                content_index: usize,
+                delta: &'a str,
+                partial: &'a AssistantMessage,
+            },
+            ThinkingEnd {
+                #[serde(rename = "contentIndex")]
+                content_index: usize,
+                content: &'a str,
+                partial: &'a AssistantMessage,
+            },
             #[serde(rename = "toolcall_start")]
-            ToolcallStart { #[serde(rename = "contentIndex")] content_index: usize, partial: &'a AssistantMessage },
+            ToolcallStart {
+                #[serde(rename = "contentIndex")]
+                content_index: usize,
+                partial: &'a AssistantMessage,
+            },
             #[serde(rename = "toolcall_delta")]
-            ToolcallDelta { #[serde(rename = "contentIndex")] content_index: usize, delta: &'a str, partial: &'a AssistantMessage },
+            ToolcallDelta {
+                #[serde(rename = "contentIndex")]
+                content_index: usize,
+                delta: &'a str,
+                partial: &'a AssistantMessage,
+            },
             #[serde(rename = "toolcall_end")]
-            ToolcallEnd { #[serde(rename = "contentIndex")] content_index: usize, #[serde(rename = "toolCall")] tool_call: ContentRef<'a>, partial: &'a AssistantMessage },
-            Done { reason: StopReason, message: &'a AssistantMessage },
-            Error { reason: StopReason, error: &'a AssistantMessage },
+            ToolcallEnd {
+                #[serde(rename = "contentIndex")]
+                content_index: usize,
+                #[serde(rename = "toolCall")]
+                tool_call: ContentRef<'a>,
+                partial: &'a AssistantMessage,
+            },
+            Done {
+                reason: StopReason,
+                message: &'a AssistantMessage,
+            },
+            Error {
+                reason: StopReason,
+                error: &'a AssistantMessage,
+            },
         }
 
         #[derive(Serialize)]
@@ -495,17 +548,89 @@ impl Serialize for AssistantMessageEvent {
 
         let wire = match self {
             Self::Start { partial } => Wire::Start { partial },
-            Self::TextStart { content_index, partial } => Wire::TextStart { content_index: *content_index, partial },
-            Self::TextDelta { content_index, delta, partial } => Wire::TextDelta { content_index: *content_index, delta, partial },
-            Self::TextEnd { content_index, content, partial } => Wire::TextEnd { content_index: *content_index, content, partial },
-            Self::ThinkingStart { content_index, partial } => Wire::ThinkingStart { content_index: *content_index, partial },
-            Self::ThinkingDelta { content_index, delta, partial } => Wire::ThinkingDelta { content_index: *content_index, delta, partial },
-            Self::ThinkingEnd { content_index, content, partial } => Wire::ThinkingEnd { content_index: *content_index, content, partial },
-            Self::ToolcallStart { content_index, partial } => Wire::ToolcallStart { content_index: *content_index, partial },
-            Self::ToolcallDelta { content_index, delta, partial } => Wire::ToolcallDelta { content_index: *content_index, delta, partial },
-            Self::ToolcallEnd { content_index, tool_call, partial } => Wire::ToolcallEnd { content_index: *content_index, tool_call: ContentRef::ToolCall(tool_call), partial },
-            Self::Done { reason, message } => Wire::Done { reason: *reason, message },
-            Self::Error { reason, error } => Wire::Error { reason: *reason, error },
+            Self::TextStart {
+                content_index,
+                partial,
+            } => Wire::TextStart {
+                content_index: *content_index,
+                partial,
+            },
+            Self::TextDelta {
+                content_index,
+                delta,
+                partial,
+            } => Wire::TextDelta {
+                content_index: *content_index,
+                delta,
+                partial,
+            },
+            Self::TextEnd {
+                content_index,
+                content,
+                partial,
+            } => Wire::TextEnd {
+                content_index: *content_index,
+                content,
+                partial,
+            },
+            Self::ThinkingStart {
+                content_index,
+                partial,
+            } => Wire::ThinkingStart {
+                content_index: *content_index,
+                partial,
+            },
+            Self::ThinkingDelta {
+                content_index,
+                delta,
+                partial,
+            } => Wire::ThinkingDelta {
+                content_index: *content_index,
+                delta,
+                partial,
+            },
+            Self::ThinkingEnd {
+                content_index,
+                content,
+                partial,
+            } => Wire::ThinkingEnd {
+                content_index: *content_index,
+                content,
+                partial,
+            },
+            Self::ToolcallStart {
+                content_index,
+                partial,
+            } => Wire::ToolcallStart {
+                content_index: *content_index,
+                partial,
+            },
+            Self::ToolcallDelta {
+                content_index,
+                delta,
+                partial,
+            } => Wire::ToolcallDelta {
+                content_index: *content_index,
+                delta,
+                partial,
+            },
+            Self::ToolcallEnd {
+                content_index,
+                tool_call,
+                partial,
+            } => Wire::ToolcallEnd {
+                content_index: *content_index,
+                tool_call: ContentRef::ToolCall(tool_call),
+                partial,
+            },
+            Self::Done { reason, message } => Wire::Done {
+                reason: *reason,
+                message,
+            },
+            Self::Error { reason, error } => Wire::Error {
+                reason: *reason,
+                error,
+            },
         };
         wire.serialize(serializer)
     }
@@ -683,7 +808,7 @@ pub enum ModelInput {
 pub struct Context {
     #[serde(default)]
     pub messages: Vec<Message>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<Tool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
