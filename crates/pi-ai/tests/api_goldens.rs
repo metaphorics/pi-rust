@@ -1,3 +1,23 @@
+//! API golden fixtures for all 10 built-in wire protocols.
+//!
+//! ## Fixture provenance
+//!
+//! | API | Request / stream fixture source |
+//! |-----|----------------------------------|
+//! | anthropic-messages | pi-test-derived (packages/ai stream shapes) + spec-shaped SSE |
+//! | openai-completions | pi-test-derived SSE deltas |
+//! | openai-responses | pi-test-derived Responses SSE |
+//! | openai-codex-responses | pi-test-derived Responses SSE (same event mapping); transport extras (zstd/WS) covered by unit tests |
+//! | azure-openai-responses | pi-test-derived Responses SSE |
+//! | google-generative-ai | pi-test-derived generateContent SSE |
+//! | google-vertex | pi-test-derived Vertex SSE |
+//! | mistral-conversations | pi-test-derived completions-compatible SSE |
+//! | bedrock-converse-stream | **spec-derived binary `application/vnd.amazon.eventstream` frames** encoded at test time from the JSONL event inventory (same converse-stream event names as the AWS SDK stream); JSONL file kept as the human-readable payload source |
+//! | pi-messages | pi-test-derived custom SSE |
+//!
+//! Stream goldens assert **full event payloads** (types + text/thinking/tool deltas +
+//! final stopReason/usage), not type-order alone.
+
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use futures_util::{StreamExt, stream};
@@ -37,6 +57,24 @@ const API_CASES: [(&str, &str); 10] = [
 struct ExpectedEvents {
     types: Vec<String>,
     final_text: String,
+    #[serde(default)]
+    thinking_text: Option<String>,
+    #[serde(default)]
+    tool_name: Option<String>,
+    #[serde(default)]
+    tool_args_city: Option<String>,
+    #[serde(default)]
+    stop_reason: Option<String>,
+    #[serde(default)]
+    usage_input: Option<u64>,
+    #[serde(default)]
+    usage_output: Option<u64>,
+    #[serde(default)]
+    text_deltas: Option<Vec<String>>,
+    #[serde(default)]
+    thinking_deltas: Option<Vec<String>>,
+    #[serde(default)]
+    tool_deltas: Option<Vec<String>>,
 }
 
 fn model(api: &str) -> Model {
@@ -162,6 +200,16 @@ fn build_request(api: &str, model: &Model, context: &Context, options: &StreamOp
     }
 }
 
+fn stream_fixture_bytes(api: &str, fixture_name: &str) -> Vec<u8> {
+    if api == "bedrock-converse-stream" {
+        // Spec-derived binary eventstream: encode real frames from the JSONL inventory.
+        let jsonl = fixture(&format!("stream_{fixture_name}.jsonl"));
+        bedrock_converse_stream::encode_jsonl_as_eventstream(&jsonl).expect("encode eventstream")
+    } else {
+        fixture(&format!("stream_{fixture_name}.sse"))
+    }
+}
+
 fn parse_events(api: &str, bytes: &[u8], model: &Model) -> Vec<AssistantMessageEvent> {
     let result = match api {
         "anthropic-messages" => anthropic_messages::parse_stream_events([bytes], model),
@@ -205,6 +253,111 @@ fn final_text(message: &AssistantMessage) -> String {
             _ => None,
         })
         .collect()
+}
+
+fn final_thinking(message: &AssistantMessage) -> String {
+    message
+        .content
+        .iter()
+        .filter_map(|content| match content {
+            Content::Thinking(thinking) => Some(thinking.thinking.as_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn text_deltas(events: &[AssistantMessageEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            AssistantMessageEvent::TextDelta { delta, .. } => Some(delta.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn thinking_deltas(events: &[AssistantMessageEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            AssistantMessageEvent::ThinkingDelta { delta, .. } => Some(delta.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn tool_deltas(events: &[AssistantMessageEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            AssistantMessageEvent::ToolcallDelta { delta, .. } => Some(delta.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn assert_event_payloads(api: &str, events: &[AssistantMessageEvent], expected: &ExpectedEvents) {
+    assert_eq!(
+        events.iter().map(event_type).collect::<Vec<_>>(),
+        expected.types,
+        "{api} event types"
+    );
+
+    if let Some(deltas) = &expected.text_deltas {
+        assert_eq!(text_deltas(events), *deltas, "{api} text deltas");
+    }
+    if let Some(deltas) = &expected.thinking_deltas {
+        assert_eq!(thinking_deltas(events), *deltas, "{api} thinking deltas");
+    }
+    if let Some(deltas) = &expected.tool_deltas {
+        assert_eq!(tool_deltas(events), *deltas, "{api} tool deltas");
+    }
+
+    let final_message = events
+        .last()
+        .and_then(AssistantMessageEvent::final_message)
+        .unwrap_or_else(|| panic!("{api}: missing final message"));
+    assert_eq!(final_text(final_message), expected.final_text, "{api} finalText");
+
+    if let Some(thinking) = &expected.thinking_text {
+        assert_eq!(final_thinking(final_message), *thinking, "{api} thinking");
+    }
+
+    if let Some(name) = &expected.tool_name {
+        let tool = final_message
+            .content
+            .iter()
+            .find_map(|c| match c {
+                Content::ToolCall(call) => Some(call),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{api}: missing tool call"));
+        assert_eq!(&tool.name, name, "{api} tool name");
+        if let Some(city) = &expected.tool_args_city {
+            assert_eq!(
+                tool.arguments.get("city").and_then(Value::as_str),
+                Some(city.as_str()),
+                "{api} tool city"
+            );
+        }
+    }
+
+    if let Some(reason) = &expected.stop_reason {
+        let actual = match final_message.stop_reason {
+            StopReason::Stop => "stop",
+            StopReason::Length => "length",
+            StopReason::ToolUse => "toolUse",
+            StopReason::Error => "error",
+            StopReason::Aborted => "aborted",
+        };
+        assert_eq!(actual, reason, "{api} stopReason");
+    }
+    if let Some(input) = expected.usage_input {
+        assert_eq!(final_message.usage.input, input, "{api} usage.input");
+    }
+    if let Some(output) = expected.usage_output {
+        assert_eq!(final_message.usage.output, output, "{api} usage.output");
+    }
 }
 
 #[test]
@@ -270,33 +423,37 @@ fn provider_specific_request_compatibility_matches_goldens() {
 }
 
 #[test]
-fn stream_parsers_match_golden_event_sequences() {
+fn stream_parsers_match_golden_event_payloads() {
     for (api, fixture_name) in API_CASES {
-        let extension = if api == "bedrock-converse-stream" {
-            "jsonl"
-        } else {
-            "sse"
-        };
-        let events = parse_events(
-            api,
-            &fixture(&format!("stream_{fixture_name}.{extension}")),
-            &model(api),
-        );
+        let bytes = stream_fixture_bytes(api, fixture_name);
+        if api == "bedrock-converse-stream" {
+            assert_ne!(bytes.first().copied(), Some(b'{'), "bedrock must be binary");
+        }
+        let events = parse_events(api, &bytes, &model(api));
         let expected: ExpectedEvents = serde_json::from_value(fixture_json(&format!(
             "expected_events_{fixture_name}.json"
         )))
         .unwrap();
-        assert_eq!(
-            events.iter().map(event_type).collect::<Vec<_>>(),
-            expected.types,
-            "{api}"
-        );
-        let final_message = events
-            .last()
-            .and_then(AssistantMessageEvent::final_message)
-            .unwrap();
-        assert_eq!(final_text(final_message), expected.final_text, "{api}");
+        assert_event_payloads(api, &events, &expected);
     }
+}
+
+#[test]
+fn bedrock_eventstream_roundtrip_from_jsonl_source() {
+    let jsonl = fixture("stream_bedrock_converse_stream.jsonl");
+    let binary = bedrock_converse_stream::encode_jsonl_as_eventstream(&jsonl).unwrap();
+    let from_binary =
+        parse_events("bedrock-converse-stream", &binary, &model("bedrock-converse-stream"));
+    let from_jsonl =
+        parse_events("bedrock-converse-stream", &jsonl, &model("bedrock-converse-stream"));
+    assert_eq!(
+        from_binary.iter().map(event_type).collect::<Vec<_>>(),
+        from_jsonl.iter().map(event_type).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        text_deltas(&from_binary),
+        text_deltas(&from_jsonl)
+    );
 }
 
 #[derive(Clone)]
@@ -318,6 +475,14 @@ impl StreamHttpClient for MockHttp {
         _url: &'a str,
         _headers: &'a [(String, String)],
         _body: &'a Value,
+    ) -> HttpFuture<'a> {
+        self.response()
+    }
+    fn post_bytes<'a>(
+        &'a self,
+        _url: &'a str,
+        _headers: &'a [(String, String)],
+        _body: &'a [u8],
     ) -> HttpFuture<'a> {
         self.response()
     }
@@ -364,6 +529,15 @@ impl StreamHttpClient for GatedHttp {
     ) -> HttpFuture<'a> {
         self.post_sse(url, headers, body)
     }
+
+    fn post_bytes<'a>(
+        &'a self,
+        url: &'a str,
+        headers: &'a [(String, String)],
+        _body: &'a [u8],
+    ) -> HttpFuture<'a> {
+        self.post_sse(url, headers, &Value::Null)
+    }
 }
 
 #[tokio::test]
@@ -403,6 +577,9 @@ async fn emits_provider_deltas_before_http_eof() {
         .unwrap();
     assert_eq!(event_type(&text_start), "text_start");
     assert_eq!(event_type(&text_delta), "text_delta");
+    if let AssistantMessageEvent::TextDelta { delta, .. } = &text_delta {
+        assert_eq!(delta, "Hi");
+    }
 
     drop(sender);
     while events.next().await.is_some() {}
@@ -412,12 +589,7 @@ async fn emits_provider_deltas_before_http_eof() {
 async fn every_builtin_dispatches_through_injected_http() {
     assert_eq!(api::BUILTIN_APIS.len(), 10);
     for (api_id, fixture_name) in API_CASES {
-        let extension = if api_id == "bedrock-converse-stream" {
-            "jsonl"
-        } else {
-            "sse"
-        };
-        let bytes = fixture(&format!("stream_{fixture_name}.{extension}"));
+        let bytes = stream_fixture_bytes(api_id, fixture_name);
         let split = bytes.len() / 2;
         let client = Arc::new(MockHttp {
             chunks: vec![bytes[..split].to_vec(), bytes[split..].to_vec()],
@@ -425,11 +597,29 @@ async fn every_builtin_dispatches_through_injected_http() {
         let mut events =
             api::stream_dispatch_with_client(api_id, model(api_id), context(), options(), client);
         let mut final_message = None;
+        let mut collected = Vec::new();
         while let Some(event) = events.next().await {
             if let Some(message) = event.final_message() {
                 final_message = Some(message.clone());
             }
+            collected.push(event);
         }
         assert_eq!(final_text(&final_message.unwrap()), "Hello", "{api_id}");
+        assert!(
+            text_deltas(&collected).iter().any(|d| d.contains('H') || d == "Hello" || d == "Hi"
+                || !d.is_empty()),
+            "{api_id} should emit text deltas"
+        );
     }
+}
+
+#[test]
+fn codex_zstd_header_when_compressing() {
+    let json = serde_json::to_vec(&json!({"model":"x","input":[]})).unwrap();
+    let compressed = openai_codex_responses::compress_request_body_zstd(&json).unwrap();
+    assert_ne!(compressed, json);
+    assert!(openai_codex_responses::should_fallback_to_sse(
+        "websocket connect: failed",
+        false
+    ));
 }
