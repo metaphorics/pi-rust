@@ -2,11 +2,13 @@
 //!
 //! Ports oracle `openai-codex-responses.ts`:
 //! - WebSocket transport with session-scoped SSE fallback cache (:60-68, :275-348)
+//! - Session WS reuse (idle TTL 5m / max age 55m) with `previous_response_id` deltas (:1043-1457)
+//! - `response.create` envelope on the WS path (oracle :1420)
+//! - One retry on `websocket_connection_limit_reached` before stream start (oracle :283-316)
 //! - zstd request compression on the SSE path (level 3)
 //! - SSE parse shared with openai-responses via the incremental decoder
 //!
-//! Live network is never used in tests: WS is behind [`WebSocketConnector`] and
-//! pure helpers (compression, fallback decisions, cache TTL) are unit-tested.
+//! Live network is never used in tests: sockets are behind [`WebSocketConnector`].
 
 use std::{
     collections::{HashMap, HashSet},
@@ -14,9 +16,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
+use tokio::sync::mpsc;
 use tokio_tungstenite::{
     connect_async,
     tungstenite::{client::IntoClientRequest, http::HeaderValue, Message},
@@ -45,8 +49,130 @@ const JWT_CLAIM_PATH: &str = "https://api.openai.com/auth";
 
 static SSE_FALLBACK_SESSIONS: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
-static WS_SESSION_CREATED_AT: LazyLock<Mutex<HashMap<String, Instant>>> =
+
+/// Session-owned WebSocket tasks (oracle `websocketSessionCache`).
+static SESSION_WS_CACHE: LazyLock<Mutex<HashMap<String, SessionWsHandle>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+// ---------------------------------------------------------------------------
+// WebSocket abstraction (test-injectable)
+// ---------------------------------------------------------------------------
+
+/// Wire-level WebSocket message used by both live and mock transports.
+#[derive(Debug, Clone)]
+pub enum WsMessage {
+    Text(String),
+    Binary(Vec<u8>),
+    Ping(Vec<u8>),
+    Pong(Vec<u8>),
+    Close { code: Option<u16>, reason: String },
+}
+
+#[async_trait]
+pub trait WebSocketConn: Send {
+    async fn send_text(&mut self, text: String) -> Result<(), String>;
+    async fn next(&mut self) -> Result<Option<WsMessage>, String>;
+    async fn close(&mut self) -> Result<(), String>;
+}
+
+#[async_trait]
+pub trait WebSocketConnector: Send + Sync {
+    async fn connect(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+    ) -> Result<Box<dyn WebSocketConn>, String>;
+}
+
+/// Live connector via `tokio-tungstenite`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TungsteniteConnector;
+
+#[async_trait]
+impl WebSocketConnector for TungsteniteConnector {
+    async fn connect(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+    ) -> Result<Box<dyn WebSocketConn>, String> {
+        let mut request = url
+            .into_client_request()
+            .map_err(|error| format!("websocket request: {error}"))?;
+        {
+            let hdrs = request.headers_mut();
+            for (name, value) in headers {
+                if let (Ok(n), Ok(v)) = (
+                    name.parse::<tokio_tungstenite::tungstenite::http::header::HeaderName>(),
+                    HeaderValue::from_str(value),
+                ) {
+                    hdrs.insert(n, v);
+                }
+            }
+        }
+        let (socket, _) = connect_async(request)
+            .await
+            .map_err(|error| format!("websocket connect: {error}"))?;
+        Ok(Box::new(TungsteniteConn { socket }))
+    }
+}
+
+struct TungsteniteConn {
+    socket: tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+}
+
+#[async_trait]
+impl WebSocketConn for TungsteniteConn {
+    async fn send_text(&mut self, text: String) -> Result<(), String> {
+        self.socket
+            .send(Message::Text(text.into()))
+            .await
+            .map_err(|error| format!("websocket send: {error}"))
+    }
+
+    async fn next(&mut self) -> Result<Option<WsMessage>, String> {
+        loop {
+            match self.socket.next().await {
+                None => return Ok(None),
+                Some(Err(error)) => return Err(format!("websocket read: {error}")),
+                Some(Ok(Message::Text(text))) => return Ok(Some(WsMessage::Text(text.to_string()))),
+                Some(Ok(Message::Binary(bytes))) => {
+                    return Ok(Some(WsMessage::Binary(bytes.to_vec())));
+                }
+                Some(Ok(Message::Ping(data))) => {
+                    let _ = self.socket.send(Message::Pong(data.clone())).await;
+                    return Ok(Some(WsMessage::Ping(data.to_vec())));
+                }
+                Some(Ok(Message::Pong(data))) => {
+                    return Ok(Some(WsMessage::Pong(data.to_vec())));
+                }
+                Some(Ok(Message::Close(frame))) => {
+                    let (code, reason) = match frame {
+                        Some(frame) => {
+                            let code: u16 = frame.code.into();
+                            (Some(code), frame.reason.to_string())
+                        }
+                        None => (None, String::new()),
+                    };
+                    return Ok(Some(WsMessage::Close { code, reason }));
+                }
+                Some(Ok(Message::Frame(_))) => continue,
+            }
+        }
+    }
+
+    async fn close(&mut self) -> Result<(), String> {
+        self.socket
+            .close(None)
+            .await
+            .map_err(|error| format!("websocket close: {error}"))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Request body / headers
+// ---------------------------------------------------------------------------
 
 pub fn build_request_body(model: &Model, context: &Context, options: &StreamOptions) -> Value {
     let mut body = openai_responses::build_request_body(model, context, options);
@@ -79,6 +205,19 @@ pub fn build_request_body(model: &Model, context: &Context, options: &StreamOpti
     body
 }
 
+/// Oracle :1420 — WS frames are `{ type: "response.create", ...requestBody }`.
+pub fn wrap_response_create_envelope(body: &Value) -> Value {
+    let mut envelope = Map::new();
+    if let Some(obj) = body.as_object() {
+        for (key, value) in obj {
+            envelope.insert(key.clone(), value.clone());
+        }
+    }
+    // Force type last so body cannot override the envelope kind.
+    envelope.insert("type".into(), Value::String("response.create".into()));
+    Value::Object(envelope)
+}
+
 pub fn build_headers(model: &Model, options: &StreamOptions) -> Vec<(String, String)> {
     build_sse_headers(model, options, false)
 }
@@ -99,12 +238,7 @@ fn build_sse_headers(
         .and_then(|m| m.get("accountId"))
         .and_then(Value::as_str)
         .map(str::to_owned)
-        .or_else(|| {
-            options
-                .api_key
-                .as_deref()
-                .and_then(extract_account_id)
-        })
+        .or_else(|| options.api_key.as_deref().and_then(extract_account_id))
     {
         headers.push(("chatgpt-account-id".into(), account));
     }
@@ -226,12 +360,62 @@ pub fn should_fallback_to_sse(error: &str, websocket_started: bool) -> bool {
         || error.contains("connection")
 }
 
+pub fn is_connection_limit_error(error: &str) -> bool {
+    error.contains(WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE)
+}
+
 pub fn is_session_ws_expired(created_at: Instant, now: Instant) -> bool {
     now.duration_since(created_at) >= Duration::from_millis(SESSION_WEBSOCKET_MAX_AGE_MS)
 }
 
 pub fn is_session_ws_idle_expired(last_used: Instant, now: Instant) -> bool {
     now.duration_since(last_used) >= Duration::from_millis(SESSION_WEBSOCKET_CACHE_TTL_MS)
+}
+
+/// Build a continuation body with `previous_response_id` + input delta when possible
+/// (oracle `buildCachedWebSocketRequestBody` / `getCachedWebSocketInputDelta`).
+pub fn build_cached_websocket_request_body(
+    body: &Value,
+    continuation: &WsContinuation,
+) -> Value {
+    let Some(delta) = cached_input_delta(body, continuation) else {
+        return body.clone();
+    };
+    let mut out = body.clone();
+    out["previous_response_id"] = Value::String(continuation.last_response_id.clone());
+    out["input"] = Value::Array(delta);
+    out
+}
+
+fn request_body_without_input(body: &Value) -> Value {
+    let mut stripped = body.clone();
+    if let Some(obj) = stripped.as_object_mut() {
+        obj.remove("input");
+        obj.remove("previous_response_id");
+    }
+    stripped
+}
+
+fn cached_input_delta(body: &Value, continuation: &WsContinuation) -> Option<Vec<Value>> {
+    if request_body_without_input(body) != request_body_without_input(&continuation.last_request_body)
+    {
+        return None;
+    }
+    let current = body.get("input").and_then(Value::as_array)?.clone();
+    let mut baseline = continuation
+        .last_request_body
+        .get("input")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    baseline.extend(continuation.last_response_items.iter().cloned());
+    if current.len() < baseline.len() {
+        return None;
+    }
+    if current[..baseline.len()] != baseline[..] {
+        return None;
+    }
+    Some(current[baseline.len()..].to_vec())
 }
 
 fn extract_account_id(token: &str) -> Option<String> {
@@ -258,6 +442,280 @@ fn extract_account_id(token: &str) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Session WebSocket cache (session task owns the socket)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct WsContinuation {
+    pub last_request_body: Value,
+    pub last_response_id: String,
+    pub last_response_items: Vec<Value>,
+}
+
+struct SessionCommand {
+    body: Value,
+    use_cached_context: bool,
+    /// Incremental turn events: frames first, then exactly one Done or Error.
+    events: mpsc::Sender<TurnEvent>,
+}
+
+enum TurnEvent {
+    Frame(String),
+    Done {
+        response_id: Option<String>,
+        reused: bool,
+    },
+    Error(String),
+}
+
+#[derive(Clone)]
+struct SessionWsHandle {
+    tx: mpsc::Sender<SessionCommand>,
+    created_at: Instant,
+    last_used: Instant,
+}
+
+/// Drop every cached session socket (tests).
+pub fn close_session_websockets(session_id: Option<&str>) {
+    let mut guard = SESSION_WS_CACHE.lock();
+    if let Some(id) = session_id {
+        guard.remove(id);
+    } else {
+        guard.clear();
+    }
+}
+
+fn session_handle_is_live(handle: &SessionWsHandle, now: Instant) -> bool {
+    !is_session_ws_expired(handle.created_at, now)
+        && !is_session_ws_idle_expired(handle.last_used, now)
+        && !handle.tx.is_closed()
+}
+
+async fn acquire_session_handle(
+    session_id: &str,
+    url: &str,
+    headers: &[(String, String)],
+    connector: Arc<dyn WebSocketConnector>,
+) -> Result<SessionWsHandle, String> {
+    let now = Instant::now();
+    {
+        let mut guard = SESSION_WS_CACHE.lock();
+        if let Some(existing) = guard.get(session_id).cloned() {
+            if session_handle_is_live(&existing, now) {
+                if let Some(entry) = guard.get_mut(session_id) {
+                    entry.last_used = now;
+                }
+                return Ok(existing);
+            }
+            guard.remove(session_id);
+        }
+    }
+
+    let socket = connector.connect(url, headers).await?;
+    let (tx, rx) = mpsc::channel::<SessionCommand>(8);
+    let created_at = Instant::now();
+    tokio::spawn(session_ws_task(session_id.to_owned(), socket, rx, created_at));
+    let handle = SessionWsHandle {
+        tx,
+        created_at,
+        last_used: created_at,
+    };
+    SESSION_WS_CACHE
+        .lock()
+        .insert(session_id.to_owned(), handle.clone());
+    Ok(handle)
+}
+
+async fn session_ws_task(
+    session_id: String,
+    mut socket: Box<dyn WebSocketConn>,
+    mut rx: mpsc::Receiver<SessionCommand>,
+    created_at: Instant,
+) {
+    let mut continuation: Option<WsContinuation> = None;
+    let mut last_used = Instant::now();
+
+    while let Some(cmd) = rx.recv().await {
+        let now = Instant::now();
+        if is_session_ws_expired(created_at, now) || is_session_ws_idle_expired(last_used, now) {
+            let _ = cmd
+                .events
+                .send(TurnEvent::Error("websocket session expired".into()))
+                .await;
+            break;
+        }
+
+        let full_body = cmd.body;
+        let request_body = if cmd.use_cached_context {
+            if let Some(cont) = continuation.as_ref() {
+                build_cached_websocket_request_body(&full_body, cont)
+            } else {
+                full_body.clone()
+            }
+        } else {
+            full_body.clone()
+        };
+        let reused = continuation.is_some()
+            && request_body
+                .get("previous_response_id")
+                .and_then(Value::as_str)
+                .is_some();
+
+        let envelope = wrap_response_create_envelope(&request_body);
+        let payload = match serde_json::to_string(&envelope) {
+            Ok(s) => s,
+            Err(error) => {
+                let _ = cmd.events.send(TurnEvent::Error(error.to_string())).await;
+                continue;
+            }
+        };
+
+        if let Err(error) = socket.send_text(payload).await {
+            let _ = cmd.events.send(TurnEvent::Error(error)).await;
+            break;
+        }
+
+        match stream_ws_turn(&mut *socket, &cmd.events).await {
+            Ok(response_id) => {
+                last_used = Instant::now();
+                if let Some(rid) = response_id.clone() {
+                    continuation = Some(WsContinuation {
+                        last_request_body: full_body,
+                        last_response_id: rid,
+                        // Full response-item conversion is not ported; empty items
+                        // still enable previous_response_id chaining when input grows
+                        // only by assistant-visible deltas the client appends.
+                        last_response_items: Vec::new(),
+                    });
+                } else {
+                    continuation = None;
+                }
+                if let Some(entry) = SESSION_WS_CACHE.lock().get_mut(&session_id) {
+                    entry.last_used = last_used;
+                }
+                let _ = cmd
+                    .events
+                    .send(TurnEvent::Done {
+                        response_id,
+                        reused,
+                    })
+                    .await;
+            }
+            Err(error) => {
+                // Socket is no longer reusable after a mid-turn failure.
+                let _ = cmd.events.send(TurnEvent::Error(error)).await;
+                break;
+            }
+        }
+    }
+
+    let _ = socket.close().await;
+    let mut guard = SESSION_WS_CACHE.lock();
+    if guard
+        .get(&session_id)
+        .is_some_and(|h| h.created_at == created_at)
+    {
+        guard.remove(&session_id);
+    }
+}
+
+/// Read one WS turn, forwarding each frame immediately. Returns response_id.
+async fn stream_ws_turn(
+    socket: &mut dyn WebSocketConn,
+    events: &mpsc::Sender<TurnEvent>,
+) -> Result<Option<String>, String> {
+    let mut response_id = None;
+
+    loop {
+        match socket.next().await? {
+            None => {
+                return Err("WebSocket stream closed before response.completed".into());
+            }
+            Some(WsMessage::Text(text)) => {
+                if let Ok(parsed) = serde_json::from_str::<Value>(&text) {
+                    if let Some(id) = parsed
+                        .pointer("/response/id")
+                        .and_then(Value::as_str)
+                        .or_else(|| parsed.get("id").and_then(Value::as_str))
+                    {
+                        response_id = Some(id.to_owned());
+                    }
+                    match parsed.get("type").and_then(Value::as_str) {
+                        Some("error") => {
+                            let code = parsed
+                                .get("code")
+                                .and_then(Value::as_str)
+                                .or_else(|| parsed.pointer("/error/code").and_then(Value::as_str))
+                                .unwrap_or("");
+                            let message = parsed
+                                .get("message")
+                                .and_then(Value::as_str)
+                                .or_else(|| {
+                                    parsed.pointer("/error/message").and_then(Value::as_str)
+                                })
+                                .unwrap_or("Codex error");
+                            if code == WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE
+                                || message.contains(WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE)
+                            {
+                                return Err(WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE.into());
+                            }
+                            return Err(format!("Codex error: {message}"));
+                        }
+                        Some("response.failed") => {
+                            let code = parsed
+                                .pointer("/response/error/code")
+                                .and_then(Value::as_str)
+                                .unwrap_or("");
+                            let message = parsed
+                                .pointer("/response/error/message")
+                                .and_then(Value::as_str)
+                                .unwrap_or("Codex response failed");
+                            if code == WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE {
+                                return Err(WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE.into());
+                            }
+                            return Err(message.into());
+                        }
+                        Some("response.completed" | "response.done" | "response.incomplete") => {
+                            let _ = events.send(TurnEvent::Frame(text)).await;
+                            return Ok(response_id);
+                        }
+                        _ => {
+                            let _ = events.send(TurnEvent::Frame(text)).await;
+                        }
+                    }
+                } else {
+                    let _ = events.send(TurnEvent::Frame(text)).await;
+                }
+            }
+            Some(WsMessage::Binary(bytes)) => {
+                let text = String::from_utf8_lossy(&bytes).into_owned();
+                let _ = events.send(TurnEvent::Frame(text)).await;
+            }
+            Some(WsMessage::Close { code, reason }) => {
+                if code == Some(WEBSOCKET_MESSAGE_TOO_BIG_CLOSE_CODE) {
+                    return Err(format!(
+                        "websocket close {WEBSOCKET_MESSAGE_TOO_BIG_CLOSE_CODE}: {reason}"
+                    ));
+                }
+                if reason.contains(WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE) {
+                    return Err(WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE.into());
+                }
+                return Err(format!(
+                    "WebSocket closed{}{}",
+                    code.map(|c| format!(" {c}")).unwrap_or_default(),
+                    if reason.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" {reason}")
+                    }
+                ));
+            }
+            Some(WsMessage::Ping(_) | WsMessage::Pong(_)) => {}
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Streaming
 // ---------------------------------------------------------------------------
 
@@ -273,15 +731,6 @@ pub fn stream_with_client(
     let use_zstd = compressed.is_some();
     let headers = build_sse_headers(&model, &options, use_zstd);
     let url = resolve_codex_url(&model.base_url);
-
-    let transport = options.transport.unwrap_or(Transport::Auto);
-    let session_id = options.session_id.clone();
-    let force_sse = matches!(transport, Transport::Sse)
-        || is_websocket_sse_fallback_active(session_id.as_deref());
-
-    // Injectable HTTP path always uses SSE (tests inject MockHttp).
-    // Live `stream()` attempts WS first when transport is auto/websocket.
-    let _ = force_sse;
 
     let stream = AssistantMessageEventStream::new();
     let producer = stream.clone();
@@ -337,13 +786,26 @@ pub fn stream(
     context: Context,
     options: StreamOptions,
 ) -> AssistantMessageEventStream {
+    stream_with_ws_connector(model, context, options, Arc::new(TungsteniteConnector), None)
+}
+
+/// Injectable path used by tests: optional WS connector + optional SSE client.
+pub fn stream_with_ws_connector(
+    model: Model,
+    context: Context,
+    options: StreamOptions,
+    connector: Arc<dyn WebSocketConnector>,
+    sse_client: Option<Arc<dyn StreamHttpClient>>,
+) -> AssistantMessageEventStream {
     let transport = options.transport.unwrap_or(Transport::Auto);
     let session_id = options.session_id.clone();
     let ws_disabled = matches!(transport, Transport::Sse)
         || is_websocket_sse_fallback_active(session_id.as_deref());
 
-    if matches!(transport, Transport::Websocket | Transport::WebsocketCached | Transport::Auto)
-        && !ws_disabled
+    if matches!(
+        transport,
+        Transport::Websocket | Transport::WebsocketCached | Transport::Auto
+    ) && !ws_disabled
     {
         let stream = AssistantMessageEventStream::new();
         let producer = stream.clone();
@@ -354,26 +816,44 @@ pub fn stream(
                 .unwrap_or_else(|| format!("codex_{}", common::now_ms()));
             let ws_url = resolve_codex_websocket_url(&model.base_url);
             let ws_headers = build_websocket_headers(&model, &options, &request_id);
-            let mut websocket_started = false;
-            match process_websocket_stream(
-                &ws_url,
-                &ws_headers,
-                &body,
-                &model,
-                &mut websocket_started,
-                producer.clone(),
-            )
-            .await
-            {
-                Ok(()) => {
-                    producer.end(None);
-                    return;
-                }
-                Err(error) => {
-                    if should_fallback_to_sse(&error, websocket_started) {
-                        record_websocket_sse_fallback(session_id.as_deref());
-                        // Fall through to SSE via injected-style client.
-                    } else {
+            let use_cached_context = matches!(
+                transport,
+                Transport::WebsocketCached | Transport::Auto
+            );
+
+            let mut retried_connection_limit = false;
+            loop {
+                let mut websocket_started = false;
+                match process_websocket_stream(
+                    &ws_url,
+                    &ws_headers,
+                    &body,
+                    &model,
+                    session_id.as_deref(),
+                    use_cached_context,
+                    connector.clone(),
+                    &mut websocket_started,
+                    producer.clone(),
+                )
+                .await
+                {
+                    Ok(()) => {
+                        producer.end(None);
+                        return;
+                    }
+                    Err(error) => {
+                        let connection_limit_before_start =
+                            !websocket_started && is_connection_limit_error(&error);
+                        if connection_limit_before_start && !retried_connection_limit {
+                            retried_connection_limit = true;
+                            // Drop any half-open session entry before retrying.
+                            close_session_websockets(session_id.as_deref());
+                            continue;
+                        }
+                        if should_fallback_to_sse(&error, websocket_started) {
+                            record_websocket_sse_fallback(session_id.as_deref());
+                            break;
+                        }
                         let mut message = common::empty_message(&model);
                         message.stop_reason = StopReason::Error;
                         message.error_message = Some(error);
@@ -388,134 +868,164 @@ pub fn stream(
             }
 
             // SSE fallback with zstd compression.
-            match ReqwestStreamHttpClient::new() {
-                Ok(client) => {
-                    let sse_stream =
-                        stream_with_client(model, context, options, Arc::new(client));
-                    // Bridge: drain sse_stream into producer.
-                    let mut sse_stream = sse_stream;
+            match sse_client {
+                Some(client) => {
+                    let mut sse_stream =
+                        stream_with_client(model, context, options, client);
                     while let Some(event) = sse_stream.next().await {
                         producer.push(event);
                     }
                     producer.end(None);
                 }
-                Err(error) => {
-                    let mut message = common::empty_message(&model);
-                    message.stop_reason = StopReason::Error;
-                    message.error_message = Some(error.to_string());
-                    producer.push(AssistantMessageEvent::Error {
-                        reason: StopReason::Error,
-                        error: message,
-                    });
-                    producer.end(None);
-                }
+                None => match ReqwestStreamHttpClient::new() {
+                    Ok(client) => {
+                        let mut sse_stream =
+                            stream_with_client(model, context, options, Arc::new(client));
+                        while let Some(event) = sse_stream.next().await {
+                            producer.push(event);
+                        }
+                        producer.end(None);
+                    }
+                    Err(error) => {
+                        let mut message = common::empty_message(&model);
+                        message.stop_reason = StopReason::Error;
+                        message.error_message = Some(error.to_string());
+                        producer.push(AssistantMessageEvent::Error {
+                            reason: StopReason::Error,
+                            error: message,
+                        });
+                        producer.end(None);
+                    }
+                },
             }
         });
         return stream;
     }
 
-    match ReqwestStreamHttpClient::new() {
-        Ok(client) => stream_with_client(model, context, options, Arc::new(client)),
-        Err(error) => {
-            let stream = AssistantMessageEventStream::new();
-            let mut message = common::empty_message(&model);
-            message.stop_reason = StopReason::Error;
-            message.error_message = Some(error.to_string());
-            stream.push(AssistantMessageEvent::Error {
-                reason: StopReason::Error,
-                error: message,
-            });
-            stream
-        }
+    match sse_client {
+        Some(client) => stream_with_client(model, context, options, client),
+        None => match ReqwestStreamHttpClient::new() {
+            Ok(client) => stream_with_client(model, context, options, Arc::new(client)),
+            Err(error) => {
+                let stream = AssistantMessageEventStream::new();
+                let mut message = common::empty_message(&model);
+                message.stop_reason = StopReason::Error;
+                message.error_message = Some(error.to_string());
+                stream.push(AssistantMessageEvent::Error {
+                    reason: StopReason::Error,
+                    error: message,
+                });
+                stream
+            }
+        },
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_websocket_stream(
     url: &str,
     headers: &[(String, String)],
     body: &Value,
     model: &Model,
+    session_id: Option<&str>,
+    use_cached_context: bool,
+    connector: Arc<dyn WebSocketConnector>,
     websocket_started: &mut bool,
     producer: AssistantMessageEventStream,
 ) -> common::ApiResult<()> {
-    let mut request = url
-        .into_client_request()
-        .map_err(|error| format!("websocket request: {error}"))?;
-    {
-        let hdrs = request.headers_mut();
-        for (name, value) in headers {
-            if let (Ok(n), Ok(v)) = (
-                name.parse::<tokio_tungstenite::tungstenite::http::header::HeaderName>(),
-                HeaderValue::from_str(value),
-            ) {
-                hdrs.insert(n, v);
-            }
-        }
-    }
-
-    let (mut socket, _) = connect_async(request)
-        .await
-        .map_err(|error| format!("websocket connect: {error}"))?;
-
-    if let Some(session) = headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("session-id"))
-        .map(|(_, v)| v.clone())
-    {
-        let mut guard = WS_SESSION_CREATED_AT.lock();
-        let now = Instant::now();
-        if let Some(created) = guard.get(&session).copied()
-            && is_session_ws_expired(created, now)
-        {
-            guard.remove(&session);
-        }
-        guard.entry(session).or_insert(now);
-    }
-
-    let payload = serde_json::to_string(body).map_err(|error| error.to_string())?;
-    socket
-        .send(Message::Text(payload.into()))
-        .await
-        .map_err(|error| format!("websocket send: {error}"))?;
-
     let mut decoder = super::incremental::decoder(model);
-    while let Some(message) = socket.next().await {
-        let message = message.map_err(|error| format!("websocket read: {error}"))?;
-        match message {
-            Message::Text(text) => {
-                *websocket_started = true;
-                // Codex WS frames are JSON events (same shape as SSE data payloads).
-                for event in decoder.push_frame(&text)? {
-                    producer.push(event);
-                }
-            }
-            Message::Binary(bytes) => {
-                *websocket_started = true;
-                let text = String::from_utf8_lossy(&bytes);
-                for event in decoder.push_frame(&text)? {
-                    producer.push(event);
-                }
-            }
-            Message::Close(frame) => {
-                if let Some(frame) = frame {
-                    if frame.code == WEBSOCKET_MESSAGE_TOO_BIG_CLOSE_CODE.into() {
-                        return Err(format!(
-                            "websocket close {WEBSOCKET_MESSAGE_TOO_BIG_CLOSE_CODE}: {}",
-                            frame.reason
-                        ));
-                    }
-                    if frame.reason.contains(WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE) {
-                        return Err(WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE.into());
+
+    if let Some(session_id) = session_id {
+        let handle = acquire_session_handle(session_id, url, headers, connector).await?;
+        let (events_tx, mut events_rx) = mpsc::channel::<TurnEvent>(64);
+        handle
+            .tx
+            .send(SessionCommand {
+                body: body.clone(),
+                use_cached_context,
+                events: events_tx,
+            })
+            .await
+            .map_err(|_| "websocket session closed".to_owned())?;
+
+        while let Some(event) = events_rx.recv().await {
+            match event {
+                TurnEvent::Frame(frame) => {
+                    *websocket_started = true;
+                    for decoded in decoder.push_frame(&frame)? {
+                        producer.push(decoded);
                     }
                 }
-                break;
+                TurnEvent::Done {
+                    response_id,
+                    reused,
+                } => {
+                    let _ = (response_id, reused);
+                    break;
+                }
+                TurnEvent::Error(error) => return Err(error),
             }
-            Message::Ping(data) => {
-                let _ = socket.send(Message::Pong(data)).await;
+        }
+    } else {
+        // Ephemeral connection (no session id) — no reuse; still stream frames.
+        let mut socket = connector.connect(url, headers).await?;
+        let envelope = wrap_response_create_envelope(body);
+        let payload = serde_json::to_string(&envelope).map_err(|error| error.to_string())?;
+        socket.send_text(payload).await?;
+
+        let (events_tx, mut events_rx) = mpsc::channel::<TurnEvent>(64);
+        let read = async {
+            let result = stream_ws_turn(&mut *socket, &events_tx).await;
+            match result {
+                Ok(response_id) => {
+                    let _ = events_tx
+                        .send(TurnEvent::Done {
+                            response_id,
+                            reused: false,
+                        })
+                        .await;
+                }
+                Err(error) => {
+                    let _ = events_tx.send(TurnEvent::Error(error)).await;
+                }
             }
-            Message::Pong(_) | Message::Frame(_) => {}
+            let _ = socket.close().await;
+        };
+        let consume = async {
+            while let Some(event) = events_rx.recv().await {
+                match event {
+                    TurnEvent::Frame(frame) => {
+                        *websocket_started = true;
+                        for decoded in decoder.push_frame(&frame)? {
+                            producer.push(decoded);
+                        }
+                    }
+                    TurnEvent::Done {
+                        response_id,
+                        reused,
+                    } => {
+                        let _ = (response_id, reused);
+                        break;
+                    }
+                    TurnEvent::Error(error) => return Err(error),
+                }
+            }
+            Ok::<(), String>(())
+        };
+        // Drive reader + consumer concurrently so frames flush immediately.
+        tokio::pin!(read);
+        tokio::pin!(consume);
+        tokio::select! {
+            _ = &mut read => {
+                consume.await?;
+            }
+            result = &mut consume => {
+                result?;
+                read.await;
+            }
         }
     }
+
     for event in decoder.finish()? {
         producer.push(event);
     }
@@ -530,9 +1040,216 @@ pub fn stream_simple(
     stream(model, context, options)
 }
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        http::{HttpByteStream, HttpError, HttpFuture, StreamHttpClient},
+        types::{Api, Message, ModelCost, ModelInput, UserContent, UserMessage},
+    };
+    use futures_util::stream;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tokio::sync::Mutex as AsyncMutex;
+
+    fn test_model() -> Model {
+        Model {
+            id: "gpt-test".into(),
+            name: "Test".into(),
+            api: Api::from("openai-codex-responses"),
+            provider: "openai-codex".into(),
+            base_url: "https://chatgpt.com/backend-api".into(),
+            reasoning: false,
+            thinking_level_map: None,
+            input: vec![ModelInput::Text],
+            cost: ModelCost::default(),
+            context_window: 128_000,
+            max_tokens: 16_384,
+            headers: None,
+            compat: None,
+        }
+    }
+
+    fn test_context(text: &str) -> Context {
+        Context {
+            messages: vec![Message::User(UserMessage {
+                content: UserContent::Text(text.into()),
+                timestamp: 0,
+            })],
+            tools: vec![],
+            system_prompt: None,
+        }
+    }
+
+    fn completed_frame(id: &str, text: &str) -> String {
+        json!({
+            "type": "response.completed",
+            "response": {
+                "id": id,
+                "status": "completed",
+                "model": "gpt-test",
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": text}]
+                }],
+                "usage": {
+                    "input_tokens": 1,
+                    "output_tokens": 1
+                }
+            }
+        })
+        .to_string()
+    }
+
+    // ----- mock WS -----
+
+    #[derive(Clone, Default)]
+    struct MockWsShared {
+        /// Queues of inbound messages, one queue consumed per connection.
+        inbound: Arc<AsyncMutex<Vec<Vec<WsMessage>>>>,
+        /// Fail next N connects with connection-limit.
+        fail_connects: Arc<AtomicUsize>,
+        /// After fail_connects exhausted, optionally fail every remaining connect.
+        always_fail_connect: Arc<AtomicBool>,
+        connect_count: Arc<AtomicUsize>,
+        sent: Arc<Mutex<Vec<String>>>,
+        /// Close-with-limit on the Nth connection's first read (1-based; 0 = never).
+        close_limit_on_conn: Arc<AtomicUsize>,
+    }
+
+    struct MockWsConnector {
+        shared: MockWsShared,
+    }
+
+    struct MockWsConn {
+        shared: MockWsShared,
+        inbound: Vec<WsMessage>,
+        conn_index: usize,
+        closed: bool,
+    }
+
+    #[async_trait]
+    impl WebSocketConnector for MockWsConnector {
+        async fn connect(
+            &self,
+            _url: &str,
+            _headers: &[(String, String)],
+        ) -> Result<Box<dyn WebSocketConn>, String> {
+            let n = self.shared.connect_count.fetch_add(1, Ordering::SeqCst) + 1;
+            let remaining = self.shared.fail_connects.load(Ordering::SeqCst);
+            if remaining > 0 {
+                self.shared.fail_connects.fetch_sub(1, Ordering::SeqCst);
+                return Err(WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE.into());
+            }
+            if self.shared.always_fail_connect.load(Ordering::SeqCst) {
+                return Err(WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE.into());
+            }
+            let mut guard = self.shared.inbound.lock().await;
+            let inbound = if guard.is_empty() {
+                vec![WsMessage::Text(completed_frame(
+                    &format!("resp-{n}"),
+                    "ok",
+                ))]
+            } else {
+                guard.remove(0)
+            };
+            Ok(Box::new(MockWsConn {
+                shared: self.shared.clone(),
+                inbound,
+                conn_index: n,
+                closed: false,
+            }))
+        }
+    }
+
+    #[async_trait]
+    impl WebSocketConn for MockWsConn {
+        async fn send_text(&mut self, text: String) -> Result<(), String> {
+            if self.closed {
+                return Err("socket closed".into());
+            }
+            self.shared.sent.lock().push(text);
+            Ok(())
+        }
+
+        async fn next(&mut self) -> Result<Option<WsMessage>, String> {
+            if self.closed {
+                return Ok(None);
+            }
+            let close_on = self.shared.close_limit_on_conn.load(Ordering::SeqCst);
+            if close_on == self.conn_index {
+                self.shared
+                    .close_limit_on_conn
+                    .store(0, Ordering::SeqCst);
+                return Ok(Some(WsMessage::Close {
+                    code: Some(1013),
+                    reason: WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE.into(),
+                }));
+            }
+            if self.inbound.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(self.inbound.remove(0)))
+        }
+
+        async fn close(&mut self) -> Result<(), String> {
+            self.closed = true;
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct RecordingHttp {
+        hits: Arc<AtomicUsize>,
+        body: Vec<u8>,
+    }
+
+    impl StreamHttpClient for RecordingHttp {
+        fn post_sse<'a>(
+            &'a self,
+            _url: &'a str,
+            _headers: &'a [(String, String)],
+            _body: &'a Value,
+        ) -> HttpFuture<'a> {
+            self.response()
+        }
+
+        fn post_json_stream<'a>(
+            &'a self,
+            _url: &'a str,
+            _headers: &'a [(String, String)],
+            _body: &'a Value,
+        ) -> HttpFuture<'a> {
+            self.response()
+        }
+
+        fn post_bytes<'a>(
+            &'a self,
+            _url: &'a str,
+            _headers: &'a [(String, String)],
+            _body: &'a [u8],
+        ) -> HttpFuture<'a> {
+            self.response()
+        }
+    }
+
+    impl RecordingHttp {
+        fn response(&self) -> HttpFuture<'_> {
+            self.hits.fetch_add(1, Ordering::SeqCst);
+            let chunks = self.body.clone();
+            Box::pin(async move {
+                let body: HttpByteStream =
+                    Box::pin(stream::iter(vec![Ok::<_, HttpError>(chunks)]));
+                Ok(body)
+            })
+        }
+    }
+
+    // ----- pure helpers -----
 
     #[test]
     fn zstd_roundtrip_compresses() {
@@ -561,26 +1278,32 @@ mod tests {
 
     #[test]
     fn sse_fallback_session_cache() {
-        clear_websocket_sse_fallback(None);
-        assert!(!is_websocket_sse_fallback_active(Some("s1")));
-        record_websocket_sse_fallback(Some("s1"));
-        assert!(is_websocket_sse_fallback_active(Some("s1")));
-        assert!(!is_websocket_sse_fallback_active(Some("s2")));
-        clear_websocket_sse_fallback(Some("s1"));
-        assert!(!is_websocket_sse_fallback_active(Some("s1")));
+        let id = format!("unit-sse-{}", common::now_ms());
+        assert!(!is_websocket_sse_fallback_active(Some(&id)));
+        record_websocket_sse_fallback(Some(&id));
+        assert!(is_websocket_sse_fallback_active(Some(&id)));
+        assert!(!is_websocket_sse_fallback_active(Some("s2-never-recorded")));
+        clear_websocket_sse_fallback(Some(&id));
+        assert!(!is_websocket_sse_fallback_active(Some(&id)));
     }
 
     #[test]
     fn fallback_decision_before_start() {
         assert!(should_fallback_to_sse("websocket connect failed", false));
-        assert!(should_fallback_to_sse(WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE, false));
+        assert!(should_fallback_to_sse(
+            WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE,
+            false
+        ));
         assert!(!should_fallback_to_sse("protocol error", true));
     }
 
     #[test]
     fn session_expiry_helpers() {
         let start = Instant::now();
-        assert!(!is_session_ws_expired(start, start + Duration::from_secs(60)));
+        assert!(!is_session_ws_expired(
+            start,
+            start + Duration::from_secs(60)
+        ));
         assert!(is_session_ws_expired(
             start,
             start + Duration::from_millis(SESSION_WEBSOCKET_MAX_AGE_MS + 1)
@@ -589,5 +1312,307 @@ mod tests {
             start,
             start + Duration::from_millis(SESSION_WEBSOCKET_CACHE_TTL_MS + 1)
         ));
+    }
+
+    #[test]
+    fn response_create_envelope_shape() {
+        let body = json!({"model":"gpt","input":[{"role":"user","content":"hi"}],"store":false});
+        let env = wrap_response_create_envelope(&body);
+        assert_eq!(env["type"], "response.create");
+        assert_eq!(env["model"], "gpt");
+        assert_eq!(env["input"][0]["role"], "user");
+        assert_eq!(env["store"], false);
+    }
+
+    #[test]
+    fn response_create_envelope_type_wins() {
+        let body = json!({"type":"other","model":"x"});
+        let env = wrap_response_create_envelope(&body);
+        assert_eq!(env["type"], "response.create");
+        assert_eq!(env["model"], "x");
+    }
+
+    #[test]
+    fn cached_request_body_sets_previous_response_id() {
+        let first = json!({
+            "model": "gpt",
+            "input": [{"role":"user","content":"a"}],
+            "store": false
+        });
+        let cont = WsContinuation {
+            last_request_body: first.clone(),
+            last_response_id: "resp-1".into(),
+            last_response_items: vec![],
+        };
+        let second = json!({
+            "model": "gpt",
+            "input": [
+                {"role":"user","content":"a"},
+                {"role":"user","content":"b"}
+            ],
+            "store": false
+        });
+        let delta = build_cached_websocket_request_body(&second, &cont);
+        assert_eq!(delta["previous_response_id"], "resp-1");
+        assert_eq!(delta["input"].as_array().unwrap().len(), 1);
+        assert_eq!(delta["input"][0]["content"], "b");
+    }
+
+    // ----- async mocked-WS integration -----
+
+    #[tokio::test]
+    async fn ws_sends_response_create_envelope() {
+        let session = format!("sess-envelope-{}", common::now_ms());
+        clear_websocket_sse_fallback(Some(&session));
+        close_session_websockets(Some(&session));
+
+        let shared = MockWsShared::default();
+        {
+            let mut inbound = shared.inbound.lock().await;
+            inbound.push(vec![WsMessage::Text(completed_frame("resp-env", "hi"))]);
+        }
+        let connector = Arc::new(MockWsConnector {
+            shared: shared.clone(),
+        });
+
+        let options = StreamOptions {
+            transport: Some(Transport::Websocket),
+            session_id: Some(session.clone()),
+            api_key: Some("tok".into()),
+            ..Default::default()
+        };
+        let mut stream = stream_with_ws_connector(
+            test_model(),
+            test_context("hello"),
+            options,
+            connector,
+            None,
+        );
+        while stream.next().await.is_some() {}
+
+        let sent = shared.sent.lock().clone();
+        assert_eq!(sent.len(), 1, "exactly one WS frame sent");
+        let parsed: Value = serde_json::from_str(&sent[0]).unwrap();
+        assert_eq!(
+            parsed["type"].as_str(),
+            Some("response.create"),
+            "envelope must be response.create, got {parsed}"
+        );
+        assert!(parsed.get("model").is_some() || parsed.get("input").is_some());
+        close_session_websockets(Some(&session));
+        clear_websocket_sse_fallback(Some(&session));
+    }
+
+    #[tokio::test]
+    async fn connection_limit_retries_once_then_succeeds() {
+        let session = format!("sess-retry-{}", common::now_ms());
+        clear_websocket_sse_fallback(Some(&session));
+        close_session_websockets(Some(&session));
+
+        let shared = MockWsShared {
+            fail_connects: Arc::new(AtomicUsize::new(1)),
+            ..Default::default()
+        };
+        {
+            let mut inbound = shared.inbound.lock().await;
+            // First successful connect after the failed one.
+            inbound.push(vec![WsMessage::Text(completed_frame("resp-retry", "ok"))]);
+        }
+        let connector = Arc::new(MockWsConnector {
+            shared: shared.clone(),
+        });
+        let http_hits = Arc::new(AtomicUsize::new(0));
+        let sse = Arc::new(RecordingHttp {
+            hits: http_hits.clone(),
+            body: b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"sse\",\"status\":\"completed\",\"output\":[],\"usage\":{}}}\n\n".to_vec(),
+        });
+
+        let options = StreamOptions {
+            transport: Some(Transport::Websocket),
+            session_id: Some(session.clone()),
+            api_key: Some("tok".into()),
+            ..Default::default()
+        };
+        let mut stream = stream_with_ws_connector(
+            test_model(),
+            test_context("retry"),
+            options,
+            connector,
+            Some(sse),
+        );
+        while stream.next().await.is_some() {}
+
+        assert_eq!(
+            shared.connect_count.load(Ordering::SeqCst),
+            2,
+            "connect once (limit) + one retry"
+        );
+        assert_eq!(
+            http_hits.load(Ordering::SeqCst),
+            0,
+            "must not fall back to SSE when retry succeeds"
+        );
+        assert!(
+            !is_websocket_sse_fallback_active(Some(&session)),
+            "successful retry must not record SSE fallback"
+        );
+        close_session_websockets(Some(&session));
+        clear_websocket_sse_fallback(Some(&session));
+    }
+
+    #[tokio::test]
+    async fn connection_limit_twice_records_sse_fallback() {
+        let session = format!("sess-fallback-{}", common::now_ms());
+        clear_websocket_sse_fallback(Some(&session));
+        close_session_websockets(Some(&session));
+
+        let shared = MockWsShared {
+            fail_connects: Arc::new(AtomicUsize::new(2)),
+            ..Default::default()
+        };
+        let connector = Arc::new(MockWsConnector {
+            shared: shared.clone(),
+        });
+        let http_hits = Arc::new(AtomicUsize::new(0));
+        let sse_body = b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"sse-1\",\"status\":\"completed\",\"model\":\"gpt-test\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"from-sse\"}]}],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n";
+        let sse = Arc::new(RecordingHttp {
+            hits: http_hits.clone(),
+            body: sse_body.to_vec(),
+        });
+
+        let options = StreamOptions {
+            transport: Some(Transport::Auto),
+            session_id: Some(session.clone()),
+            api_key: Some("tok".into()),
+            ..Default::default()
+        };
+        let mut stream = stream_with_ws_connector(
+            test_model(),
+            test_context("fallback"),
+            options,
+            connector,
+            Some(sse),
+        );
+        while stream.next().await.is_some() {}
+
+        assert_eq!(
+            shared.connect_count.load(Ordering::SeqCst),
+            2,
+            "attempt + single retry, then stop"
+        );
+        assert_eq!(http_hits.load(Ordering::SeqCst), 1, "SSE fallback used");
+        assert!(
+            is_websocket_sse_fallback_active(Some(&session)),
+            "session must be recorded for SSE fallback"
+        );
+        clear_websocket_sse_fallback(Some(&session));
+        close_session_websockets(Some(&session));
+    }
+
+    #[tokio::test]
+    async fn session_websocket_reused_across_two_requests() {
+        let session = format!("sess-reuse-{}", common::now_ms());
+        clear_websocket_sse_fallback(Some(&session));
+        close_session_websockets(Some(&session));
+
+        let shared = MockWsShared::default();
+        {
+            let mut inbound = shared.inbound.lock().await;
+            // One connection serves two turns.
+            inbound.push(vec![
+                WsMessage::Text(completed_frame("resp-1", "one")),
+                WsMessage::Text(completed_frame("resp-2", "two")),
+            ]);
+        }
+        let connector = Arc::new(MockWsConnector {
+            shared: shared.clone(),
+        });
+
+        let options = StreamOptions {
+            transport: Some(Transport::WebsocketCached),
+            session_id: Some(session.clone()),
+            api_key: Some("tok".into()),
+            ..Default::default()
+        };
+
+        let mut s1 = stream_with_ws_connector(
+            test_model(),
+            test_context("first"),
+            options.clone(),
+            connector.clone(),
+            None,
+        );
+        while s1.next().await.is_some() {}
+
+        let mut s2 = stream_with_ws_connector(
+            test_model(),
+            test_context("second"),
+            options,
+            connector,
+            None,
+        );
+        while s2.next().await.is_some() {}
+
+        assert_eq!(
+            shared.connect_count.load(Ordering::SeqCst),
+            1,
+            "second request must reuse the session socket"
+        );
+        let sent = shared.sent.lock().clone();
+        assert_eq!(sent.len(), 2, "two response.create frames on one socket");
+        for frame in &sent {
+            let parsed: Value = serde_json::from_str(frame).unwrap();
+            assert_eq!(parsed["type"], "response.create");
+        }
+        close_session_websockets(Some(&session));
+        clear_websocket_sse_fallback(Some(&session));
+    }
+
+    #[tokio::test]
+    async fn close_limit_before_start_retries_once() {
+        let session = format!("sess-close-limit-{}", common::now_ms());
+        clear_websocket_sse_fallback(Some(&session));
+        close_session_websockets(Some(&session));
+
+        let shared = MockWsShared {
+            // First connection closes with limit on first read; second succeeds.
+            close_limit_on_conn: Arc::new(AtomicUsize::new(1)),
+            ..Default::default()
+        };
+        {
+            let mut inbound = shared.inbound.lock().await;
+            // Conn 1: close happens before inbound is read (close_limit_on_conn).
+            inbound.push(vec![]);
+            // Conn 2: success.
+            inbound.push(vec![WsMessage::Text(completed_frame("resp-ok", "ok"))]);
+        }
+        let connector = Arc::new(MockWsConnector {
+            shared: shared.clone(),
+        });
+        let http_hits = Arc::new(AtomicUsize::new(0));
+        let sse = Arc::new(RecordingHttp {
+            hits: http_hits.clone(),
+            body: b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"x\",\"status\":\"completed\",\"output\":[],\"usage\":{}}}\n\n".to_vec(),
+        });
+
+        let options = StreamOptions {
+            transport: Some(Transport::Websocket),
+            session_id: Some(session.clone()),
+            api_key: Some("tok".into()),
+            ..Default::default()
+        };
+        let mut stream = stream_with_ws_connector(
+            test_model(),
+            test_context("close-limit"),
+            options,
+            connector,
+            Some(sse),
+        );
+        while stream.next().await.is_some() {}
+
+        assert_eq!(shared.connect_count.load(Ordering::SeqCst), 2);
+        assert_eq!(http_hits.load(Ordering::SeqCst), 0);
+        close_session_websockets(Some(&session));
+        clear_websocket_sse_fallback(Some(&session));
     }
 }
