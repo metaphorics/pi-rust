@@ -489,10 +489,10 @@ mod tests {
                 if let Some(mut done) = self.done.take() {
                     done(Some("picked".to_owned()));
                 }
-            } else if data == "cancel" {
-                if let Some(mut done) = self.done.take() {
+            } else if data == "cancel"
+                && let Some(mut done) = self.done.take()
+            {
                     done(None);
-                }
             }
         }
 
