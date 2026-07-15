@@ -1,0 +1,59 @@
+[
+  {
+    "type": "start",
+    "partial": {
+      "role": "assistant",
+      "content": [],
+      "api": "openai-responses",
+      "provider": "openai",
+      "model": "gpt-5.4",
+      "usage": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0, "cost": { "input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 0.0 } },
+      "stopReason": "stop",
+      "timestamp": 1740000000000
+    }
+  },
+  {
+    "type": "text_delta",
+    "contentIndex": 0,
+    "delta": "Hi",
+    "partial": {
+      "role": "assistant",
+      "content": [{ "type": "text", "text": "Hi" }],
+      "api": "openai-responses",
+      "provider": "openai",
+      "model": "gpt-5.4",
+      "usage": { "input": 1, "output": 1, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 2, "cost": { "input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 0.0 } },
+      "stopReason": "stop",
+      "timestamp": 1740000000000
+    }
+  },
+  {
+    "type": "toolcall_end",
+    "contentIndex": 1,
+    "toolCall": { "type": "toolCall", "id": "call_1", "name": "lookup", "arguments": { "q": "pi" } },
+    "partial": {
+      "role": "assistant",
+      "content": [{ "type": "text", "text": "Hi" }, { "type": "toolCall", "id": "call_1", "name": "lookup", "arguments": { "q": "pi" } }],
+      "api": "openai-responses",
+      "provider": "openai",
+      "model": "gpt-5.4",
+      "usage": { "input": 1, "output": 1, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 2, "cost": { "input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 0.0 } },
+      "stopReason": "toolUse",
+      "timestamp": 1740000000000
+    }
+  },
+  {
+    "type": "done",
+    "reason": "toolUse",
+    "message": {
+      "role": "assistant",
+      "content": [{ "type": "text", "text": "Hi" }],
+      "api": "openai-responses",
+      "provider": "openai",
+      "model": "gpt-5.4",
+      "usage": { "input": 1, "output": 1, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 2, "cost": { "input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 0.0 } },
+      "stopReason": "toolUse",
+      "timestamp": 1740000000000
+    }
+  }
+]

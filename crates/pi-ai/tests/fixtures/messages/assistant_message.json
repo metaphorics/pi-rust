@@ -1,0 +1,25 @@
+{
+  "role": "assistant",
+  "content": [
+    { "type": "thinking", "thinking": "Consider", "thinkingSignature": "sig-thinking" },
+    { "type": "text", "text": "Hello", "textSignature": "sig-text" },
+    { "type": "toolCall", "id": "call_1", "name": "weather", "arguments": { "city": "Paris" }, "thoughtSignature": "sig-tool" }
+  ],
+  "api": "anthropic-messages",
+  "provider": "anthropic",
+  "model": "claude-sonnet-4-5",
+  "responseModel": "claude-sonnet-4-5-20250929",
+  "responseId": "msg_1",
+  "usage": {
+    "input": 10,
+    "output": 5,
+    "cacheRead": 2,
+    "cacheWrite": 3,
+    "cacheWrite1h": 1,
+    "reasoning": 2,
+    "totalTokens": 20,
+    "cost": { "input": 0.1, "output": 0.2, "cacheRead": 0.01, "cacheWrite": 0.03, "total": 0.34 }
+  },
+  "stopReason": "toolUse",
+  "timestamp": 1740000000000
+}

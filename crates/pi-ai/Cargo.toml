@@ -6,11 +6,41 @@ license.workspace = true
 description = "pi-ai: types, event stream, wire protocols, auth, model catalog"
 
 [dependencies]
-reqwest.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-thiserror.workspace = true
-tokio.workspace = true
+# Wire-compatible JSON models and fixtures.
+serde = { workspace = true }
+# Dynamic provider metadata and OAuth extension fields.
+serde_json = { workspace = true }
+# Stable public errors for storage and OAuth operations.
+thiserror = { workspace = true }
+# Async streams, synchronization, filesystem, and timers.
+tokio = { workspace = true }
+# Rustls HTTP client for OAuth refresh and provider calls.
+reqwest = { workspace = true }
+# Millisecond-safe wall-clock timestamps without platform-specific code.
+jiff = { workspace = true }
+# Stream combinators used by SSE and event consumers.
+futures-util = "0.3"
+# Zero-copy HTTP body chunks.
+bytes = "1"
+# OAuth client constants, JWT payloads, and PKCE encoding.
+base64 = "0.22"
+# PKCE S256 challenge hashing.
+sha2 = "0.10"
+# Cryptographically secure PKCE verifier and OAuth state generation.
+rand = "0.8"
+# Wire-identical retry and overflow classifiers.
+regex = "1"
+# OAuth authorization URL construction and callback parsing.
+url = "2"
+# Object-safe async credential and OAuth provider interfaces.
+async-trait = "0.1"
+# Typed HTTP header maps shared by provider auth.
+http = "1"
+# Standards-compliant OAuth form encoding.
+percent-encoding = "2"
+# Low-overhead in-memory credential and stream synchronization.
+parking_lot = "0.12"
 
 [dev-dependencies]
-tokio.workspace = true
+# Async test runtime and test macros.
+tokio = { workspace = true, features = ["macros", "rt"] }
