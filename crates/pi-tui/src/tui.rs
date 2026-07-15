@@ -1233,9 +1233,9 @@ mod tests {
 
         // In-place mutate a deterministic pattern of children and re-render via Ranges.
         for round in 0..5 {
-            for i in 0..20 {
+            for (i, handle) in handles.iter().enumerate() {
                 if (i + round) % 3 == 0 {
-                    *handles[i].borrow_mut() = format!("CHANGED-{round}-{i}");
+                    *handle.borrow_mut() = format!("CHANGED-{round}-{i}");
                     // Invalidate the cached component so render status flips.
                     if let Some(child) = tui.root.children_mut().get_mut(i) {
                         child.invalidate();
