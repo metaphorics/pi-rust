@@ -2,9 +2,12 @@
 
 use std::{future::Future, pin::Pin};
 
+use futures_util::{Stream, StreamExt};
 use serde_json::Value;
 
-pub type HttpFuture<'a> = Pin<Box<dyn Future<Output = Result<Vec<Vec<u8>>, HttpError>> + Send + 'a>>;
+pub type HttpByteStream = Pin<Box<dyn Stream<Item = Result<Vec<u8>, HttpError>> + Send>>;
+pub type HttpFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<HttpByteStream, HttpError>> + Send + 'a>>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum HttpError {
@@ -47,21 +50,25 @@ impl ReqwestStreamHttpClient {
         url: &str,
         headers: &[(String, String)],
         body: &Value,
-    ) -> Result<Vec<Vec<u8>>, HttpError> {
+    ) -> Result<HttpByteStream, HttpError> {
         let mut request = self.client.post(url).json(body);
         for (name, value) in headers {
             request = request.header(name, value);
         }
         let response = request.send().await?;
         let status = response.status();
-        let bytes = response.bytes().await?;
         if !status.is_success() {
+            let bytes = response.bytes().await?;
             return Err(HttpError::Status {
                 status: status.as_u16(),
                 body: String::from_utf8_lossy(&bytes).into_owned(),
             });
         }
-        Ok(vec![bytes.to_vec()])
+        Ok(Box::pin(response.bytes_stream().map(|chunk| {
+            chunk
+                .map(|bytes| bytes.to_vec())
+                .map_err(HttpError::Request)
+        })))
     }
 }
 
