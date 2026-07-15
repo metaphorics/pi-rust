@@ -197,7 +197,7 @@ pub enum TextPhase {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TextContent {
-    pub text: String,
+    pub text: crate::shared_text::SharedText,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text_signature: Option<String>,
 }
@@ -205,7 +205,7 @@ pub struct TextContent {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThinkingContent {
-    pub thinking: String,
+    pub thinking: crate::shared_text::SharedText,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking_signature: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
