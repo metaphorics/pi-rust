@@ -1,0 +1,16 @@
+{
+  "anthropic": {
+    "type": "oauth",
+    "access": "access-token",
+    "refresh": "refresh-token",
+    "expires": 1893456000000,
+    "scope": "user:inference"
+  },
+  "openai": {
+    "type": "api_key",
+    "key": "sk-test",
+    "env": {
+      "OPENAI_ORG_ID": "org-test"
+    }
+  }
+}

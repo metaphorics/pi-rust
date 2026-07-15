@@ -2,7 +2,10 @@
 //!
 //! Port of packages/ai. Skeleton only for Phase 0.
 
+pub mod auth;
+pub mod env_api_keys;
 pub mod event_stream;
+pub mod oauth;
 pub mod types;
 pub mod utils;
 
