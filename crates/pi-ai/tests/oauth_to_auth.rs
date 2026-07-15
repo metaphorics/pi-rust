@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use pi_ai::{
     auth::OAuthCredential,
     oauth::{anthropic, github_copilot, openai_codex},
@@ -58,5 +59,32 @@ fn copilot_derives_individual_proxy_and_enterprise_urls() {
     assert_eq!(
         github_copilot::get_base_url(None, None),
         "https://api.individual.githubcopilot.com"
+    );
+    assert_eq!(
+        github_copilot::get_base_url(Some("proxy-ep=api.proxy.githubcopilot.com;"), None),
+        "https://api.proxy.githubcopilot.com"
+    );
+}
+
+#[test]
+fn codex_refresh_credentials_preserve_account_id_from_jwt() {
+    let payload = URL_SAFE_NO_PAD
+        .encode(br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"acct_123"}}"#);
+    let token = format!("e30.{payload}.signature");
+    let credential = openai_codex::credentials_from_token(token, "refresh".into(), 123).unwrap();
+    assert_eq!(credential.extra["accountId"], "acct_123");
+}
+
+#[test]
+fn copilot_model_policy_filter_matches_pi() {
+    let response = serde_json::json!({"data": [
+        {"id":"enabled","model_picker_enabled":true,"policy":{"state":"enabled"},"capabilities":{"supports":{"tool_calls":true}}},
+        {"id":"disabled","model_picker_enabled":true,"policy":{"state":"disabled"},"capabilities":{"supports":{"tool_calls":true}}},
+        {"id":"no-tools","model_picker_enabled":true,"policy":{"state":"enabled"},"capabilities":{"supports":{"tool_calls":false}}},
+        {"id":"hidden","model_picker_enabled":false,"policy":{"state":"enabled"},"capabilities":{"supports":{"tool_calls":true}}}
+    ]});
+    assert_eq!(
+        github_copilot::parse_available_model_ids(&response).unwrap(),
+        vec!["enabled"]
     );
 }

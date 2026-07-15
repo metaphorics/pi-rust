@@ -1,5 +1,7 @@
 use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::Deserialize;
+use serde_json::Value;
 
 use crate::auth::{ModelAuth, OAuthAuth, OAuthCredential, OAuthError};
 
@@ -9,6 +11,7 @@ pub const AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
 pub const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 pub const REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
 pub const SCOPE: &str = "openid profile email offline_access";
+const JWT_CLAIM_PATH: &str = "https://api.openai.com/auth";
 
 #[derive(Deserialize)]
 struct TokenResponse {
@@ -32,11 +35,42 @@ pub async fn refresh_token(
         .await?
         .error_for_status()?;
     let token: TokenResponse = response.json().await?;
+    credentials_from_token(
+        token.access_token,
+        token.refresh_token,
+        jiff::Timestamp::now().as_millisecond() + token.expires_in * 1000,
+    )
+}
+
+pub fn credentials_from_token(
+    access: String,
+    refresh: String,
+    expires: i64,
+) -> Result<OAuthCredential, OAuthError> {
+    let payload = access
+        .split('.')
+        .nth(1)
+        .ok_or_else(|| OAuthError::InvalidResponse("access token is not a JWT".into()))?;
+    let decoded = URL_SAFE_NO_PAD
+        .decode(payload)
+        .map_err(|error| OAuthError::InvalidResponse(format!("invalid JWT payload: {error}")))?;
+    let claims: Value = serde_json::from_slice(&decoded)
+        .map_err(|error| OAuthError::InvalidResponse(format!("invalid JWT claims: {error}")))?;
+    let account_id = claims
+        .get(JWT_CLAIM_PATH)
+        .and_then(|auth| auth.get("chatgpt_account_id"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            OAuthError::InvalidResponse("Failed to extract accountId from token".into())
+        })?;
+    let mut extra = std::collections::HashMap::new();
+    extra.insert("accountId".into(), Value::String(account_id.into()));
     Ok(OAuthCredential {
-        access: token.access_token,
-        refresh: token.refresh_token,
-        expires: jiff::Timestamp::now().as_millisecond() + token.expires_in * 1000,
-        extra: Default::default(),
+        access,
+        refresh,
+        expires,
+        extra,
     })
 }
 
