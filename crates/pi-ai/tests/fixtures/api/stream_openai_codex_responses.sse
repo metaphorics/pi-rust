@@ -1,0 +1,8 @@
+data: {"type":"response.created","response":{"id":"resp-1","model":"test-model"}}
+
+data: {"type":"response.output_text.delta","delta":"Hello"}
+
+data: {"type":"response.completed","response":{"id":"resp-1","status":"completed","usage":{"input_tokens":3,"output_tokens":1}}}
+
+data: [DONE]
+

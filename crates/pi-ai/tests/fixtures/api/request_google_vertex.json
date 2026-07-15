@@ -1,0 +1,44 @@
+{
+  "contents": [
+    {
+      "parts": [
+        {
+          "text": "Hello"
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "generationConfig": {
+    "maxOutputTokens": 64,
+    "temperature": 0.2
+  },
+  "systemInstruction": {
+    "parts": [
+      {
+        "text": "Be concise."
+      }
+    ]
+  },
+  "tools": [
+    {
+      "functionDeclarations": [
+        {
+          "description": "Get weather",
+          "name": "get_weather",
+          "parametersJsonSchema": {
+            "properties": {
+              "city": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "city"
+            ],
+            "type": "object"
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,3 @@
+{"contentBlockDelta":{"contentBlockIndex":0,"delta":{"text":"Hello"}}}
+{"messageStop":{"stopReason":"end_turn"}}
+{"metadata":{"usage":{"inputTokens":3,"outputTokens":1}}}

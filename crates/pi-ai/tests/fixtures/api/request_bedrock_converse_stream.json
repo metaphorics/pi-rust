@@ -1,0 +1,45 @@
+{
+  "inferenceConfig": {
+    "maxTokens": 64,
+    "temperature": 0.2
+  },
+  "messages": [
+    {
+      "content": [
+        {
+          "text": "Hello"
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "modelId": "test-model",
+  "system": [
+    {
+      "text": "Be concise."
+    }
+  ],
+  "toolConfig": {
+    "tools": [
+      {
+        "toolSpec": {
+          "description": "Get weather",
+          "inputSchema": {
+            "json": {
+              "properties": {
+                "city": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "city"
+              ],
+              "type": "object"
+            }
+          },
+          "name": "get_weather"
+        }
+      }
+    ]
+  }
+}

@@ -1,0 +1,6 @@
+data: {"id":"resp-1","model":"test-model","choices":[{"delta":{"content":"Hello"},"finish_reason":null}]}
+
+data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1}}
+
+data: [DONE]
+
