@@ -3,8 +3,29 @@
 //! Port of `packages/tui/src/autocomplete.ts` — trait surface + applyCompletion
 //! logic sufficient for editor tests. Full `fd`-backed fuzzy path walk can land
 //! later; `get_suggestions` is a sync stub with optional slash-command matching.
+//!
+//! ## Cancellation / async seam
+//!
+//! TypeScript's provider takes `{ signal: AbortSignal; force?: boolean }` and
+//! returns `Promise`. The TUI host cancels in-flight work by aborting the signal
+//! when the user keeps typing (after debounce). A pure sync trait cannot express
+//! "abort while the provider is still running".
+//!
+//! Design (minimal, TUI-thread friendly, no tokio in pi-tui):
+//! - [`CancellationToken`] is a cloneable AbortSignal analog (`cancel` /
+//!   `is_cancelled` / push `on_cancel` listeners — load-bearing for the oracle
+//!   abort test that counts via `addEventListener("abort", …)`).
+//! - [`AutocompleteProvider::get_suggestions`] stays synchronous for the common path.
+//! - [`AutocompleteProvider::begin_suggestions`] is the async-capable seam: default
+//!   returns [`SuggestionStart::Ready`]; async providers return
+//!   [`SuggestionStart::Pending`] with a `std::sync::mpsc::Receiver` the Editor
+//!   drains via non-blocking `try_recv` from `render` / `flush_autocomplete`.
+//! - Debounce remains in the Editor (`std::time::Instant` + poll), not in the provider.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Receiver;
+use std::sync::{Arc, Mutex};
 
 use crate::fuzzy::fuzzy_filter;
 
@@ -45,6 +66,14 @@ impl SlashCommand {
         self.argument_hint = Some(hint.into());
         self
     }
+
+    pub fn with_argument_completions(
+        mut self,
+        f: fn(&str) -> Option<Vec<AutocompleteItem>>,
+    ) -> Self {
+        self.get_argument_completions = Some(f);
+        self
+    }
 }
 
 /// Suggestion list plus the matched prefix text.
@@ -55,13 +84,92 @@ pub struct AutocompleteSuggestions {
     pub prefix: String,
 }
 
+/// Cloneable cancellation token — TS `AbortSignal` analog.
+///
+/// `cancel()` is idempotent. `on_cancel` listeners fire at most once, either
+/// immediately if already cancelled or when `cancel()` is first called. Push
+/// delivery is required: the editor drops the pending job on cancel and never
+/// re-polls it, so providers must observe abort via listeners (oracle abort test).
+#[derive(Clone, Default)]
+pub struct CancellationToken {
+    cancelled: Arc<AtomicBool>,
+    listeners: Arc<Mutex<Vec<Box<dyn FnOnce() + Send>>>>,
+}
+
+impl std::fmt::Debug for CancellationToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CancellationToken")
+            .field("cancelled", &self.is_cancelled())
+            .finish()
+    }
+}
+
+impl CancellationToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// Mark cancelled and run any registered listeners exactly once.
+    pub fn cancel(&self) {
+        if self
+            .cancelled
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        let listeners = std::mem::take(&mut *self.listeners.lock().expect("cancel listeners"));
+        for listener in listeners {
+            listener();
+        }
+    }
+
+    /// Register a one-shot abort listener. Runs immediately if already cancelled.
+    pub fn on_cancel(&self, f: impl FnOnce() + Send + 'static) {
+        if self.is_cancelled() {
+            f();
+            return;
+        }
+        self.listeners
+            .lock()
+            .expect("cancel listeners")
+            .push(Box::new(f));
+        // Race: cancel may have landed between the check and the push.
+        if self.is_cancelled() {
+            let listeners = std::mem::take(&mut *self.listeners.lock().expect("cancel listeners"));
+            for listener in listeners {
+                listener();
+            }
+        }
+    }
+}
+
 /// Options for [`AutocompleteProvider::get_suggestions`].
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone)]
 pub struct SuggestionOptions {
     /// Explicit Tab force (path completion even without path-like prefix).
     pub force: bool,
-    /// When true, this request was cancelled (TS AbortSignal.aborted).
-    pub aborted: bool,
+    /// Live cancellation token (TS `AbortSignal`). Check / listen during long work.
+    pub cancel: CancellationToken,
+}
+
+impl Default for SuggestionOptions {
+    fn default() -> Self {
+        Self {
+            force: false,
+            cancel: CancellationToken::new(),
+        }
+    }
+}
+
+impl SuggestionOptions {
+    pub fn aborted(&self) -> bool {
+        self.cancel.is_cancelled()
+    }
 }
 
 /// Result of applying a selected completion.
@@ -72,10 +180,21 @@ pub struct AppliedCompletion {
     pub cursor_col: usize,
 }
 
-/// Autocomplete provider contract (sync stub of the TS async API).
+/// Outcome of starting a suggestion fetch.
 ///
-/// TS uses `Promise` + `AbortSignal`; here callers run on the TUI thread and
-/// pass [`SuggestionOptions`]. Async wrappers can spawn and call these methods.
+/// Sync providers return [`SuggestionStart::Ready`]. Async providers return
+/// [`SuggestionStart::Pending`] and later send on the channel (or never, if
+/// cancelled). The Editor drains via non-blocking `try_recv` from the TUI loop.
+pub enum SuggestionStart {
+    Ready(Option<AutocompleteSuggestions>),
+    Pending(Receiver<Option<AutocompleteSuggestions>>),
+}
+
+/// Autocomplete provider contract.
+///
+/// TS uses `Promise` + `AbortSignal`. Sync providers implement
+/// [`get_suggestions`]; async ones override [`begin_suggestions`] to return a
+/// pending channel while observing [`SuggestionOptions::cancel`].
 pub trait AutocompleteProvider {
     /// Characters that naturally trigger this provider at token boundaries.
     fn trigger_characters(&self) -> &[char] {
@@ -90,6 +209,17 @@ pub trait AutocompleteProvider {
         cursor_col: usize,
         options: SuggestionOptions,
     ) -> Option<AutocompleteSuggestions>;
+
+    /// Async-capable entry point. Default: call [`get_suggestions`] immediately.
+    fn begin_suggestions(
+        &self,
+        lines: &[String],
+        cursor_line: usize,
+        cursor_col: usize,
+        options: SuggestionOptions,
+    ) -> SuggestionStart {
+        SuggestionStart::Ready(self.get_suggestions(lines, cursor_line, cursor_col, options))
+    }
 
     /// Apply the selected item; returns new lines + cursor.
     fn apply_completion(
@@ -111,6 +241,7 @@ pub trait AutocompleteProvider {
         false
     }
 }
+
 
 /// Command entry accepted by CombinedAutocompleteProvider.
 #[derive(Debug, Clone)]
@@ -558,7 +689,7 @@ mod tests {
                 4,
                 SuggestionOptions {
                     force: false,
-                    aborted: false,
+                    cancel: CancellationToken::new(),
                 },
             )
             .expect("file suggestions");

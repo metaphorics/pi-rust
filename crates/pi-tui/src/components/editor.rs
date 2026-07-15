@@ -4,13 +4,15 @@
 //! grapheme-aware even though storage is UTF-8.
 
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::autocomplete::{AutocompleteItem, AutocompleteProvider, SuggestionOptions};
+use crate::autocomplete::{
+    AutocompleteItem, AutocompleteProvider, AutocompleteSuggestions, CancellationToken,
+    SuggestionOptions, SuggestionStart,
+};
 use crate::component::{Component, Focusable, RenderStatus};
 use crate::components::input::{byte_to_utf16, utf16_len, utf16_to_byte};
 use crate::components::select_list::{SelectItem, SelectList, SelectListTheme};
@@ -81,15 +83,32 @@ fn graphemes_with_markers(text: &str) -> Vec<(usize, String)> {
 
 /// Pi's word-aware wrap algorithm (`editor.ts:114-206`).
 pub fn word_wrap_line(line: &str, max_width: usize) -> Vec<TextChunk> {
-    word_wrap_line_inner(line, max_width, false)
+    word_wrap_line_inner(line, max_width, false, None)
 }
 
 /// Word-wrap treating paste-marker-shaped spans as atomic segments.
 pub fn word_wrap_line_atomic(line: &str, max_width: usize) -> Vec<TextChunk> {
-    word_wrap_line_inner(line, max_width, true)
+    word_wrap_line_inner(line, max_width, true, None)
 }
 
-fn word_wrap_line_inner(line: &str, max_width: usize, atomic_markers: bool) -> Vec<TextChunk> {
+/// Word-wrap with explicit pre-segmented atomic units (TS `preSegmented` arg).
+///
+/// Each segment is `(utf16_start, text)`. Oversized atomic segments are split
+/// for layout only.
+pub fn word_wrap_line_with_segments(
+    line: &str,
+    max_width: usize,
+    segments: &[(usize, String)],
+) -> Vec<TextChunk> {
+    word_wrap_line_inner(line, max_width, true, Some(segments))
+}
+
+fn word_wrap_line_inner(
+    line: &str,
+    max_width: usize,
+    atomic_markers: bool,
+    pre_segmented: Option<&[(usize, String)]>,
+) -> Vec<TextChunk> {
     if line.is_empty() || max_width == 0 {
         return vec![TextChunk {
             text: String::new(),
@@ -104,7 +123,9 @@ fn word_wrap_line_inner(line: &str, max_width: usize, atomic_markers: bool) -> V
             end_index: utf16_len(line),
         }];
     }
-    let segs = if atomic_markers {
+    let segs = if let Some(pre) = pre_segmented {
+        pre.to_vec()
+    } else if atomic_markers {
         graphemes_with_markers(line)
     } else {
         line.grapheme_indices(true)
@@ -234,7 +255,6 @@ struct VisualLine {
     length: usize,
 }
 
-#[derive(Debug, Clone)]
 struct PendingAutocomplete {
     force: bool,
     explicit_tab: bool,
@@ -243,7 +263,11 @@ struct PendingAutocomplete {
     text: String,
     line: usize,
     col: usize,
-    abort: Arc<AtomicBool>,
+    cancel: CancellationToken,
+    /// In-flight async result, if provider returned Pending.
+    rx: Option<Receiver<Option<AutocompleteSuggestions>>>,
+    /// True once begin_suggestions has been invoked for this request.
+    started: bool,
 }
 
 /// Grapheme-aware multiline terminal editor.
@@ -273,6 +297,8 @@ pub struct Editor<'a> {
     autocomplete_max_visible: usize,
     trigger_chars: Vec<char>,
     pending_ac: Option<PendingAutocomplete>,
+    /// Cursor (line, col) where the last yank began (for yank-pop delete).
+    last_yank_start: Option<(usize, usize)>,
     ac_token: u64,
     /// Debounce delay for attachment-style triggers (`@`, `#`, custom). Tests may set 0.
     ac_debounce_ms: u64,
@@ -328,6 +354,7 @@ impl<'a> Editor<'a> {
             },
             trigger_chars: DEFAULT_TRIGGER_CHARS.to_vec(),
             pending_ac: None,
+            last_yank_start: None,
             ac_token: 0,
             ac_debounce_ms: ATTACHMENT_AUTOCOMPLETE_DEBOUNCE_MS,
             cached: vec![],
@@ -349,6 +376,8 @@ impl<'a> Editor<'a> {
         (self.state.line, self.state.col)
     }
     pub fn set_text(&mut self, text: &str) {
+        self.cancel_autocomplete();
+        self.last_action = None;
         if self.get_text() != normalize(text) {
             self.push_undo();
         }
@@ -751,6 +780,7 @@ impl<'a> Editor<'a> {
             return;
         };
         self.push_undo();
+        self.last_yank_start = Some((self.state.line, self.state.col));
         self.insert_text_inner(&text);
         self.last_action = Some(Action::Yank);
         self.changed();
@@ -761,36 +791,48 @@ impl<'a> Editor<'a> {
         }
         let old = self.kill_ring.peek().unwrap().to_owned();
         self.push_undo();
-        self.delete_inserted(&old);
+        self.delete_yanked_text(&old);
         self.kill_ring.rotate();
         let replacement = self.kill_ring.peek().unwrap().to_owned();
+        self.last_yank_start = Some((self.state.line, self.state.col));
         self.insert_text_inner(&replacement);
         self.last_action = Some(Action::Yank);
         self.changed();
     }
-    fn delete_inserted(&mut self, text: &str) {
-        let parts: Vec<_> = text.split('\n').collect();
-        if parts.len() == 1 {
-            let start = self.state.col - utf16_len(text);
+    /// Delete text previously inserted by yank, using the recorded start mark.
+    fn delete_yanked_text(&mut self, text: &str) {
+        let Some((start_line, start_col)) = self.last_yank_start else {
+            // Fallback: assume cursor is immediately after a single-line yank.
+            let start = self.state.col.saturating_sub(utf16_len(text));
             let b0 = utf16_to_byte(self.line(), start);
             let b1 = utf16_to_byte(self.line(), self.state.col);
             self.state.lines[self.state.line].replace_range(b0..b1, "");
             self.state.col = start;
-        } else {
-            let first = self.state.line - parts.len() + 1;
-            let start = utf16_len(&self.state.lines[first]) - utf16_len(parts[0]);
-            let suffix = self.state.lines[self.state.line]
-                [utf16_to_byte(self.line(), self.state.col)..]
-                .to_owned();
-            let prefix = self.state.lines[first][..utf16_to_byte(&self.state.lines[first], start)]
-                .to_owned();
-            self.state
-                .lines
-                .splice(first..=self.state.line, [format!("{prefix}{suffix}")]);
-            self.state.line = first;
-            self.state.col = start;
+            return;
+        };
+        let end_line = self.state.line;
+        let end_col = self.state.col;
+        if start_line == end_line {
+            let b0 = utf16_to_byte(self.line(), start_col);
+            let b1 = utf16_to_byte(self.line(), end_col);
+            self.state.lines[self.state.line].replace_range(b0..b1, "");
+            self.state.col = start_col;
+            return;
         }
+        // Multi-line: join prefix of start line with suffix of end line.
+        let prefix = self.state.lines[start_line]
+            [..utf16_to_byte(&self.state.lines[start_line], start_col)]
+            .to_owned();
+        let suffix = self.state.lines[end_line][utf16_to_byte(&self.state.lines[end_line], end_col)..]
+            .to_owned();
+        self.state
+            .lines
+            .splice(start_line..=end_line, [format!("{prefix}{suffix}")]);
+        self.state.line = start_line;
+        self.state.col = start_col;
+        let _ = text; // used for single-line fallback only
     }
+
     fn undo(&mut self) {
         self.exit_history();
         if let Some(state) = self.undo.pop() {
@@ -923,7 +965,7 @@ impl<'a> Editor<'a> {
                     length: utf16_len(line),
                 });
             } else {
-                for chunk in word_wrap_line_inner(line, width, true) {
+                for chunk in word_wrap_line_inner(line, width, true, None) {
                     out.push(VisualLine {
                         logical_line: i,
                         start_col: chunk.start_index,
@@ -1133,8 +1175,11 @@ impl<'a> Editor<'a> {
     }
     fn cancel_autocomplete_request(&mut self) {
         if let Some(pending) = self.pending_ac.take() {
-            pending.abort.store(true, Ordering::SeqCst);
+            // Push-based abort: listeners fire even though we drop the job.
+            pending.cancel.cancel();
         }
+        // Bump token so a late channel delivery is ignored.
+        self.ac_token = self.ac_token.wrapping_add(1);
     }
     fn debounce_ms_for(&self, force: bool, explicit_tab: bool) -> u64 {
         if force || explicit_tab {
@@ -1232,7 +1277,6 @@ impl<'a> Editor<'a> {
         self.ac_token = self.ac_token.wrapping_add(1);
         let token = self.ac_token;
         let delay = self.debounce_ms_for(force, explicit_tab);
-        let abort = Arc::new(AtomicBool::new(false));
         self.pending_ac = Some(PendingAutocomplete {
             force,
             explicit_tab,
@@ -1241,61 +1285,133 @@ impl<'a> Editor<'a> {
             text: self.get_text(),
             line: self.state.line,
             col: self.state.col,
-            abort,
+            cancel: CancellationToken::new(),
+            rx: None,
+            started: false,
         });
         if delay == 0 {
             self.poll_autocomplete(true);
         }
     }
+    #[allow(clippy::collapsible_if)]
     fn poll_autocomplete(&mut self, force_ready: bool) {
+        // 1) Drain in-flight async result if present.
+        if let Some(pending) = self.pending_ac.as_mut() {
+            if pending.started {
+                if pending.cancel.is_cancelled() || pending.token != self.ac_token {
+                    self.pending_ac = None;
+                    return;
+                }
+                if let Some(rx) = pending.rx.as_ref() {
+                    match rx.try_recv() {
+                        Ok(result) => {
+                            let pending = self.pending_ac.take().unwrap();
+                            if pending.cancel.is_cancelled()
+                                || pending.token != self.ac_token
+                                || pending.text != self.get_text()
+                                || pending.line != self.state.line
+                                || pending.col != self.state.col
+                            {
+                                return;
+                            }
+                            self.apply_suggestion_result(result, pending.force, pending.explicit_tab);
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            // Still waiting; nothing else to do.
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            self.pending_ac = None;
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+
         let Some(pending) = self.pending_ac.as_ref() else {
             return;
         };
+        if pending.started {
+            return;
+        }
         if !force_ready && Instant::now() < pending.ready_at {
             return;
         }
-        if pending.abort.load(Ordering::SeqCst) {
+        if pending.cancel.is_cancelled() {
             self.pending_ac = None;
             return;
         }
-        let pending = self.pending_ac.take().unwrap();
+        // Snapshot fields we need after take.
+        let force = pending.force;
+        let explicit_tab = pending.explicit_tab;
+        let token = pending.token;
+        let text = pending.text.clone();
+        let line = pending.line;
+        let col = pending.col;
+        let cancel = pending.cancel.clone();
+
         // Stale if document moved since schedule.
-        if pending.text != self.get_text()
-            || pending.line != self.state.line
-            || pending.col != self.state.col
-            || pending.token != self.ac_token
+        if text != self.get_text()
+            || line != self.state.line
+            || col != self.state.col
+            || token != self.ac_token
         {
+            self.pending_ac = None;
             return;
         }
-        if pending.abort.load(Ordering::SeqCst) {
+        if cancel.is_cancelled() {
+            self.pending_ac = None;
             return;
         }
         let Some(provider) = self.provider.as_ref() else {
+            self.pending_ac = None;
             return;
         };
-        let aborted = pending.abort.load(Ordering::SeqCst);
-        let Some(s) = provider.get_suggestions(
+        let start = provider.begin_suggestions(
             &self.state.lines,
             self.state.line,
             self.state.col,
             SuggestionOptions {
-                force: pending.force,
-                aborted,
+                force,
+                cancel: cancel.clone(),
             },
-        ) else {
+        );
+        match start {
+            SuggestionStart::Ready(result) => {
+                self.pending_ac = None;
+                if cancel.is_cancelled() || token != self.ac_token {
+                    return;
+                }
+                self.apply_suggestion_result(result, force, explicit_tab);
+            }
+            SuggestionStart::Pending(rx) => {
+                if let Some(p) = self.pending_ac.as_mut() {
+                    p.started = true;
+                    p.rx = Some(rx);
+                }
+                // Immediate non-blocking poll in case the result is already ready.
+                self.poll_autocomplete(true);
+            }
+        }
+    }
+
+    fn apply_suggestion_result(
+        &mut self,
+        result: Option<AutocompleteSuggestions>,
+        force: bool,
+        explicit_tab: bool,
+    ) {
+        let Some(s) = result else {
             self.cancel_autocomplete();
             self.tui.request_render();
             return;
         };
-        if aborted || pending.abort.load(Ordering::SeqCst) {
-            return;
-        }
         if s.items.is_empty() {
             self.cancel_autocomplete();
             self.tui.request_render();
             return;
         }
-        if pending.force && pending.explicit_tab && s.items.len() == 1 {
+        if force && explicit_tab && s.items.len() == 1 {
             self.apply_completion(&s.items[0], &s.prefix);
             return;
         }
@@ -1331,7 +1447,7 @@ impl<'a> Editor<'a> {
         }
         self.autocomplete = Some(list);
         self.autocomplete_prefix = s.prefix;
-        self.autocomplete_force = pending.force;
+        self.autocomplete_force = force;
         self.tui.request_render();
     }
     fn apply_completion(&mut self, item: &AutocompleteItem, prefix: &str) {
@@ -1355,6 +1471,7 @@ impl<'a> Editor<'a> {
         self.changed();
     }
     fn cancel_autocomplete(&mut self) {
+        self.cancel_autocomplete_request();
         self.autocomplete = None;
         self.autocomplete_prefix.clear();
         self.autocomplete_force = false;
@@ -1478,6 +1595,17 @@ impl<'a> Editor<'a> {
             } else {
                 self.move_vert(true);
             }
+        } else if self.autocomplete.is_some() && kb.matches(data, "tui.select.cancel") {
+            self.cancel_autocomplete_request();
+            self.cancel_autocomplete();
+            self.tui.request_render();
+        } else if self.autocomplete.is_some()
+            && (kb.matches(data, "tui.select.up") || kb.matches(data, "tui.select.down"))
+        {
+            if let Some(list) = self.autocomplete.as_mut() {
+                list.handle_input(data);
+            }
+            self.tui.request_render();
         } else if kb.matches(data, "tui.input.tab") {
             if let Some(list) = &self.autocomplete {
                 if let Some(selected) = list.get_selected_item() {
@@ -1491,6 +1619,23 @@ impl<'a> Editor<'a> {
                 }
             } else {
                 self.trigger_autocomplete(true);
+            }
+        } else if self.autocomplete.is_some() && kb.matches(data, "tui.select.confirm") {
+            // Enter while menu open: apply selection. Slash prefixes fall through to submit.
+            let is_slash = self.autocomplete_prefix.starts_with('/');
+            if let Some(list) = &self.autocomplete
+                && let Some(selected) = list.get_selected_item()
+            {
+                    let item = AutocompleteItem {
+                        value: selected.value.clone(),
+                        label: selected.label.clone(),
+                        description: selected.description.clone(),
+                    };
+                    let prefix = self.autocomplete_prefix.clone();
+                    self.apply_completion(&item, &prefix);
+                    if is_slash {
+                        self.submit();
+                    }
             }
         } else if kb.matches(data, "tui.input.newLine") {
             self.newline();
@@ -1525,7 +1670,7 @@ impl Component for Editor<'_> {
         self.last_width = layout;
         let mut rendered = vec![Line::plain("─".repeat(width))];
         for (line_index, logical) in self.state.lines.iter().enumerate() {
-            for part in word_wrap_line_inner(logical, layout, true) {
+            for part in word_wrap_line_inner(logical, layout, true, None) {
                 let has = line_index == self.state.line
                     && self.state.col >= part.start_index
                     && self.state.col <= part.end_index;
