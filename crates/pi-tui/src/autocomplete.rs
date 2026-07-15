@@ -60,6 +60,8 @@ pub struct AutocompleteSuggestions {
 pub struct SuggestionOptions {
     /// Explicit Tab force (path completion even without path-like prefix).
     pub force: bool,
+    /// When true, this request was cancelled (TS AbortSignal.aborted).
+    pub aborted: bool,
 }
 
 /// Result of applying a selected completion.
@@ -196,9 +198,10 @@ impl CombinedAutocompleteProvider {
 
     fn extract_at_prefix(text: &str) -> Option<String> {
         if let Some(q) = extract_quoted_prefix(text)
-            && q.starts_with("@\"") {
-                return Some(q);
-            }
+            && q.starts_with("@\"")
+        {
+            return Some(q);
+        }
         let last = find_last_delimiter(text);
         let token_start = if last == usize::MAX { 0 } else { last + 1 };
         if text.as_bytes().get(token_start) == Some(&b'@') {
@@ -272,9 +275,10 @@ impl CombinedAutocompleteProvider {
     ) -> Option<Vec<AutocompleteItem>> {
         for cmd in &self.commands {
             if let CommandEntry::Slash(c) = cmd
-                && c.name == command_name {
-                    return c.get_argument_completions.and_then(|f| f(argument_prefix));
-                }
+                && c.name == command_name
+            {
+                return c.get_argument_completions.and_then(|f| f(argument_prefix));
+            }
         }
         None
     }
@@ -457,13 +461,16 @@ fn extract_quoted_prefix(text: &str) -> Option<String> {
                 }
             }
         }
-        if bytes[i] == b'@' && i + 1 < bytes.len() && bytes[i + 1] == b'"'
-            && (i == 0 || PATH_DELIMITERS.contains(&(bytes[i - 1] as char))) {
-                let rest = &text[i + 2..];
-                if !rest.contains('"') {
-                    return Some(text[i..].to_string());
-                }
+        if bytes[i] == b'@'
+            && i + 1 < bytes.len()
+            && bytes[i + 1] == b'"'
+            && (i == 0 || PATH_DELIMITERS.contains(&(bytes[i - 1] as char)))
+        {
+            let rest = &text[i + 2..];
+            if !rest.contains('"') {
+                return Some(text[i..].to_string());
             }
+        }
         i += 1;
     }
     None
@@ -477,9 +484,10 @@ fn expand_home_path(path: &str) -> PathBuf {
             return home.join(rest);
         }
     } else if path == "~"
-        && let Some(home) = env_home() {
-            return home;
-        }
+        && let Some(home) = env_home()
+    {
+        return home;
+    }
     PathBuf::from(path)
 }
 
@@ -544,7 +552,15 @@ mod tests {
             .with_files(vec!["src/main.rs".into(), "src/lib.rs".into()]);
         let lines = vec!["src/".into()];
         let s = provider
-            .get_suggestions(&lines, 0, 4, SuggestionOptions { force: false })
+            .get_suggestions(
+                &lines,
+                0,
+                4,
+                SuggestionOptions {
+                    force: false,
+                    aborted: false,
+                },
+            )
             .expect("file suggestions");
         assert_eq!(s.items.len(), 2);
     }

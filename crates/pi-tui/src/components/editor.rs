@@ -4,6 +4,9 @@
 //! grapheme-aware even though storage is UTF-8.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -20,6 +23,8 @@ use crate::util::{CJK_BREAK, is_whitespace_char, visible_width};
 use crate::word_navigation::{find_word_backward, find_word_forward};
 
 const PASTE_PREFIX: &str = "[paste #";
+const ATTACHMENT_AUTOCOMPLETE_DEBOUNCE_MS: u64 = 20;
+const DEFAULT_TRIGGER_CHARS: &[char] = &['@', '#'];
 
 /// Minimal terminal services required by [`Editor`].
 pub trait EditorTui {
@@ -57,14 +62,15 @@ fn graphemes_with_markers(text: &str) -> Vec<(usize, String)> {
     let mut byte = 0;
     while byte < text.len() {
         if text[byte..].starts_with(PASTE_PREFIX)
-            && let Some(end) = text[byte..].find(']') {
-                let marker = &text[byte..byte + end + 1];
-                if is_marker(marker) {
-                    out.push((byte_to_utf16(text, byte), marker.to_owned()));
-                    byte += end + 1;
-                    continue;
-                }
+            && let Some(end) = text[byte..].find(']')
+        {
+            let marker = &text[byte..byte + end + 1];
+            if is_marker(marker) {
+                out.push((byte_to_utf16(text, byte), marker.to_owned()));
+                byte += end + 1;
+                continue;
             }
+        }
         let rest = &text[byte..];
         let g = rest.graphemes(true).next().expect("nonempty");
         out.push((byte_to_utf16(text, byte), g.to_owned()));
@@ -76,6 +82,11 @@ fn graphemes_with_markers(text: &str) -> Vec<(usize, String)> {
 /// Pi's word-aware wrap algorithm (`editor.ts:114-206`).
 pub fn word_wrap_line(line: &str, max_width: usize) -> Vec<TextChunk> {
     word_wrap_line_inner(line, max_width, false)
+}
+
+/// Word-wrap treating paste-marker-shaped spans as atomic segments.
+pub fn word_wrap_line_atomic(line: &str, max_width: usize) -> Vec<TextChunk> {
+    word_wrap_line_inner(line, max_width, true)
 }
 
 fn word_wrap_line_inner(line: &str, max_width: usize, atomic_markers: bool) -> Vec<TextChunk> {
@@ -216,6 +227,25 @@ enum Jump {
     Backward,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VisualLine {
+    logical_line: usize,
+    start_col: usize,
+    length: usize,
+}
+
+#[derive(Debug, Clone)]
+struct PendingAutocomplete {
+    force: bool,
+    explicit_tab: bool,
+    token: u64,
+    ready_at: Instant,
+    text: String,
+    line: usize,
+    col: usize,
+    abort: Arc<AtomicBool>,
+}
+
 /// Grapheme-aware multiline terminal editor.
 pub struct Editor<'a> {
     tui: &'a dyn EditorTui,
@@ -235,10 +265,17 @@ pub struct Editor<'a> {
     paste_buffer: String,
     jump: Option<Jump>,
     preferred_col: Option<usize>,
+    snapped_from_col: Option<usize>,
     provider: Option<Box<dyn AutocompleteProvider>>,
     autocomplete: Option<SelectList>,
     autocomplete_prefix: String,
     autocomplete_force: bool,
+    autocomplete_max_visible: usize,
+    trigger_chars: Vec<char>,
+    pending_ac: Option<PendingAutocomplete>,
+    ac_token: u64,
+    /// Debounce delay for attachment-style triggers (`@`, `#`, custom). Tests may set 0.
+    ac_debounce_ms: u64,
     cached: Vec<Line>,
     pub on_submit: Option<Box<dyn FnMut(String)>>,
     pub on_change: Option<Box<dyn FnMut(String)>>,
@@ -276,10 +313,23 @@ impl<'a> Editor<'a> {
             paste_buffer: String::new(),
             jump: None,
             preferred_col: None,
+            snapped_from_col: None,
             provider: None,
             autocomplete: None,
             autocomplete_prefix: String::new(),
             autocomplete_force: false,
+            autocomplete_max_visible: {
+                let n = if options.autocomplete_max_visible == 0 {
+                    5
+                } else {
+                    options.autocomplete_max_visible
+                };
+                n.clamp(3, 20)
+            },
+            trigger_chars: DEFAULT_TRIGGER_CHARS.to_vec(),
+            pending_ac: None,
+            ac_token: 0,
+            ac_debounce_ms: ATTACHMENT_AUTOCOMPLETE_DEBOUNCE_MS,
             cached: vec![],
             on_submit: None,
             on_change: None,
@@ -325,11 +375,32 @@ impl<'a> Editor<'a> {
         }
     }
     pub fn set_autocomplete_provider(&mut self, provider: Box<dyn AutocompleteProvider>) {
+        let triggers = provider.trigger_characters().to_vec();
         self.provider = Some(provider);
+        // Default @/# when provider lists none; otherwise provider triggers only.
+        self.trigger_chars = if triggers.is_empty() {
+            DEFAULT_TRIGGER_CHARS.to_vec()
+        } else {
+            triggers
+        };
+        self.cancel_autocomplete_request();
         self.cancel_autocomplete();
     }
     pub fn is_showing_autocomplete(&self) -> bool {
         self.autocomplete.is_some()
+    }
+    /// Override attachment debounce (TS default 20ms). Use 0 in unit tests.
+    pub fn set_autocomplete_debounce_ms(&mut self, ms: u64) {
+        self.ac_debounce_ms = ms;
+    }
+    /// Process any pending debounced autocomplete request whose delay has elapsed.
+    /// Also processes immediately-ready requests (delay 0).
+    pub fn flush_autocomplete(&mut self) {
+        self.poll_autocomplete(true);
+    }
+    /// UTF-16 code-unit length of `s` (JS string index helper for tests).
+    pub fn utf16_len_of(s: &str) -> usize {
+        utf16_len(s)
     }
     pub fn get_padding_x(&self) -> usize {
         self.padding_x
@@ -345,6 +416,7 @@ impl<'a> Editor<'a> {
     fn set_col(&mut self, col: usize) {
         self.state.col = col.min(utf16_len(self.line()));
         self.preferred_col = None;
+        self.snapped_from_col = None;
     }
     fn push_undo(&mut self) {
         self.undo.push(&self.state);
@@ -432,8 +504,7 @@ impl<'a> Editor<'a> {
         let rest = &self.line()[b..];
         let end = rest.find(']')? + 1;
         let marker = &rest[..end];
-        self.marker_id(marker)
-            .map(|id| (utf16_len(marker), id))
+        self.marker_id(marker).map(|id| (utf16_len(marker), id))
     }
     fn remove_paste(&mut self, id: usize) {
         self.pastes.remove(&id);
@@ -449,7 +520,9 @@ impl<'a> Editor<'a> {
             let mut at = 0;
             while let Some(found) = line[at..].find(PASTE_PREFIX) {
                 let start = at + found;
-                let Some(close) = line[start..].find(']') else { break };
+                let Some(close) = line[start..].find(']') else {
+                    break;
+                };
                 let end = start + close + 1;
                 let marker = &line[start..end];
                 if let Some(number) = marker
@@ -458,7 +531,11 @@ impl<'a> Editor<'a> {
                     .and_then(|(n, _)| n.parse::<usize>().ok())
                     && number > id
                 {
-                    replacements.push((start, end, marker.replacen(&format!("#{number}"), &format!("#{}", number - 1), 1)));
+                    replacements.push((
+                        start,
+                        end,
+                        marker.replacen(&format!("#{number}"), &format!("#{}", number - 1), 1),
+                    ));
                 }
                 at = end;
             }
@@ -484,7 +561,11 @@ impl<'a> Editor<'a> {
         if next == -1 {
             if let Some(draft) = self.history_draft.take() {
                 self.state = draft;
+                self.preferred_col = None;
+                self.snapped_from_col = None;
                 self.changed();
+            } else {
+                self.set_text_inner("", false, false);
             }
         } else {
             self.set_text_inner(&self.history[next as usize].clone(), up, true);
@@ -499,7 +580,29 @@ impl<'a> Editor<'a> {
         self.insert_text_inner(text);
         self.last_action = Some(Action::Word);
         self.changed();
-        self.trigger_autocomplete(false);
+        // Autocomplete after insert (slash / trigger chars / continuation).
+        if self.autocomplete.is_some() {
+            self.update_autocomplete();
+        } else if text == "/" && self.state.line == 0 {
+            let before = self.line()[..utf16_to_byte(self.line(), self.state.col)].to_owned();
+            if before.trim_start() == "/" || before.starts_with('/') {
+                self.try_trigger_autocomplete(false);
+            }
+        } else if text.chars().count() == 1 {
+            let ch = text.chars().next().unwrap();
+            if self.trigger_chars.contains(&ch) {
+                let before = self.line()[..utf16_to_byte(self.line(), self.state.col)].to_owned();
+                let prev = before.chars().rev().nth(1);
+                if before.chars().count() == 1 || prev == Some(' ') || prev == Some('\t') {
+                    self.try_trigger_autocomplete(false);
+                }
+            } else {
+                let before = self.line()[..utf16_to_byte(self.line(), self.state.col)].to_owned();
+                if self.is_in_slash_context(&before) || self.matches_trigger_pattern(&before) {
+                    self.try_trigger_autocomplete(false);
+                }
+            }
+        }
     }
     fn newline(&mut self) {
         self.exit_history();
@@ -519,7 +622,14 @@ impl<'a> Editor<'a> {
                 (self.state.col - start, Some(id))
             } else {
                 let before = self.line()[..b].to_owned();
-                (before.graphemes(true).next_back().map(utf16_len).unwrap_or(1), None)
+                (
+                    before
+                        .graphemes(true)
+                        .next_back()
+                        .map(utf16_len)
+                        .unwrap_or(1),
+                    None,
+                )
             };
             let begin = utf16_to_byte(self.line(), self.state.col - len);
             self.state.lines[self.state.line].replace_range(begin..b, "");
@@ -535,6 +645,14 @@ impl<'a> Editor<'a> {
             self.state.lines[self.state.line].push_str(&current);
         }
         self.changed();
+        if self.autocomplete.is_some() {
+            self.update_autocomplete();
+        } else {
+            let before = self.line()[..utf16_to_byte(self.line(), self.state.col)].to_owned();
+            if self.is_in_slash_context(&before) || self.matches_trigger_pattern(&before) {
+                self.try_trigger_autocomplete(false);
+            }
+        }
     }
     fn forward_delete(&mut self) {
         self.exit_history();
@@ -546,7 +664,14 @@ impl<'a> Editor<'a> {
             let (len, removed) = if let Some((len, id)) = atomic {
                 (len, Some(id))
             } else {
-                (self.line()[b..].graphemes(true).next().map(utf16_len).unwrap_or(1), None)
+                (
+                    self.line()[b..]
+                        .graphemes(true)
+                        .next()
+                        .map(utf16_len)
+                        .unwrap_or(1),
+                    None,
+                )
             };
             let end = utf16_to_byte(self.line(), self.state.col + len);
             self.state.lines[self.state.line].replace_range(b..end, "");
@@ -671,60 +796,259 @@ impl<'a> Editor<'a> {
         if let Some(state) = self.undo.pop() {
             self.state = state;
             self.last_action = None;
+            self.preferred_col = None;
+            self.snapped_from_col = None;
             self.changed();
         }
     }
     fn move_horiz(&mut self, right: bool) {
         self.last_action = None;
-        self.preferred_col = None;
+        let visual_lines = self.build_visual_line_map(self.last_width);
+        let current_vl = self.find_current_visual_line(&visual_lines);
         if right {
             if let Some((len, _)) = self.atomic_at_cursor() {
-                self.state.col += len;
+                self.set_col(self.state.col + len);
             } else if self.state.col < utf16_len(self.line()) {
                 let b = utf16_to_byte(self.line(), self.state.col);
-                self.state.col += self.line()[b..].graphemes(true).next().map(utf16_len).unwrap_or(1);
+                let step = self.line()[b..]
+                    .graphemes(true)
+                    .next()
+                    .map(utf16_len)
+                    .unwrap_or(1);
+                self.set_col(self.state.col + step);
             } else if self.state.line + 1 < self.state.lines.len() {
                 self.state.line += 1;
-                self.state.col = 0;
+                self.set_col(0);
+            } else if let Some(vl) = visual_lines.get(current_vl) {
+                // At end of last line: keep preferred visual col for vertical nav.
+                self.preferred_col = Some(self.state.col.saturating_sub(vl.start_col));
             }
         } else if let Some((start, _)) = self.atomic_before_cursor() {
-            self.state.col = start;
+            self.set_col(start);
         } else if self.state.col > 0 {
             let b = utf16_to_byte(self.line(), self.state.col);
-            self.state.col -= self.line()[..b].graphemes(true).next_back().map(utf16_len).unwrap_or(1);
+            let step = self.line()[..b]
+                .graphemes(true)
+                .next_back()
+                .map(utf16_len)
+                .unwrap_or(1);
+            self.set_col(self.state.col - step);
         } else if self.state.line > 0 {
             self.state.line -= 1;
-            self.state.col = utf16_len(self.line());
+            self.set_col(utf16_len(self.line()));
+        }
+        if self.autocomplete.is_some() {
+            self.update_autocomplete();
         }
     }
     fn move_vert(&mut self, down: bool) {
         self.last_action = None;
-        let target = if down {
-            self.state.line + 1
-        } else {
-            self.state.line.saturating_sub(1)
-        };
-        if target >= self.state.lines.len() || (!down && self.state.line == 0) {
+        let visual_lines = self.build_visual_line_map(self.last_width);
+        if visual_lines.is_empty() {
             return;
         }
-        let col = *self.preferred_col.get_or_insert(self.state.col);
-        self.state.line = target;
-        self.state.col = col.min(utf16_len(self.line()));
+        let current = self.find_current_visual_line(&visual_lines);
+        let target = if down {
+            current + 1
+        } else {
+            current.saturating_sub(1)
+        };
+        if target >= visual_lines.len() || (!down && current == 0) {
+            return;
+        }
+        self.move_to_visual_line(&visual_lines, current, target);
+        if self.autocomplete.is_some() {
+            self.update_autocomplete();
+        }
+    }
+    fn page_scroll(&mut self, down: bool) {
+        self.last_action = None;
+        let rows = self.tui.terminal_rows() as usize;
+        let page = (rows * 3 / 10).max(5);
+        let visual_lines = self.build_visual_line_map(self.last_width);
+        if visual_lines.is_empty() {
+            return;
+        }
+        let current = self.find_current_visual_line(&visual_lines);
+        let target = if down {
+            (current + page).min(visual_lines.len() - 1)
+        } else {
+            current.saturating_sub(page)
+        };
+        self.move_to_visual_line(&visual_lines, current, target);
     }
     fn move_word(&mut self, forward: bool) {
         self.last_action = None;
+        let is_atomic = |s: &str| -> bool { is_marker(s) && self.marker_id(s).is_some() };
         if forward {
             if self.state.col == utf16_len(self.line()) {
                 self.move_horiz(true);
             } else {
-                self.state.col = find_word_forward(self.line(), self.state.col, None);
+                let col = find_word_forward(self.line(), self.state.col, Some(&is_atomic));
+                self.set_col(col);
             }
         } else if self.state.col == 0 && self.state.line > 0 {
             self.state.line -= 1;
-            self.state.col = utf16_len(self.line());
+            self.set_col(utf16_len(self.line()));
         } else {
-            self.state.col = find_word_backward(self.line(), self.state.col, None);
+            let col = find_word_backward(self.line(), self.state.col, Some(&is_atomic));
+            self.set_col(col);
         }
+    }
+    fn is_on_first_visual_line(&self) -> bool {
+        let vls = self.build_visual_line_map(self.last_width);
+        self.find_current_visual_line(&vls) == 0
+    }
+    fn is_on_last_visual_line(&self) -> bool {
+        let vls = self.build_visual_line_map(self.last_width);
+        !vls.is_empty() && self.find_current_visual_line(&vls) + 1 == vls.len()
+    }
+    fn is_editor_empty(&self) -> bool {
+        self.state.lines.len() == 1 && self.state.lines[0].is_empty()
+    }
+    fn build_visual_line_map(&self, width: usize) -> Vec<VisualLine> {
+        let width = width.max(1);
+        let mut out = Vec::new();
+        for (i, line) in self.state.lines.iter().enumerate() {
+            if line.is_empty() {
+                out.push(VisualLine {
+                    logical_line: i,
+                    start_col: 0,
+                    length: 0,
+                });
+            } else if visible_width(line) <= width {
+                out.push(VisualLine {
+                    logical_line: i,
+                    start_col: 0,
+                    length: utf16_len(line),
+                });
+            } else {
+                for chunk in word_wrap_line_inner(line, width, true) {
+                    out.push(VisualLine {
+                        logical_line: i,
+                        start_col: chunk.start_index,
+                        length: chunk.end_index.saturating_sub(chunk.start_index),
+                    });
+                }
+            }
+        }
+        out
+    }
+    fn find_visual_line_at(&self, visual_lines: &[VisualLine], line: usize, col: usize) -> usize {
+        for (i, vl) in visual_lines.iter().enumerate() {
+            if vl.logical_line != line {
+                continue;
+            }
+            let offset = col as isize - vl.start_col as isize;
+            let is_last =
+                i + 1 == visual_lines.len() || visual_lines[i + 1].logical_line != vl.logical_line;
+            if offset >= 0
+                && (offset < vl.length as isize || (is_last && offset == vl.length as isize))
+            {
+                return i;
+            }
+        }
+        visual_lines.len().saturating_sub(1)
+    }
+    fn find_current_visual_line(&self, visual_lines: &[VisualLine]) -> usize {
+        self.find_visual_line_at(visual_lines, self.state.line, self.state.col)
+    }
+    fn compute_vertical_move_column(
+        &mut self,
+        current_visual_col: usize,
+        source_max: usize,
+        target_max: usize,
+    ) -> usize {
+        let has_preferred = self.preferred_col.is_some();
+        let cursor_in_middle = current_visual_col < source_max;
+        let target_too_short = target_max < current_visual_col;
+        if !has_preferred || cursor_in_middle {
+            if target_too_short {
+                self.preferred_col = Some(current_visual_col);
+                return target_max;
+            }
+            self.preferred_col = None;
+            return current_visual_col;
+        }
+        let preferred = self.preferred_col.unwrap();
+        let cant_fit = target_max < preferred;
+        if target_too_short || cant_fit {
+            return target_max;
+        }
+        self.preferred_col = None;
+        preferred
+    }
+    fn move_to_visual_line(
+        &mut self,
+        visual_lines: &[VisualLine],
+        current_visual_line: usize,
+        target_visual_line: usize,
+    ) {
+        let Some(current_vl) = visual_lines.get(current_visual_line).copied() else {
+            return;
+        };
+        let Some(target_vl) = visual_lines.get(target_visual_line).copied() else {
+            return;
+        };
+        let current_visual_col = if let Some(snap) = self.snapped_from_col {
+            let vl_index = self.find_visual_line_at(visual_lines, current_vl.logical_line, snap);
+            snap.saturating_sub(visual_lines[vl_index].start_col)
+        } else {
+            self.state.col.saturating_sub(current_vl.start_col)
+        };
+        let is_last_source = current_visual_line + 1 == visual_lines.len()
+            || visual_lines[current_visual_line + 1].logical_line != current_vl.logical_line;
+        let source_max = if is_last_source {
+            current_vl.length
+        } else {
+            current_vl.length.saturating_sub(1)
+        };
+        let is_last_target = target_visual_line + 1 == visual_lines.len()
+            || visual_lines[target_visual_line + 1].logical_line != target_vl.logical_line;
+        let target_max = if is_last_target {
+            target_vl.length
+        } else {
+            target_vl.length.saturating_sub(1)
+        };
+        let move_to = self.compute_vertical_move_column(current_visual_col, source_max, target_max);
+        self.state.line = target_vl.logical_line;
+        let target_col = target_vl.start_col + move_to;
+        let logical = self.state.lines[target_vl.logical_line].clone();
+        self.state.col = target_col.min(utf16_len(&logical));
+
+        // Snap into atomic multi-grapheme segments (paste markers).
+        let segs = graphemes_with_markers(&logical);
+        for (index, segment) in segs {
+            let seg_len = utf16_len(&segment);
+            if index > self.state.col {
+                break;
+            }
+            if seg_len <= 1 {
+                continue;
+            }
+            if self.state.col < index + seg_len {
+                let is_continuation = index < target_vl.start_col;
+                let is_moving_down = target_visual_line > current_visual_line;
+                if is_continuation && is_moving_down {
+                    let seg_end = index + seg_len;
+                    let mut next = target_visual_line + 1;
+                    while next < visual_lines.len()
+                        && visual_lines[next].logical_line == target_vl.logical_line
+                        && visual_lines[next].start_col < seg_end
+                    {
+                        next += 1;
+                    }
+                    if next < visual_lines.len() {
+                        self.move_to_visual_line(visual_lines, current_visual_line, next);
+                        return;
+                    }
+                }
+                self.snapped_from_col = Some(self.state.col);
+                self.state.col = index;
+                return;
+            }
+        }
+        self.snapped_from_col = None;
     }
     fn jump_to(&mut self, wanted: &str, forward: bool) {
         self.last_action = None;
@@ -767,11 +1091,12 @@ impl<'a> Editor<'a> {
             let suffix = &rest[start + 2..];
             if let Some(end) = suffix.find(";5u")
                 && let Ok(cp) = suffix[..end].parse::<u32>()
-                    && ((65..=90).contains(&cp) || (97..=122).contains(&cp)) {
-                        decoded.push(char::from_u32(if cp >= 97 { cp - 96 } else { cp - 64 }).unwrap());
-                        rest = &suffix[end + 3..];
-                        continue;
-                    }
+                && ((65..=90).contains(&cp) || (97..=122).contains(&cp))
+            {
+                decoded.push(char::from_u32(if cp >= 97 { cp - 96 } else { cp - 64 }).unwrap());
+                rest = &suffix[end + 3..];
+                continue;
+            }
             decoded.push_str("\x1b[");
             rest = suffix;
         }
@@ -794,32 +1119,183 @@ impl<'a> Editor<'a> {
         }
     }
     fn trigger_autocomplete(&mut self, force: bool) {
-        let Some(provider) = self.provider.as_ref() else {
+        self.request_autocomplete(force, force);
+    }
+    fn try_trigger_autocomplete(&mut self, explicit_tab: bool) {
+        self.request_autocomplete(false, explicit_tab);
+    }
+    fn update_autocomplete(&mut self) {
+        if self.autocomplete.is_none() {
+            return;
+        }
+        let force = self.autocomplete_force;
+        self.request_autocomplete(force, false);
+    }
+    fn cancel_autocomplete_request(&mut self) {
+        if let Some(pending) = self.pending_ac.take() {
+            pending.abort.store(true, Ordering::SeqCst);
+        }
+    }
+    fn debounce_ms_for(&self, force: bool, explicit_tab: bool) -> u64 {
+        if force || explicit_tab {
+            return 0;
+        }
+        let before = self.line()[..utf16_to_byte(self.line(), self.state.col)].to_owned();
+        if self.matches_debounce_pattern(&before) {
+            self.ac_debounce_ms
+        } else {
+            0
+        }
+    }
+    fn matches_trigger_pattern(&self, before: &str) -> bool {
+        // (?:^|[\s])[triggers][^\s]*$
+        if before.is_empty() {
+            return false;
+        }
+        let chars: Vec<char> = before.chars().collect();
+        let mut i = chars.len();
+        while i > 0 && !chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        // i is start of last token
+        if i >= chars.len() {
+            return false;
+        }
+        let first = chars[i];
+        if !self.trigger_chars.contains(&first) {
+            return false;
+        }
+        if i > 0 && !chars[i - 1].is_whitespace() {
+            return false;
+        }
+        true
+    }
+    fn matches_debounce_pattern(&self, before: &str) -> bool {
+        // (?:^|[ \t])(?:@"..."|@\S*|[other][^\s]*)$
+        if before.is_empty() {
+            return false;
+        }
+        let chars: Vec<char> = before.chars().collect();
+        // find last space/tab or start
+        let mut i = chars.len();
+        while i > 0 && chars[i - 1] != ' ' && chars[i - 1] != '\t' {
+            i -= 1;
+        }
+        if i >= chars.len() {
+            return false;
+        }
+        let token: String = chars[i..].iter().collect();
+        if let Some(token) = token.strip_prefix('@') {
+            // @"..." or @nonspace*
+            if let Some(quoted) = token.strip_prefix('"') {
+                return !quoted.contains('"');
+            }
+            return !token.chars().any(|c| c.is_whitespace());
+        }
+        let others: Vec<char> = self
+            .trigger_chars
+            .iter()
+            .copied()
+            .filter(|c| *c != '@')
+            .collect();
+        if others.is_empty() {
+            return false;
+        }
+        let first = token.chars().next().unwrap();
+        others.contains(&first) && !token.chars().skip(1).any(|c| c.is_whitespace())
+    }
+    fn is_in_slash_context(&self, before: &str) -> bool {
+        let trimmed = before.trim_start();
+        trimmed.starts_with('/') && self.state.line == 0
+    }
+    fn request_autocomplete(&mut self, force: bool, explicit_tab: bool) {
+        if self.provider.is_none() {
+            return;
+        }
+        if force {
+            let ok = self
+                .provider
+                .as_ref()
+                .map(|p| {
+                    p.should_trigger_file_completion(
+                        &self.state.lines,
+                        self.state.line,
+                        self.state.col,
+                    )
+                })
+                .unwrap_or(false);
+            if !ok {
+                return;
+            }
+        }
+        self.cancel_autocomplete_request();
+        self.ac_token = self.ac_token.wrapping_add(1);
+        let token = self.ac_token;
+        let delay = self.debounce_ms_for(force, explicit_tab);
+        let abort = Arc::new(AtomicBool::new(false));
+        self.pending_ac = Some(PendingAutocomplete {
+            force,
+            explicit_tab,
+            token,
+            ready_at: Instant::now() + Duration::from_millis(delay),
+            text: self.get_text(),
+            line: self.state.line,
+            col: self.state.col,
+            abort,
+        });
+        if delay == 0 {
+            self.poll_autocomplete(true);
+        }
+    }
+    fn poll_autocomplete(&mut self, force_ready: bool) {
+        let Some(pending) = self.pending_ac.as_ref() else {
             return;
         };
-        if force
-            && !provider.should_trigger_file_completion(
-                &self.state.lines,
-                self.state.line,
-                self.state.col,
-            )
+        if !force_ready && Instant::now() < pending.ready_at {
+            return;
+        }
+        if pending.abort.load(Ordering::SeqCst) {
+            self.pending_ac = None;
+            return;
+        }
+        let pending = self.pending_ac.take().unwrap();
+        // Stale if document moved since schedule.
+        if pending.text != self.get_text()
+            || pending.line != self.state.line
+            || pending.col != self.state.col
+            || pending.token != self.ac_token
         {
             return;
         }
+        if pending.abort.load(Ordering::SeqCst) {
+            return;
+        }
+        let Some(provider) = self.provider.as_ref() else {
+            return;
+        };
+        let aborted = pending.abort.load(Ordering::SeqCst);
         let Some(s) = provider.get_suggestions(
             &self.state.lines,
             self.state.line,
             self.state.col,
-            SuggestionOptions { force },
+            SuggestionOptions {
+                force: pending.force,
+                aborted,
+            },
         ) else {
             self.cancel_autocomplete();
+            self.tui.request_render();
             return;
         };
-        if s.items.is_empty() {
-            self.cancel_autocomplete();
+        if aborted || pending.abort.load(Ordering::SeqCst) {
             return;
         }
-        if force && s.items.len() == 1 {
+        if s.items.is_empty() {
+            self.cancel_autocomplete();
+            self.tui.request_render();
+            return;
+        }
+        if pending.force && pending.explicit_tab && s.items.len() == 1 {
             self.apply_completion(&s.items[0], &s.prefix);
             return;
         }
@@ -832,17 +1308,31 @@ impl<'a> Editor<'a> {
                 y
             })
             .collect();
-        let mut list = SelectList::new(items, 5, SelectListTheme::identity(), Default::default());
-        if let Some(n) = s
-            .items
-            .iter()
-            .position(|x| x.value == s.prefix || x.value.starts_with(&s.prefix))
-        {
+        let mut list = SelectList::new(
+            items,
+            self.autocomplete_max_visible,
+            SelectListTheme::identity(),
+            Default::default(),
+        );
+        // Exact match wins; else first prefix match.
+        let mut first_prefix = None;
+        let mut exact = None;
+        for (i, item) in s.items.iter().enumerate() {
+            if item.value == s.prefix {
+                exact = Some(i);
+                break;
+            }
+            if first_prefix.is_none() && item.value.starts_with(&s.prefix) {
+                first_prefix = Some(i);
+            }
+        }
+        if let Some(n) = exact.or(first_prefix) {
             list.set_selected_index(n);
         }
         self.autocomplete = Some(list);
         self.autocomplete_prefix = s.prefix;
-        self.autocomplete_force = force;
+        self.autocomplete_force = pending.force;
+        self.tui.request_render();
     }
     fn apply_completion(&mut self, item: &AutocompleteItem, prefix: &str) {
         let Some(provider) = self.provider.as_ref() else {
@@ -856,15 +1346,18 @@ impl<'a> Editor<'a> {
             prefix,
         );
         self.push_undo();
+        self.last_action = None;
         self.state.lines = applied.lines;
         self.state.line = applied.cursor_line;
-        self.state.col = applied.cursor_col;
+        self.set_col(applied.cursor_col);
+        self.cancel_autocomplete_request();
         self.cancel_autocomplete();
         self.changed();
     }
     fn cancel_autocomplete(&mut self) {
         self.autocomplete = None;
         self.autocomplete_prefix.clear();
+        self.autocomplete_force = false;
     }
     fn submit(&mut self) {
         if self.disable_submit {
@@ -961,18 +1454,26 @@ impl<'a> Editor<'a> {
             self.move_horiz(false);
         } else if kb.matches(data, "tui.editor.cursorRight") {
             self.move_horiz(true);
+        } else if kb.matches(data, "tui.editor.pageUp") {
+            self.page_scroll(false);
+        } else if kb.matches(data, "tui.editor.pageDown") {
+            self.page_scroll(true);
         } else if kb.matches(data, "tui.editor.cursorUp") {
-            if self.history_index >= 0 || (self.state.line == 0 && self.state.col == 0) {
+            if self.is_on_first_visual_line()
+                && (self.is_editor_empty() || self.history_index > -1 || self.state.col == 0)
+            {
                 self.navigate_history(true);
-            } else if self.state.line == 0 {
+            } else if self.is_on_first_visual_line() {
+                self.last_action = None;
                 self.set_col(0);
             } else {
                 self.move_vert(false);
             }
         } else if kb.matches(data, "tui.editor.cursorDown") {
-            if self.history_index >= 0 {
+            if self.history_index > -1 && self.is_on_last_visual_line() {
                 self.navigate_history(false);
-            } else if self.state.line + 1 == self.state.lines.len() {
+            } else if self.is_on_last_visual_line() {
+                self.last_action = None;
                 self.set_col(utf16_len(self.line()));
             } else {
                 self.move_vert(true);
@@ -1012,6 +1513,7 @@ impl<'a> Editor<'a> {
 
 impl Component for Editor<'_> {
     fn render(&mut self, width: u16) -> &[Line] {
+        self.poll_autocomplete(false);
         let width = width as usize;
         let padding = self.padding_x.min(width.saturating_sub(1) / 2);
         let content = width.saturating_sub(padding * 2).max(1);
@@ -1031,8 +1533,10 @@ impl Component for Editor<'_> {
                 if has {
                     let offset = (self.state.col - part.start_index).min(utf16_len(&text));
                     let b = utf16_to_byte(&text, offset);
-                    let g = text[b..].graphemes(true).next().unwrap_or(" ");
-                    let tail = &text[b + g.len()..];
+                    let (g, tail) = match text[b..].graphemes(true).next() {
+                        Some(g) => (g, &text[b + g.len()..]),
+                        None => (" ", ""),
+                    };
                     let marker = if self.focused { CURSOR_MARKER } else { "" };
                     text = format!("{}{}\x1b[7m{}\x1b[0m{}", &text[..b], marker, g, tail);
                 }
@@ -1271,5 +1775,154 @@ mod tests {
         e.handle_input("\x7f");
         assert_eq!(e.get_text(), " [paste #1 +12 lines]");
         assert_eq!(e.get_expanded_text(), format!(" {}", "y\n".repeat(11)));
+    }
+
+    #[test]
+    fn visual_line_map_uses_utf16_offsets_and_wraps() {
+        let mut e = e();
+        e.set_text("ab😀cdef");
+        let visual = e.build_visual_line_map(4);
+        assert_eq!(
+            visual,
+            vec![
+                VisualLine {
+                    logical_line: 0,
+                    start_col: 0,
+                    length: 4
+                },
+                VisualLine {
+                    logical_line: 0,
+                    start_col: 4,
+                    length: 4
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn moves_through_wrapped_visual_lines_before_logical_lines() {
+        let mut e = e();
+        e.set_text("short\n123456789012345678901234567890");
+        e.render(15);
+        assert_eq!(e.get_cursor(), (1, 30));
+        e.handle_input("\x1b[A");
+        assert_eq!(e.get_cursor().0, 1);
+        e.handle_input("\x1b[A");
+        assert_eq!(e.get_cursor().0, 1);
+        e.handle_input("\x1b[A");
+        assert_eq!(e.get_cursor().0, 0);
+    }
+
+    #[test]
+    fn sticky_column_restores_across_short_visual_line() {
+        let mut e = e();
+        e.set_text("2222222222x222\n\n1111111111_111111111111");
+        e.handle_input("\x01");
+        for _ in 0..10 {
+            e.handle_input("\x1b[C");
+        }
+        e.handle_input("\x1b[A");
+        assert_eq!(e.get_cursor(), (1, 0));
+        e.handle_input("\x1b[A");
+        assert_eq!(e.get_cursor(), (0, 10));
+    }
+
+    #[test]
+    fn horizontal_movement_resets_sticky_column() {
+        let mut e = e();
+        e.set_text("1234567890\n\n1234567890");
+        e.handle_input("\x01");
+        for _ in 0..5 {
+            e.handle_input("\x1b[C");
+        }
+        e.handle_input("\x1b[A");
+        e.handle_input("\x1b[A");
+        e.handle_input("\x1b[D");
+        e.handle_input("\x1b[B");
+        e.handle_input("\x1b[B");
+        assert_eq!(e.get_cursor(), (2, 4));
+    }
+
+    #[test]
+    fn page_scroll_moves_by_terminal_page_of_visual_lines() {
+        let mut e = e();
+        e.set_text(
+            &(0..20)
+                .map(|n| format!("line{n}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        for _ in 0..19 {
+            e.handle_input("\x1b[A");
+        }
+        e.handle_input("\x01");
+        e.handle_input("\x1b[6~");
+        assert_eq!(e.get_cursor(), (7, 0));
+        e.handle_input("\x1b[5~");
+        assert_eq!(e.get_cursor(), (0, 0));
+    }
+
+    #[test]
+    fn resize_rewraps_visual_navigation_using_current_width() {
+        let mut e = e();
+        e.set_text("abcdefghijklmnopqr\n123456789012345678");
+        e.handle_input("\x1b[A");
+        e.handle_input("\x01");
+        for _ in 0..18 {
+            e.handle_input("\x1b[C");
+        }
+        e.render(10);
+        e.handle_input("\x1b[B");
+        assert_eq!(e.get_cursor(), (1, 8));
+        e.render(80);
+        e.handle_input("\x1b[A");
+        assert_eq!(e.get_cursor(), (0, 8));
+    }
+
+    #[test]
+    fn attachment_autocomplete_is_deferred_and_latest_request_wins() {
+        struct Provider;
+        impl AutocompleteProvider for Provider {
+            fn get_suggestions(
+                &self,
+                lines: &[String],
+                _: usize,
+                col: usize,
+                _: SuggestionOptions,
+            ) -> Option<crate::autocomplete::AutocompleteSuggestions> {
+                Some(crate::autocomplete::AutocompleteSuggestions {
+                    items: vec![AutocompleteItem {
+                        value: "@main.rs".into(),
+                        label: "@main.rs".into(),
+                        description: None,
+                    }],
+                    prefix: lines[0][..utf16_to_byte(&lines[0], col)].to_owned(),
+                })
+            }
+            fn apply_completion(
+                &self,
+                lines: &[String],
+                line: usize,
+                col: usize,
+                item: &AutocompleteItem,
+                _: &str,
+            ) -> crate::autocomplete::AppliedCompletion {
+                let mut lines = lines.to_vec();
+                let byte = utf16_to_byte(&lines[line], col);
+                lines[line].insert_str(byte, &item.value);
+                crate::autocomplete::AppliedCompletion {
+                    lines,
+                    cursor_line: line,
+                    cursor_col: col + utf16_len(&item.value),
+                }
+            }
+        }
+        let mut e = e();
+        e.set_autocomplete_provider(Box::new(Provider));
+        e.handle_input("@");
+        e.handle_input("m");
+        assert!(!e.is_showing_autocomplete());
+        e.flush_autocomplete();
+        assert!(e.is_showing_autocomplete());
     }
 }
