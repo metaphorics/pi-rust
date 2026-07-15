@@ -7,9 +7,11 @@ use std::{
     sync::Arc,
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use globset::{Glob, GlobSetBuilder};
 use ignore::WalkBuilder;
 use pi_agent::{AgentToolResult, ToolDefinition, ToolExecutionMode};
+use pi_ai::{Content, ImageContent, TextContent};
 use regex::RegexBuilder;
 use serde_json::{Value, json};
 
@@ -61,6 +63,17 @@ fn truncate_head(contents: &str, max_lines: usize, max_bytes: usize) -> (String,
     (lines.concat(), truncated, total_lines)
 }
 
+fn image_mime(path: &Path) -> Option<&'static str> {
+    match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "png" => Some("image/png"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "bmp" => Some("image/bmp"),
+        _ => None,
+    }
+}
+
 /// JSON schema copied from `core/tools/read.ts`.
 pub fn read_schema() -> Value {
     json!({"type":"object","properties":{"path":{"type":"string","description":"Path to the file to read (relative or absolute)"},"offset":{"type":"number","description":"Line number to start reading from (1-indexed)"},"limit":{"type":"number","description":"Maximum number of lines to read"}},"required":["path"]})
@@ -76,7 +89,20 @@ pub fn create_read_tool(cwd: impl Into<PathBuf>) -> ToolDefinition {
             let cwd = cwd.clone();
             Box::pin(async move {
                 let raw = string_arg(&args, "path")?;
-                let contents = fs::read_to_string(resolve(&cwd, raw)).map_err(|error| error.to_string())?;
+                let target = resolve(&cwd, raw);
+                if let Some(mime_type) = image_mime(&target) {
+                    let data = fs::read(&target).map_err(|error| error.to_string())?;
+                    return Ok(AgentToolResult {
+                        content: vec![
+                            Content::Text(TextContent { text: format!("Read image file [{mime_type}]").into(), text_signature: None }),
+                            Content::Image(ImageContent { data: BASE64.encode(data), mime_type: mime_type.to_owned() }),
+                        ],
+                        details: Value::Object(Default::default()),
+                        added_tool_names: None,
+                        terminate: None,
+                    });
+                }
+                let contents = fs::read_to_string(target).map_err(|error| error.to_string())?;
                 let all: Vec<&str> = contents.lines().collect();
                 let offset = limit_arg(&args, "offset").unwrap_or(1);
                 let start = offset.saturating_sub(1);
@@ -430,6 +456,19 @@ mod tests {
             .expect("read"),
             "beta"
         );
+        fs::write(dir.join("picture.png"), [137, 80, 78, 71]).expect("image fixture");
+        let image = (create_read_tool(&dir).execute)(
+            "test".into(),
+            json!({"path":"picture.png"}),
+            None,
+            None,
+        )
+        .await
+        .expect("image read");
+        assert!(matches!(
+            image.content.get(1),
+            Some(pi_ai::Content::Image(_))
+        ));
         assert!(
             run(
                 &create_write_tool(&dir),
