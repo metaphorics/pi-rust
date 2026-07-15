@@ -5,6 +5,8 @@
 pub mod auth;
 pub mod env_api_keys;
 pub mod event_stream;
+pub mod models;
+pub mod models_generated;
 pub mod oauth;
 pub mod types;
 pub mod utils;
