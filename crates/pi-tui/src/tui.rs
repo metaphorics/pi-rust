@@ -712,7 +712,9 @@ impl Tui {
         let first_frame = self.retained.is_empty() && new_len > 0;
 
         // Always rebuild overlay frames so first_frame/force paths never drop dialogs.
-        let (rt_overlays, overlay_cursor) = self.build_overlay_frames(width, height);
+        // Pass upcoming base length so focused-overlay CursorTarget uses composed
+        // working geometry (not stale pre-update retained len).
+        let (rt_overlays, overlay_cursor) = self.build_overlay_frames(width, height, new_len);
 
         if first_frame || (dirty.is_empty() && new_len != self.retained.len()) {
             let mut ansi_lines: Vec<String> = root_lines.iter().map(Line::to_ansi).collect();
@@ -759,13 +761,21 @@ impl Tui {
 
     /// Build overlay line frames sorted by focusOrder; extract CURSOR_MARKER
     /// from the focused overlay when present (pi compositeOverlays + extractCursor).
+    ///
+    /// `upcoming_base_len` is the root's post-render line count for this frame.
+    /// Overlay cursor abs_row mirrors inkferro-rt `overlay_working_geometry`:
+    /// `working_height = max(base, term_height, max overlay bottom)` then
+    /// `abs_row = working_height.saturating_sub(term_height) + layout.row + local.row`.
+    /// Using pre-update `self.retained.len()` would place the hardware cursor
+    /// off by the length delta when the root grows under a focused overlay.
     fn build_overlay_frames(
         &mut self,
         term_width: usize,
         term_height: usize,
+        upcoming_base_len: usize,
     ) -> (Vec<Overlay>, Option<CursorTarget>) {
         let mut rt_overlays: Vec<Overlay> = Vec::new();
-        let mut overlay_cursor: Option<CursorTarget> = None;
+        let mut focused_cursor_local: Option<(usize, usize, CursorTarget)> = None;
         let mut order: Vec<usize> = (0..self.overlays.len()).collect();
         order.sort_by_key(|&i| self.overlays[i].focus_order);
 
@@ -793,17 +803,7 @@ impl Tui {
             if is_focused
                 && let Some(local) = extract_cursor_from_ansi_lines(&mut strings, term_height)
             {
-                // Overlay.row/col are viewport-relative; translate local
-                // cursor into retained-buffer coordinates via viewport top.
-                let retained_len = self.retained.len().max(term_height);
-                let viewport_top = retained_len.saturating_sub(term_height);
-                let abs_row = viewport_top
-                    .saturating_add(layout.row)
-                    .saturating_add(local.row);
-                overlay_cursor = Some(CursorTarget {
-                    row: abs_row,
-                    col: layout.col.saturating_add(local.col),
-                });
+                focused_cursor_local = Some((layout.row, layout.col, local));
             }
             rt_overlays.push(Overlay {
                 row: layout.row,
@@ -812,6 +812,28 @@ impl Tui {
                 lines: strings,
             });
         }
+
+        // Mirror inkferro_rt::overlay_working_geometry with the upcoming base
+        // length so scrollback advance under a focused overlay keeps abs_row
+        // aligned with compose placement.
+        let overlay_cursor = focused_cursor_local.map(|(layout_row, layout_col, local)| {
+            let mut min_lines_needed = upcoming_base_len;
+            for ov in &rt_overlays {
+                min_lines_needed =
+                    min_lines_needed.max(ov.row.saturating_add(ov.lines.len()));
+            }
+            let working_height = upcoming_base_len
+                .max(term_height)
+                .max(min_lines_needed);
+            let viewport_start = working_height.saturating_sub(term_height);
+            CursorTarget {
+                row: viewport_start
+                    .saturating_add(layout_row)
+                    .saturating_add(local.row),
+                col: layout_col.saturating_add(local.col),
+            }
+        });
+
         (rt_overlays, overlay_cursor)
     }
 
@@ -1291,6 +1313,83 @@ mod tests {
         tui.do_render();
         // Overlay path strips CURSOR_MARKER from overlay lines (no panic).
         // Cursor extraction from focused overlay is exercised.
+    }
+
+    /// When root grows past the viewport under a focused overlay, CursorTarget
+    /// abs_row must use upcoming base length (compose working geometry), not
+    /// pre-update retained length. Also covers request_render(force).
+    #[test]
+    fn overlay_cursor_tracks_base_growth_and_force_redraw() {
+        const TERM_H: usize = 5;
+        const TERM_W: usize = 40;
+        const LAYOUT_ROW: usize = 0;
+        const LAYOUT_COL: usize = 2;
+
+        let mut tui = Tui::new(VirtualTerminal::new(TERM_W as u16, TERM_H as u16));
+        tui.set_show_hardware_cursor(true);
+
+        // Seed below viewport; growth past TERM_H makes viewport_start > 0.
+        let mut handles: Vec<Rc<RefCell<String>>> = Vec::new();
+        for i in 0..3 {
+            let (comp, handle) = LiveText::new(format!("base-{i}"));
+            handles.push(handle);
+            tui.add_child(comp);
+        }
+
+        let (ov, _) = LiveText::new("input");
+        let ov = ov.with_cursor();
+        let id = tui.show_overlay(
+            ov,
+            OverlayOptions {
+                anchor: OverlayAnchor::TopLeft,
+                width: Some(SizeValue::Abs(20)),
+                row: Some(SizeValue::Abs(LAYOUT_ROW)),
+                col: Some(SizeValue::Abs(LAYOUT_COL)),
+                ..Default::default()
+            },
+        );
+        assert_eq!(tui.focused, Some(FocusTarget::Overlay(id)));
+        tui.do_render();
+        // Overlay cursor local.row=0; base_len=3 ≤ TERM_H → viewport_start=0.
+        assert_eq!(tui.frame.lines_hardware_cursor_row(), LAYOUT_ROW);
+
+        // Append past viewport while overlay stays focused.
+        for i in 3..8 {
+            let (comp, handle) = LiveText::new(format!("base-{i}"));
+            handles.push(handle);
+            tui.add_child(comp);
+        }
+        // Height change dirties suffix; force a render.
+        tui.do_render();
+        let base_len = tui.retained.len();
+        assert_eq!(base_len, 8, "root must grow past term height");
+        // working_height = max(8, 5, overlay_bottom=1) = 8; viewport_start = 3
+        let expected_abs = base_len.saturating_sub(TERM_H) + LAYOUT_ROW;
+        assert!(
+            expected_abs > 0,
+            "regression needs nonzero viewport_start; got {expected_abs}"
+        );
+        assert_eq!(
+            tui.frame.lines_hardware_cursor_row(),
+            expected_abs,
+            "growth: hardware cursor must match compose viewport_start + layout.row"
+        );
+        assert_eq!(tui.frame.lines_viewport_top(), expected_abs);
+
+        // Force redraw clears retained then rebuilds; must still use upcoming base.
+        tui.request_render(true);
+        tui.do_render();
+        let base_len = tui.retained.len();
+        assert_eq!(base_len, 8);
+        let expected_abs = base_len.saturating_sub(TERM_H) + LAYOUT_ROW;
+        assert_eq!(
+            tui.frame.lines_hardware_cursor_row(),
+            expected_abs,
+            "force redraw: cursor must still track working geometry"
+        );
+        assert_eq!(tui.frame.lines_viewport_top(), expected_abs);
+        let _ = handles; // keep handles live for clarity
+        let _ = id;
     }
 
     #[test]
