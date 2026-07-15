@@ -11,6 +11,7 @@
     "key": "sk-test",
     "env": {
       "OPENAI_ORG_ID": "org-test"
-    }
+    },
+    "note": "keep-me"
   }
 }

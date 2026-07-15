@@ -704,46 +704,77 @@ impl AssistantMessageEvent {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OpenAICompletionsCompat {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_store: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_developer_role: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_reasoning_effort: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_usage_in_streaming: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens_field: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requires_tool_result_name: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requires_assistant_after_tool_result: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requires_thinking_as_text: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requires_reasoning_content_on_assistant_messages: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_format: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_template_kwargs: Option<HashMap<String, ChatTemplateKwargValue>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub open_router_routing: Option<OpenRouterRouting>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vercel_gateway_routing: Option<VercelGatewayRouting>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zai_tool_stream: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_strict_mode: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_control_format: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub send_session_affinity_headers: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_affinity_format: Option<SessionAffinityFormat>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_long_cache_retention: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OpenAIResponsesCompat {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_developer_role: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_affinity_format: Option<SessionAffinityFormat>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_long_cache_retention: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_tool_search: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AnthropicMessagesCompat {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_eager_tool_input_streaming: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_long_cache_retention: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub send_session_affinity_headers: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_cache_control_on_tools: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_temperature: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub force_adaptive_thinking: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_empty_signature: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_tool_references: Option<bool>,
 }
 

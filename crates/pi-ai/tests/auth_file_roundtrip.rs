@@ -54,4 +54,9 @@ fn auth_fixture_preserves_extension_fields() {
         panic!("expected oauth")
     };
     assert_eq!(oauth.extra["scope"], "user:inference");
+
+    let Credential::ApiKey(openai) = &auth["openai"] else {
+        panic!("expected api_key")
+    };
+    assert_eq!(openai.extra["note"], "keep-me");
 }
