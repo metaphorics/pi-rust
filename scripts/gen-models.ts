@@ -16,29 +16,81 @@ interface ModelLike {
 	[key: string]: unknown;
 }
 
-function findReferenceRoot(): string {
+interface ResolvedCatalogRoot {
+	/** Package root that contains either src/ or dist/ catalog sources. */
+	root: string;
+	/** Absolute path to models.generated.{ts,js}. */
+	generatedFile: string;
+	/** Absolute path to providers/ directory holding *.models.{ts,js}. */
+	providersDir: string;
+	/** File extension of provider model modules (".ts" | ".js"). */
+	modelsExt: ".ts" | ".js";
+}
+
+function resolveCatalogLayout(root: string): ResolvedCatalogRoot | null {
+	const srcGenerated = join(root, "src/models.generated.ts");
+	if (existsSync(srcGenerated)) {
+		return {
+			root,
+			generatedFile: srcGenerated,
+			providersDir: join(root, "src/providers"),
+			modelsExt: ".ts",
+		};
+	}
+	const distGenerated = join(root, "dist/models.generated.js");
+	if (existsSync(distGenerated)) {
+		return {
+			root,
+			generatedFile: distGenerated,
+			providersDir: join(root, "dist/providers"),
+			modelsExt: ".js",
+		};
+	}
+	return null;
+}
+
+function findReferenceRoot(): ResolvedCatalogRoot {
 	const configured = process.env.PI_AI_REF;
 	if (configured) {
 		const candidate = isAbsolute(configured) ? configured : resolve(process.cwd(), configured);
-		if (!existsSync(join(candidate, "src/models.generated.ts"))) {
-			throw new Error(`PI_AI_REF does not contain src/models.generated.ts: ${candidate}`);
+		const layout = resolveCatalogLayout(candidate);
+		if (!layout) {
+			throw new Error(
+				`PI_AI_REF does not contain src/models.generated.ts or dist/models.generated.js: ${candidate}`,
+			);
 		}
-		return candidate;
+		return layout;
 	}
 
+	// Dev path first: local .references checkout (src/, may include uncommitted catalog edits).
 	const documentedRelative = resolve(import.meta.dir, "../../../.references/pi/packages/ai");
-	if (existsSync(join(documentedRelative, "src/models.generated.ts"))) return documentedRelative;
+	const documentedLayout = resolveCatalogLayout(documentedRelative);
+	if (documentedLayout) return documentedLayout;
 
 	let current = import.meta.dir;
 	while (dirname(current) !== current) {
 		const candidate = join(current, ".references/pi/packages/ai");
-		if (existsSync(join(candidate, "src/models.generated.ts"))) return candidate;
+		const layout = resolveCatalogLayout(candidate);
+		if (layout) return layout;
 		current = dirname(current);
 	}
 
 	const workstationFallback = "/home/alpha/exp/pi-rust/.references/pi/packages/ai";
-	if (existsSync(join(workstationFallback, "src/models.generated.ts"))) return workstationFallback;
-	throw new Error("Unable to locate the pi packages/ai reference; set PI_AI_REF");
+	const workstationLayout = resolveCatalogLayout(workstationFallback);
+	if (workstationLayout) return workstationLayout;
+
+	// CI / hermetic path: published package installed under scripts/ (or repo root).
+	for (const candidate of [
+		resolve(import.meta.dir, "node_modules/@earendil-works/pi-ai"),
+		resolve(import.meta.dir, "../node_modules/@earendil-works/pi-ai"),
+	]) {
+		const layout = resolveCatalogLayout(candidate);
+		if (layout) return layout;
+	}
+
+	throw new Error(
+		"Unable to locate pi-ai catalog sources (src/ or dist/); set PI_AI_REF or install @earendil-works/pi-ai@0.80.7 under scripts/",
+	);
 }
 
 function rustString(value: string): string {
@@ -62,20 +114,23 @@ function stableJson(value: unknown): string {
 	});
 }
 
-const referenceRoot = findReferenceRoot();
-const providersDir = join(referenceRoot, "src/providers");
-const generatedSource = await Bun.file(join(referenceRoot, "src/models.generated.ts")).text();
+const layout = findReferenceRoot();
+const generatedSource = await Bun.file(layout.generatedFile).text();
+// Both models.generated.ts and the published dist .js keep `"provider": X_MODELS,` literals.
 const canonicalProviders = new Set(
 	[...generatedSource.matchAll(/^\s*"([^"]+)":\s*[A-Z0-9_]+_MODELS,/gm)].map((match) => match[1]),
 );
-const files = [...new Bun.Glob("*.models.ts").scanSync({ cwd: providersDir, absolute: true })].sort();
+const modelsGlob = `*${layout.modelsExt === ".ts" ? ".models.ts" : ".models.js"}`;
+const files = [...new Bun.Glob(modelsGlob).scanSync({ cwd: layout.providersDir, absolute: true })].sort();
 
 const models: ModelLike[] = [];
 for (const file of files) {
-	const provider = file.slice(file.lastIndexOf("/") + 1, -".models.ts".length);
+	const base = file.slice(file.lastIndexOf("/") + 1);
+	const provider = base.slice(0, -`.models${layout.modelsExt}`.length);
 	if (!canonicalProviders.has(provider)) continue;
-	// The module path is discovered from the canonical provider registry at runtime,
-	// so a static import cannot represent the complete generated catalog.
+	// Specifier is discovered from the canonical provider registry at runtime
+	// (src/*.models.ts locally, dist/*.models.js from the published package) —
+	// a static import cannot enumerate the complete generated catalog.
 	const module = (await import(pathToFileURL(file).href)) as Record<string, unknown>;
 	const catalog = Object.values(module).find(
 		(value): value is Record<string, ModelLike> =>
@@ -118,4 +173,6 @@ lines.push("];", "");
 const output = resolve(import.meta.dir, "../crates/pi-ai/src/models_generated.rs");
 await Bun.write(output, lines.join("\n"));
 // CI zero-diff gate: bun scripts/gen-models.ts && git diff --exit-code crates/pi-ai/src/models_generated.rs
-console.log(`Generated ${models.length} models from ${canonicalProviders.size} providers at ${output}`);
+process.stdout.write(
+	`Generated ${models.length} models from ${canonicalProviders.size} providers (${layout.modelsExt} catalog at ${layout.root}) → ${output}\n`,
+);

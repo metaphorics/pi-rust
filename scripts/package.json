@@ -1,0 +1,8 @@
+{
+	"name": "pi-rust-scripts",
+	"private": true,
+	"type": "module",
+	"devDependencies": {
+		"@earendil-works/pi-ai": "0.80.7"
+	}
+}
