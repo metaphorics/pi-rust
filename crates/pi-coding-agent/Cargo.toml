@@ -8,8 +8,14 @@ description = "pi coding agent: CLI, modes, session manager, tools, extension br
 [dependencies]
 pi-tui = { path = "../pi-tui" }
 pi-agent = { path = "../pi-agent" }
+pi-ai = { path = "../pi-ai" }
 pi-ext-protocol = { path = "../pi-ext-protocol" }
 anyhow.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+regex = "1"
+globset = "0.4"
+ignore = "0.4"
 
 [[bin]]
 name = "pi"
