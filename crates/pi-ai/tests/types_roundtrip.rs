@@ -7,7 +7,9 @@ fn assistant_message_roundtrips_wire_fixture() {
     let source = include_str!("fixtures/messages/assistant_message.json");
     let expected: Value = serde_json::from_str(source).unwrap();
     let message: Message = serde_json::from_str(source).unwrap();
-    assert_eq!(serde_json::to_value(message).unwrap(), expected);
+    assert_eq!(serde_json::to_value(&message).unwrap(), expected);
+    let json = serde_json::to_string(&message).unwrap();
+    assert_eq!(json.matches("\"role\"").count(), 1);
 }
 
 #[test]

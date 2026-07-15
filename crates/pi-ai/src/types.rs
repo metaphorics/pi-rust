@@ -381,7 +381,7 @@ pub struct ToolResultMessage {
     pub timestamp: i64,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(tag = "role")]
 pub enum Message {
     #[serde(rename = "user")]
@@ -390,6 +390,57 @@ pub enum Message {
     Assistant(AssistantMessage),
     #[serde(rename = "toolResult")]
     ToolResult(ToolResultMessage),
+}
+
+impl Serialize for Message {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct UserWire<'a> {
+            role: &'static str,
+            content: &'a UserContent,
+            timestamp: i64,
+        }
+
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct ToolResultWire<'a> {
+            role: &'static str,
+            tool_call_id: &'a str,
+            tool_name: &'a str,
+            content: &'a [Content],
+            #[serde(skip_serializing_if = "Option::is_none")]
+            details: &'a Option<Value>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            added_tool_names: &'a Option<Vec<String>>,
+            is_error: bool,
+            timestamp: i64,
+        }
+
+        match self {
+            Self::Assistant(message) => message.serialize(serializer),
+            Self::User(message) => UserWire {
+                role: "user",
+                content: &message.content,
+                timestamp: message.timestamp,
+            }
+            .serialize(serializer),
+            Self::ToolResult(message) => ToolResultWire {
+                role: "toolResult",
+                tool_call_id: &message.tool_call_id,
+                tool_name: &message.tool_name,
+                content: &message.content,
+                details: &message.details,
+                added_tool_names: &message.added_tool_names,
+                is_error: message.is_error,
+                timestamp: message.timestamp,
+            }
+            .serialize(serializer),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
