@@ -416,12 +416,27 @@ async function dispatchEvent(
     }
     default: {
       const event = withMintedSignal(wireEvent, signal);
-      if (type === "session_compact") {
-        runtime.bridged.notifySessionCompact(asObject(wireEvent["compactionEntry"] ?? {}));
-      }
       // Generic runner path (session_*, agent_*, turn_*, message_*,
       // tool_execution_*, model_select, thinking_level_select, ...).
       const result = await runner.emit(fromWire<never>(event));
+      if (type === "session_compact") {
+        // Oracle ordering: session_compact handlers run before compact()
+        // resolves, so pending ctx.compact() callbacks fire after emit.
+        runtime.bridged.notifySessionCompact(
+          asObject(wireEvent["compactionEntry"] ?? {}),
+          String(wireEvent["reason"] ?? ""),
+        );
+      }
+      if (type === "session_before_compact" && wireEvent["reason"] === "manual") {
+        // A cancelling handler makes the host throw "Compaction cancelled"
+        // (oracle: agent-session.ts compact()); no session_compact follows,
+        // so the matching pending ctx.compact() fails here. Non-cancel
+        // failures (LLM errors etc.) have no wire signal in protocol v1.
+        const emitted: unknown = result;
+        const cancel =
+          typeof emitted === "object" && emitted !== null && "cancel" in emitted && emitted.cancel === true;
+        if (cancel) runtime.bridged.failPendingCompact(new Error("Compaction cancelled"));
+      }
       return toWire(result ?? null);
     }
   }

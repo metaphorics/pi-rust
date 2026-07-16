@@ -13,6 +13,7 @@ import { decodeFrame, fromWire } from "../src/protocol.ts";
 import type { JsonObject, JsonValue, StateBlockDto } from "../src/protocol.ts";
 import { RpcError } from "../src/rpc.ts";
 import { FIXTURES_DIR, createTestBridge, makeInitParams, makeStateBlock } from "./harness.ts";
+import type { RustSide } from "./harness.ts";
 
 interface OrderGlobal {
   __piFixtureOrder?: string[];
@@ -287,6 +288,140 @@ describe("event dispatch", () => {
     }
     // No extra error/extension banner for the tool_call throw.
     expect(bridge.notificationsOf("error/extension").length).toBe(1);
+  });
+});
+
+describe("compact callback correlation", () => {
+  interface CompactCallbackEntry {
+    customType: string;
+    data: {
+      tag: string;
+      summary?: string;
+      firstKeptEntryId?: string;
+      tokensBefore?: number;
+      estimatedTokensAfter?: number | null;
+      details?: { tag: string } | null;
+      message?: string;
+    };
+  }
+
+  function sessionCompactEvent(tag: string, reason = "manual"): JsonObject {
+    return {
+      type: "session_compact",
+      compactionEntry: {
+        type: "compaction",
+        id: `c-${tag}`,
+        summary: `summary-${tag}`,
+        firstKeptEntryId: `keep-${tag}`,
+        tokensBefore: 1000,
+        estimatedTokensAfter: 250,
+        details: { tag },
+      },
+      fromExtension: false,
+      reason,
+      willRetry: false,
+    };
+  }
+
+  function beforeCompactEvent(customInstructions: string): JsonObject {
+    return {
+      type: "session_before_compact",
+      preparation: {},
+      branchEntries: [],
+      customInstructions,
+      reason: "manual",
+      willRetry: false,
+    };
+  }
+
+  async function bootCompactBridge() {
+    const bridge = createTestBridge();
+    await bridge.init(makeInitParams({ configuredPaths: [join(FIXTURES_DIR, "compact-callbacks.ts")] }));
+    return bridge;
+  }
+
+  function callbackEntries(bridge: RustSide, customType: string): CompactCallbackEntry["data"][] {
+    return bridge
+      .notificationsOf("action/appendEntry")
+      .map((entry) => fromWire<CompactCallbackEntry>(entry))
+      .filter((entry) => entry.customType === customType)
+      .map((entry) => entry.data);
+  }
+
+  test("each manual session_compact resolves exactly one pending compact in call order", async () => {
+    const bridge = await bootCompactBridge();
+    await bridge.peer.request("command/execute", { name: "trigger-compact", args: "one" });
+    await bridge.peer.request("command/execute", { name: "trigger-compact", args: "two" });
+    expect(bridge.notificationsOf("action/compact")).toEqual([
+      { options: { customInstructions: "one" } },
+      { options: { customInstructions: "two" } },
+    ]);
+
+    // One success event settles ONE pending — not all of them.
+    await bridge.peer.request("event/emit", emitParams(sessionCompactEvent("a")));
+    let completed = callbackEntries(bridge, "compact-complete");
+    expect(completed).toEqual([
+      {
+        tag: "one",
+        summary: "summary-a",
+        firstKeptEntryId: "keep-a",
+        tokensBefore: 1000,
+        estimatedTokensAfter: 250,
+        details: { tag: "a" },
+      },
+    ]);
+
+    await bridge.peer.request("event/emit", emitParams(sessionCompactEvent("b")));
+    completed = callbackEntries(bridge, "compact-complete");
+    expect(completed.length).toBe(2);
+    expect(completed[1]).toEqual({
+      tag: "two",
+      summary: "summary-b",
+      firstKeptEntryId: "keep-b",
+      tokensBefore: 1000,
+      estimatedTokensAfter: 250,
+      details: { tag: "b" },
+    });
+    expect(callbackEntries(bridge, "compact-error")).toEqual([]);
+  });
+
+  test("auto compactions (threshold/overflow) never consume pending compacts", async () => {
+    const bridge = await bootCompactBridge();
+    await bridge.peer.request("command/execute", { name: "trigger-compact", args: "one" });
+    await bridge.peer.request("event/emit", emitParams(sessionCompactEvent("auto", "threshold")));
+    expect(callbackEntries(bridge, "compact-complete")).toEqual([]);
+    await bridge.peer.request("event/emit", emitParams(sessionCompactEvent("manual")));
+    expect(callbackEntries(bridge, "compact-complete").map((entry) => entry.tag)).toEqual(["one"]);
+  });
+
+  test("a cancelled manual compaction rejects exactly one pending with the oracle error", async () => {
+    const bridge = await bootCompactBridge();
+    await bridge.peer.request("command/execute", { name: "trigger-compact", args: "cancel-me" });
+    const result = await bridge.peer.request("event/emit", emitParams(beforeCompactEvent("cancel-me")));
+    expect(result).toEqual({ cancel: true });
+    expect(callbackEntries(bridge, "compact-error")).toEqual([
+      { tag: "cancel-me", message: "Compaction cancelled" },
+    ]);
+    expect(callbackEntries(bridge, "compact-complete")).toEqual([]);
+  });
+
+  test("concurrent success and failure settle their own callbacks", async () => {
+    const bridge = await bootCompactBridge();
+    await bridge.peer.request("command/execute", { name: "trigger-compact", args: "first-ok" });
+    await bridge.peer.request("command/execute", { name: "trigger-compact", args: "cancel-me" });
+
+    // Host runs the first compaction: not cancelled, then completes.
+    const first = await bridge.peer.request("event/emit", emitParams(beforeCompactEvent("first-ok")));
+    expect(first).toBeNull();
+    await bridge.peer.request("event/emit", emitParams(sessionCompactEvent("a")));
+    // Second compaction: the before hook cancels it.
+    const second = await bridge.peer.request("event/emit", emitParams(beforeCompactEvent("cancel-me")));
+    expect(second).toEqual({ cancel: true });
+
+    expect(callbackEntries(bridge, "compact-complete").map((entry) => entry.tag)).toEqual(["first-ok"]);
+    expect(callbackEntries(bridge, "compact-error")).toEqual([
+      { tag: "cancel-me", message: "Compaction cancelled" },
+    ]);
   });
 });
 

@@ -52,8 +52,17 @@ export interface BridgedActions {
   contextActions: ExtensionContextActions;
   commandContextActions: ExtensionCommandContextActions;
   pendingSetups: Map<string, PendingSetup>;
-  /** Fired by the host when a `session_compact` event arrives. */
-  notifySessionCompact: (compactionEntry: JsonObject) => void;
+  /**
+   * Fired by the host when a manual `session_compact` event arrives.
+   * Resolves exactly ONE pending `ctx.compact()` callback (FIFO).
+   */
+  notifySessionCompact: (compactionEntry: JsonObject, reason: string) => void;
+  /**
+   * Fired by the host when a manual compaction observably fails (a
+   * `session_before_compact` handler returned `cancel: true`). Rejects
+   * exactly ONE pending `ctx.compact()` callback (FIFO).
+   */
+  failPendingCompact: (error: Error) => void;
   /** Turn-signal tracker; the host feeds idle transitions into it. */
   turnSignal: TurnSignalTracker;
 }
@@ -170,7 +179,9 @@ export function createBridgedActions(deps: BridgedActionDeps): BridgedActions {
     },
     getContextUsage: () => state.current.contextUsage,
     compact: (options) => {
-      if (options !== undefined) pendingCompacts.push(options);
+      // Every compact() call queues one FIFO entry (even option-less calls)
+      // so completions/failures consume pendings in call order.
+      pendingCompacts.push(options ?? {});
       peer.notify("action/compact", {
         ...(options?.customInstructions !== undefined
           ? { options: { customInstructions: options.customInstructions } }
@@ -235,25 +246,54 @@ export function createBridgedActions(deps: BridgedActionDeps): BridgedActions {
     },
   };
 
-  const notifySessionCompact = (compactionEntry: JsonObject): void => {
-    const callbacks = pendingCompacts.splice(0);
-    for (const options of callbacks) {
-      try {
-        options.onComplete?.({
-          summary: typeof compactionEntry["summary"] === "string" ? compactionEntry["summary"] : "",
-          firstKeptEntryId:
-            typeof compactionEntry["firstKeptEntryId"] === "string" ? compactionEntry["firstKeptEntryId"] : "",
-          tokensBefore:
-            typeof compactionEntry["tokensBefore"] === "number" ? compactionEntry["tokensBefore"] : 0,
-          details: compactionEntry["details"],
-        });
-      } catch {
-        // Extension callback errors must not break event dispatch.
-      }
+  // ctx.compact() runs as a manual compaction on the host (oracle:
+  // agent-session.ts compact() -> reason "manual"), so only manual outcomes
+  // consume pendings; threshold/overflow auto-compactions never do. Note
+  // session_compact's fromExtension flags an extension-SUPPLIED summary
+  // (session_before_compact result), not an extension-TRIGGERED compaction,
+  // so it cannot gate correlation. Residual ambiguity: a user /compact
+  // interleaved with a pending ctx.compact() is indistinguishable without a
+  // wire correlation id (protocol v1 gap).
+  const notifySessionCompact = (compactionEntry: JsonObject, reason: string): void => {
+    if (reason !== "manual") return;
+    const options = pendingCompacts.shift();
+    if (options === undefined) return;
+    try {
+      options.onComplete?.({
+        summary: typeof compactionEntry["summary"] === "string" ? compactionEntry["summary"] : "",
+        firstKeptEntryId:
+          typeof compactionEntry["firstKeptEntryId"] === "string" ? compactionEntry["firstKeptEntryId"] : "",
+        tokensBefore:
+          typeof compactionEntry["tokensBefore"] === "number" ? compactionEntry["tokensBefore"] : 0,
+        ...(typeof compactionEntry["estimatedTokensAfter"] === "number"
+          ? { estimatedTokensAfter: compactionEntry["estimatedTokensAfter"] }
+          : {}),
+        details: compactionEntry["details"],
+      });
+    } catch {
+      // Extension callback errors must not break event dispatch.
     }
   };
 
-  return { actions, contextActions, commandContextActions, pendingSetups, notifySessionCompact, turnSignal };
+  const failPendingCompact = (error: Error): void => {
+    const options = pendingCompacts.shift();
+    if (options === undefined) return;
+    try {
+      options.onError?.(error);
+    } catch {
+      // Extension callback errors must not break event dispatch.
+    }
+  };
+
+  return {
+    actions,
+    contextActions,
+    commandContextActions,
+    pendingSetups,
+    notifySessionCompact,
+    failPendingCompact,
+    turnSignal,
+  };
 }
 
 function decodeCancelled(ok: JsonValue): { cancelled: boolean } {
