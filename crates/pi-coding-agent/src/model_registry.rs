@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -182,6 +183,7 @@ pub struct ModelRegistry {
     model_request_headers: HashMap<String, HashMap<String, String>>,
     config_model_overrides: HashMap<String, HashMap<String, ModelOverride>>,
     registered_providers: HashMap<String, ProviderConfigInput>,
+    radius_oauth_providers: HashSet<String>,
     load_error: Option<String>,
     pub auth_storage: AuthStorage,
     models_json_path: Option<PathBuf>,
@@ -195,6 +197,7 @@ impl ModelRegistry {
             model_request_headers: HashMap::new(),
             config_model_overrides: HashMap::new(),
             registered_providers: HashMap::new(),
+            radius_oauth_providers: HashSet::new(),
             load_error: None,
             auth_storage,
             models_json_path: Some(models_json_path),
@@ -210,6 +213,7 @@ impl ModelRegistry {
             model_request_headers: HashMap::new(),
             config_model_overrides: HashMap::new(),
             registered_providers: HashMap::new(),
+            radius_oauth_providers: HashSet::new(),
             load_error: None,
             auth_storage,
             models_json_path: None,
@@ -222,6 +226,7 @@ impl ModelRegistry {
         self.provider_request_configs.clear();
         self.model_request_headers.clear();
         self.load_error = None;
+        pi_ai::oauth::reset_oauth_providers();
 
         self.load_models();
 
@@ -636,6 +641,7 @@ impl ModelRegistry {
     }
 
     fn load_models(&mut self) {
+        self.radius_oauth_providers.clear();
         let (custom_models, overrides, model_overrides) = if let Some(path) = self.models_json_path.clone() {
             match self.load_custom_models(&path) {
                 Ok(res) => res,
@@ -651,7 +657,8 @@ impl ModelRegistry {
         self.config_model_overrides = model_overrides.clone();
 
         let built_in = self.load_built_in_models(&overrides, &model_overrides);
-        self.models = self.merge_custom_models(built_in, custom_models);
+        let combined = self.merge_custom_models(built_in, custom_models);
+        self.models = self.apply_oauth_model_transforms(combined);
     }
 
     fn load_custom_models(&mut self, path: &std::path::Path) -> Result<LoadedCustomModels, String> {
@@ -679,6 +686,23 @@ impl ModelRegistry {
                         compat: provider_config.compat.clone(),
                     },
                 );
+            }
+
+            if matches!(provider_config.oauth, Some(OAuthProviderType::Radius)) {
+                let base_url = provider_config.base_url.as_deref().expect("validated Radius baseUrl");
+                let gateway = base_url
+                    .strip_suffix("/v1/")
+                    .or_else(|| base_url.strip_suffix("/v1"))
+                    .unwrap_or(base_url);
+                let provider = Arc::new(pi_ai::oauth::radius::create_radius_oauth_provider(
+                    pi_ai::oauth::radius::RadiusOAuthProviderOptions {
+                        id: provider_name.clone(),
+                        name: provider_config.name.clone().unwrap_or_else(|| provider_name.clone()),
+                        gateway: gateway.to_owned(),
+                    },
+                ));
+                pi_ai::oauth::register_oauth_login_provider(provider_name.clone(), provider);
+                self.radius_oauth_providers.insert(provider_name.clone());
             }
 
             let req_cfg = ProviderRequestConfig {
@@ -817,6 +841,91 @@ impl ModelRegistry {
             }
         }
         merged
+    }
+
+    fn apply_oauth_model_transforms(
+        &self,
+        mut models: Vec<pi_ai::types::Model>,
+    ) -> Vec<pi_ai::types::Model> {
+        if pi_ai::oauth::get_oauth_provider("github-copilot").is_some()
+            && let Ok(Some(pi_ai::auth::Credential::OAuth(credential))) =
+                self.auth_storage.get_sync("github-copilot")
+        {
+            let enterprise_domain = credential
+                .extra
+                .get("enterpriseUrl")
+                .and_then(Value::as_str)
+                .and_then(pi_ai::oauth::github_copilot::normalize_domain);
+            let base_url = pi_ai::oauth::github_copilot::get_base_url(
+                Some(&credential.access),
+                enterprise_domain.as_deref(),
+            );
+            let available_ids = credential.extra.get("availableModelIds").and_then(|value| {
+                value.as_array().map(|ids| {
+                    ids.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect::<HashSet<_>>()
+                })
+            });
+            models.retain_mut(|model| {
+                if model.provider != "github-copilot" {
+                    return true;
+                }
+                if available_ids.as_ref().is_some_and(|ids| !ids.contains(&model.id)) {
+                    return false;
+                }
+                model.base_url = base_url.clone();
+                true
+            });
+        }
+
+        let mut radius_provider_ids = self.radius_oauth_providers.clone();
+        radius_provider_ids.insert("radius".to_owned());
+        for provider_id in radius_provider_ids {
+            if pi_ai::oauth::get_oauth_provider(&provider_id).is_none() {
+                continue;
+            }
+            let Ok(Some(pi_ai::auth::Credential::OAuth(credential))) =
+                self.auth_storage.get_sync(&provider_id)
+            else {
+                continue;
+            };
+            let Some(config) = credential
+                .extra
+                .get("gatewayConfig")
+                .and_then(pi_ai::oauth::radius::sanitize_radius_gateway_config)
+            else {
+                continue;
+            };
+            let mut existing_ids = models
+                .iter()
+                .filter(|model| model.provider == provider_id)
+                .map(|model| model.id.clone())
+                .collect::<HashSet<_>>();
+            models.extend(config.models.into_iter().filter_map(|model| {
+                if !existing_ids.insert(model.id.clone()) {
+                    return None;
+                }
+                Some(pi_ai::types::Model {
+                    id: model.id,
+                    name: model.name,
+                    api: pi_ai::types::Api::new("pi-messages"),
+                    provider: provider_id.clone(),
+                    base_url: config.base_url.clone(),
+                    reasoning: model.reasoning,
+                    thinking_level_map: model.thinking_level_map,
+                    input: model.input,
+                    cost: model.cost,
+                    context_window: model.context_window,
+                    max_tokens: model.max_tokens,
+                    headers: None,
+                    compat: None,
+                })
+            }));
+        }
+
+        models
     }
 
     fn get_configured_model_override(&self, provider_name: &str, model_id: &str) -> Option<ModelOverride> {
@@ -1310,6 +1419,21 @@ fn validate_config(config: &ModelsConfig) -> Result<(), String> {
         let has_provider_api = provider_config.api.is_some();
         let models = provider_config.models.as_deref().unwrap_or(&[]);
         let has_model_overrides = provider_config.model_overrides.as_ref().map(|mo| !mo.is_empty()).unwrap_or(false);
+
+        if let Some(model_overrides) = &provider_config.model_overrides {
+            for (model_id, model_override) in model_overrides {
+                if model_override.api.is_some() {
+                    return Err(format!(
+                        "Provider {provider_name}, modelOverride {model_id}: unsupported field \"api\"."
+                    ));
+                }
+                if model_override.base_url.is_some() {
+                    return Err(format!(
+                        "Provider {provider_name}, modelOverride {model_id}: unsupported field \"baseUrl\"."
+                    ));
+                }
+            }
+        }
 
         if provider_config.oauth.is_some() && provider_config.base_url.is_none() {
             return Err(format!("Provider {}: \"baseUrl\" is required when \"oauth\" is set.", provider_name));

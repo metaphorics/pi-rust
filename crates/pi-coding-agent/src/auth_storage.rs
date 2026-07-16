@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 
-use pi_ai::auth::{Credential, FileCredentialStore, CredentialStore};
+use pi_ai::auth::{Credential, CredentialStoreError, FileCredentialStore, CredentialStore, ResolveAuthError};
 use crate::resolve_config_value::resolve_config_value;
 
 #[derive(Debug, thiserror::Error)]
@@ -31,14 +32,18 @@ pub struct AuthStatus {
 
 pub struct AuthStorage {
     store: FileCredentialStore,
+    path: PathBuf,
     runtime_overrides: HashMap<String, String>,
+    errors: Mutex<Vec<String>>,
 }
 
 impl AuthStorage {
     pub fn new(path: PathBuf) -> Self {
         Self {
-            store: FileCredentialStore::new(path),
+            store: FileCredentialStore::new(path.clone()),
+            path,
             runtime_overrides: HashMap::new(),
+            errors: Mutex::new(Vec::new()),
         }
     }
 
@@ -132,6 +137,28 @@ impl AuthStorage {
         })
     }
 
+    /// Read a raw credential directly from auth.json for synchronous catalog loading.
+    pub(crate) fn get_sync(&self, provider: &str) -> Result<Option<Credential>, AuthStorageError> {
+        let content = match std::fs::read_to_string(&self.path) {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let credentials: HashMap<String, Credential> = serde_json::from_str(&content)?;
+        Ok(credentials.get(provider).cloned())
+    }
+
+    pub fn get_errors(&self) -> Vec<String> {
+        self.errors.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
+    }
+
+    fn record_error(&self, error: &impl std::fmt::Display) {
+        self.errors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(error.to_string());
+    }
+
     /// Get API key for a provider.
     pub async fn get_api_key(&self, provider_id: &str, include_fallback: bool) -> Result<Option<String>, AuthStorageError> {
         if let Some(key) = self.runtime_overrides.get(provider_id) {
@@ -153,13 +180,44 @@ impl AuthStorage {
         ).await {
             Ok(Some(res)) => res,
             Ok(None) => return Ok(None),
-            Err(e) => return Err(AuthStorageError::Resolve(e)),
+            Err(ResolveAuthError::Store(CredentialStoreError::Update(message))) => {
+                self.record_error(&message);
+                return self.recover_after_oauth_refresh_failure(provider_id, oauth.as_deref()).await;
+            }
+            Err(ResolveAuthError::OAuth(error)) => {
+                self.record_error(&error);
+                return self.recover_after_oauth_refresh_failure(provider_id, oauth.as_deref()).await;
+            }
+            Err(error) => return Err(AuthStorageError::Resolve(error)),
         };
 
         if let Some(key) = auth_res.auth.api_key {
             Ok(resolve_config_value(&key, auth_res.env.as_ref()))
         } else {
             Ok(None)
+        }
+    }
+
+    async fn recover_after_oauth_refresh_failure(
+        &self,
+        provider_id: &str,
+        oauth: Option<&dyn pi_ai::auth::OAuthAuth>,
+    ) -> Result<Option<String>, AuthStorageError> {
+        let Some(Credential::OAuth(credential)) = self.store.read(provider_id).await? else {
+            return Ok(None);
+        };
+        if credential.expires <= jiff::Timestamp::now().as_millisecond() {
+            return Ok(None);
+        }
+        let Some(oauth) = oauth else {
+            return Ok(None);
+        };
+        match oauth.to_auth(&credential).await {
+            Ok(auth) => Ok(auth.api_key),
+            Err(error) => {
+                self.record_error(&error);
+                Ok(None)
+            }
         }
     }
 }

@@ -515,3 +515,149 @@ fn test_config_resolver_commands_and_headers() {
     assert_eq!(r.len(), 1);
     assert_eq!(r.get("HeaderA"), Some(&"LiteralValue".to_string()));
 }
+
+fn oauth_credential(access: &str, expires: i64, extra: serde_json::Value) -> Credential {
+    Credential::OAuth(OAuthCredential {
+        access: access.to_owned(),
+        refresh: "refresh-token".to_owned(),
+        expires,
+        extra: extra.as_object().expect("OAuth extra must be an object").iter()
+            .map(|(key, value)| (key.clone(), value.clone())).collect(),
+    })
+}
+
+fn write_credentials(path: &std::path::Path, credentials: &[(&str, Credential)]) {
+    let values = credentials.iter()
+        .map(|(provider, credential)| ((*provider).to_owned(), credential.clone()))
+        .collect::<HashMap<_, _>>();
+    fs::write(path, serde_json::to_vec_pretty(&values).unwrap()).unwrap();
+}
+
+#[test]
+fn oauth_credentials_transform_builtin_catalogs_after_merge() {
+    let temp_dir = TempDir::new().unwrap();
+    let auth_path = temp_dir.path().join("auth.json");
+    let models_path = temp_dir.path().join("models.json");
+    fs::write(&models_path, r#"{"providers": {}}"#).unwrap();
+
+    let baseline = ModelRegistry::create(AuthStorage::new(auth_path.clone()), models_path.clone());
+    let copilot_ids = baseline.get_all().iter()
+        .filter(|model| model.provider == "github-copilot")
+        .map(|model| model.id.clone()).collect::<Vec<_>>();
+    assert!(copilot_ids.len() > 1);
+    let kept_copilot_id = copilot_ids[0].clone();
+
+    let radius_extra = serde_json::json!({"gatewayConfig": {
+        "baseUrl": "https://radius.example/v1",
+        "models": [{"id": "radius-dynamic", "name": "Radius Dynamic", "reasoning": true,
+            "input": ["text"], "cost": {"input": 1.0, "output": 2.0, "cacheRead": 0.0, "cacheWrite": 0.0},
+            "contextWindow": 64000, "maxTokens": 4096}]
+    }});
+    let copilot_extra = serde_json::json!({
+        "enterpriseUrl": "ghe.example.com", "availableModelIds": [kept_copilot_id]
+    });
+    write_credentials(&auth_path, &[
+        ("radius", oauth_credential("radius-token", i64::MAX, radius_extra)),
+        ("github-copilot", oauth_credential("copilot-token", i64::MAX, copilot_extra)),
+    ]);
+
+    let registry = ModelRegistry::create(AuthStorage::new(auth_path), models_path);
+    let radius = registry.find("radius", "radius-dynamic").expect("Radius catalog model");
+    assert_eq!(radius.api.as_ref(), "pi-messages");
+    assert_eq!(radius.base_url, "https://radius.example/v1");
+    let copilot = registry.get_all().iter()
+        .filter(|model| model.provider == "github-copilot").collect::<Vec<_>>();
+    assert_eq!(copilot.len(), 1);
+    assert_eq!(copilot[0].id, copilot_ids[0]);
+    assert_eq!(copilot[0].base_url, "https://copilot-api.ghe.example.com");
+}
+
+#[test]
+fn custom_radius_oauth_registers_before_catalog_mutation() {
+    let temp_dir = TempDir::new().unwrap();
+    let auth_path = temp_dir.path().join("auth.json");
+    let models_path = temp_dir.path().join("models.json");
+    fs::write(&models_path, r#"{"providers":{"radius-corp":{
+        "name":"Corporate Radius","baseUrl":"https://gateway.example/v1","oauth":"radius"
+    }}}"#).unwrap();
+    write_credentials(&auth_path, &[("radius-corp", oauth_credential("corp-token", i64::MAX,
+        serde_json::json!({"gatewayConfig": {"baseUrl": "https://gateway.example/v1", "models": [{
+            "id": "corp-model", "name": "Corp Model", "reasoning": false, "input": ["text", "image"],
+            "cost": {"input": 0.1, "output": 0.2, "cacheRead": 0.0, "cacheWrite": 0.0},
+            "contextWindow": 32000, "maxTokens": 2048
+        }]}})
+    ))]);
+
+    let registry = ModelRegistry::create(AuthStorage::new(auth_path), models_path);
+    assert!(pi_ai::oauth::get_oauth_login_provider("radius-corp").is_some());
+    let model = registry.find("radius-corp", "corp-model").expect("custom Radius catalog model");
+    assert_eq!(model.base_url, "https://gateway.example/v1");
+    assert_eq!(model.provider, "radius-corp");
+}
+
+#[tokio::test]
+async fn oauth_refresh_failure_is_recorded_and_returns_unavailable() {
+    let temp_dir = TempDir::new().unwrap();
+    let auth_path = temp_dir.path().join("auth.json");
+    let provider_id = "radius-refresh-soft-fail";
+    let provider = std::sync::Arc::new(pi_ai::oauth::radius::create_radius_oauth_provider(
+        pi_ai::oauth::radius::RadiusOAuthProviderOptions {
+            id: provider_id.to_owned(), name: "Refresh failure".to_owned(), gateway: "http://127.0.0.1:9".to_owned(),
+        },
+    ));
+    pi_ai::oauth::register_oauth_login_provider(provider_id, provider);
+    write_credentials(&auth_path, &[(provider_id, oauth_credential("expired", 0, serde_json::json!({})))]);
+
+    let storage = AuthStorage::new(auth_path);
+    assert_eq!(storage.get_api_key(provider_id, false).await.unwrap(), None);
+    assert!(!storage.get_errors().is_empty());
+    assert!(matches!(storage.get(provider_id).await.unwrap(), Some(Credential::OAuth(_))));
+}
+
+#[tokio::test]
+async fn oauth_refresh_failure_reloads_a_concurrently_refreshed_credential() {
+    use std::io::{Read, Write};
+
+    let temp_dir = TempDir::new().unwrap();
+    let auth_path = temp_dir.path().join("auth.json");
+    let provider_id = "radius-refresh-race";
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let gateway = format!("http://{}", listener.local_addr().unwrap());
+    let refreshed_auth_path = auth_path.clone();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 4096];
+        let _ = stream.read(&mut request).unwrap();
+        write_credentials(&refreshed_auth_path, &[(
+            provider_id, oauth_credential("fresh-access", i64::MAX, serde_json::json!({})),
+        )]);
+        stream.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+    });
+    let provider = std::sync::Arc::new(pi_ai::oauth::radius::create_radius_oauth_provider(
+        pi_ai::oauth::radius::RadiusOAuthProviderOptions {
+            id: provider_id.to_owned(), name: "Refresh race".to_owned(), gateway,
+        },
+    ));
+    pi_ai::oauth::register_oauth_login_provider(provider_id, provider);
+    write_credentials(&auth_path, &[(provider_id, oauth_credential("expired", 0, serde_json::json!({})))]);
+
+    let storage = AuthStorage::new(auth_path);
+    assert_eq!(storage.get_api_key(provider_id, false).await.unwrap(), Some("fresh-access".to_owned()));
+    assert!(!storage.get_errors().is_empty());
+    server.join().unwrap();
+}
+
+#[test]
+fn model_overrides_reject_unsupported_transport_fields() {
+    let temp_dir = TempDir::new().unwrap();
+    let auth_path = temp_dir.path().join("auth.json");
+    let models_path = temp_dir.path().join("models.json");
+    for (field, value) in [("api", "openai-responses"), ("baseUrl", "https://ignored.example")] {
+        fs::write(&models_path, format!(
+            r#"{{"providers":{{"openai":{{"modelOverrides":{{"gpt-5.5":{{"{field}":"{value}"}}}}}}}}}}"#
+        )).unwrap();
+        let registry = ModelRegistry::create(AuthStorage::new(auth_path.clone()), models_path.clone());
+        let error = registry.get_error().expect("unsupported override must fail load");
+        assert!(error.contains(&format!("unsupported field \"{field}\"")), "{error}");
+    }
+}
