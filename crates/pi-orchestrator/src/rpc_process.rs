@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdout, Command};
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -271,24 +271,44 @@ fn sibling_pi_command() -> Result<(PathBuf, Vec<String>), RpcProcessError> {
     Ok((parent.join(name), vec!["--mode".into(), "rpc".into()]))
 }
 
-async fn writer_loop(
-    mut stdin: tokio::process::ChildStdin,
+async fn writer_loop<W>(
+    mut stdin: W,
     mut receiver: mpsc::UnboundedReceiver<WriterMessage>,
     inner: Arc<Inner>,
-) {
+) where
+    W: AsyncWrite + Unpin,
+{
     while let Some(message) = receiver.recv().await {
         if let Err(error) = stdin.write_all(message.line.as_bytes()).await {
-            if let Some(id) = message.request_id {
-                reject_pending(&inner, &id, RpcProcessError::new(error.to_string())).await;
-            }
-            continue;
+            finish_writer(error, message.request_id.as_deref(), &inner).await;
+            return;
         }
-        if let Err(error) = stdin.flush().await
-            && let Some(id) = message.request_id
-        {
-            reject_pending(&inner, &id, RpcProcessError::new(error.to_string())).await;
+        if let Err(error) = stdin.flush().await {
+            finish_writer(error, message.request_id.as_deref(), &inner).await;
+            return;
         }
     }
+}
+
+async fn finish_writer(error: std::io::Error, request_id: Option<&str>, inner: &Arc<Inner>) {
+    if inner.exited.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
+    inner.writer.lock().expect("writer lock poisoned").take();
+    let error = RpcProcessError::new(error.to_string());
+    if let Some(id) = request_id {
+        reject_pending(inner, id, error.clone()).await;
+    }
+    reject_all_pending(inner, error.clone()).await;
+
+    let mut subscribers = inner.exit_subscribers.lock().await;
+    for subscriber in subscribers.values() {
+        let _ = subscriber.send(error.clone());
+    }
+    subscribers.clear();
+    inner.exit_notify.notify_waiters();
+    let _ = inner.terminate.send(());
 }
 
 async fn stdout_loop(stdout: ChildStdout, inner: Arc<Inner>) {
@@ -513,7 +533,114 @@ fn signal_name(signal: i32) -> String {
 
 #[cfg(all(test, unix))]
 mod tests {
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
     use super::*;
+
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    enum FailurePoint {
+        Write,
+        Flush,
+    }
+
+    struct FailingWriter(FailurePoint);
+
+    fn broken_pipe() -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::BrokenPipe, "synthetic broken pipe")
+    }
+
+    impl AsyncWrite for FailingWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buffer: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if self.0 == FailurePoint::Write {
+                Poll::Ready(Err(broken_pipe()))
+            } else {
+                Poll::Ready(Ok(buffer.len()))
+            }
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            if self.0 == FailurePoint::Flush {
+                Poll::Ready(Err(broken_pipe()))
+            } else {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    async fn assert_writer_failure_teardown(failure_point: FailurePoint) {
+        let (writer_tx, writer_rx) = mpsc::unbounded_channel();
+        let (terminate, _terminate_rx) = mpsc::unbounded_channel();
+        let inner = Arc::new(Inner {
+            exited: AtomicBool::new(false),
+            next_request_id: AtomicU64::new(0),
+            next_subscriber_id: AtomicU64::new(0),
+            stderr: Mutex::new(Vec::new()),
+            pending: Mutex::new(HashMap::new()),
+            event_subscribers: Mutex::new(HashMap::new()),
+            exit_subscribers: Mutex::new(HashMap::new()),
+            ui_handler: Mutex::new(None),
+            writer: StdMutex::new(Some(writer_tx.clone())),
+            terminate,
+            exit_notify: Notify::new(),
+        });
+        let weak_inner = Arc::downgrade(&inner);
+        let (result_tx, result_rx) = oneshot::channel();
+        inner
+            .pending
+            .lock()
+            .await
+            .insert("request".into(), result_tx);
+
+        let writer_task = tokio::spawn(writer_loop(
+            FailingWriter(failure_point),
+            writer_rx,
+            Arc::clone(&inner),
+        ));
+        writer_tx
+            .send(WriterMessage {
+                line: "request\n".into(),
+                request_id: Some("request".into()),
+            })
+            .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), writer_task)
+            .await
+            .expect("writer task retained its receiver and Inner after I/O failure")
+            .unwrap();
+        assert!(
+            inner.writer.lock().expect("writer lock poisoned").is_none(),
+            "writer failure retained the stored sender"
+        );
+        assert_eq!(
+            result_rx.await.unwrap().unwrap_err().to_string(),
+            "synthetic broken pipe"
+        );
+
+        drop(inner);
+        assert!(
+            weak_inner.upgrade().is_none(),
+            "completed writer task retained Inner"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_failure_closes_sender_and_releases_writer_inner() {
+        assert_writer_failure_teardown(FailurePoint::Write).await;
+    }
+
+    #[tokio::test]
+    async fn flush_failure_closes_sender_and_releases_writer_inner() {
+        assert_writer_failure_teardown(FailurePoint::Flush).await;
+    }
 
     #[tokio::test]
     async fn dispose_releases_inner_after_writer_task_ends() {

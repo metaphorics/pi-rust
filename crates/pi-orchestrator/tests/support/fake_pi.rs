@@ -79,6 +79,13 @@ for raw in sys.stdin:
         write({"type": "response", "id": request_id, "command": kind, "success": True})
     elif kind == "pending":
         write({"type": "pending_received", "id": request_id})
+    elif kind == "close_stdin":
+        write({"type": "response", "id": request_id, "command": kind, "success": True})
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        os.close(sys.stdin.fileno())
+        write({"type": "agent_event", "value": os.getpid()})
+        while True:
+            signal.pause()
     elif kind == "exit":
         sys.stderr.write(command.get("stderr", ""))
         sys.stderr.flush()

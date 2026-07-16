@@ -195,3 +195,67 @@ async fn dispose_rejects_pending_then_sends_sigterm_and_awaits_exit() {
             .starts_with("RPC process exited (code=null signal=SIGTERM). Stderr: child stopping")
     );
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stdin_failure_tears_down_writer_while_child_stays_alive() {
+    use rustix::process::{Pid, Signal, kill_process};
+
+    struct KillOnDrop(Pid);
+
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = kill_process(self.0, Signal::KILL);
+        }
+    }
+
+    let fake = FakePi::new();
+    let process = RpcProcessInstance::spawn(fake.options()).unwrap();
+    let mut exits = process.subscribe_exit().await;
+    let mut events = process.subscribe_events().await;
+
+    let pending_process = process.clone();
+    let pending = tokio::spawn(async move {
+        pending_process
+            .send(command(json!({ "type": "pending" })))
+            .await
+            .unwrap_err()
+    });
+    assert_eq!(events.recv().await.unwrap()["type"], "pending_received");
+
+    process
+        .send(command(json!({ "type": "close_stdin" })))
+        .await
+        .unwrap();
+    let pid = events.recv().await.unwrap()["value"].as_i64().unwrap() as i32;
+    let _kill_child = KillOnDrop(Pid::from_raw(pid).unwrap());
+
+    let failed = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        process.send(command(json!({ "type": "echo" }))),
+    )
+    .await
+    .expect("stdin write failure did not reject the failed request")
+    .unwrap_err();
+    assert_eq!(failed.to_string(), "Broken pipe (os error 32)");
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while !process.has_exited() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("writer failure did not publish teardown while child remained alive");
+
+    let pending = tokio::time::timeout(std::time::Duration::from_secs(1), pending)
+        .await
+        .expect("stdin write failure did not reject an already-pending request")
+        .unwrap();
+    assert_eq!(pending, failed);
+    assert_eq!(exits.recv().await.unwrap(), failed);
+    assert!(exits.try_recv().is_err());
+
+    tokio::time::timeout(std::time::Duration::from_millis(100), process.dispose())
+        .await
+        .expect("dispose waited for the still-alive child after writer teardown");
+}
