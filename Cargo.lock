@@ -1303,6 +1303,7 @@ dependencies = [
  "anyhow",
  "dirs",
  "jiff",
+ "parking_lot",
  "pi-agent",
  "pi-ai",
  "pi-ext-protocol",
@@ -1311,6 +1312,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+ "tokio",
  "uuid",
 ]
 
