@@ -68,5 +68,13 @@ pub use session::{
     format_no_api_key_found_message, format_no_model_selected_message,
     format_no_models_available_message,
 };
+pub use session::runtime::{
+    AgentSessionRuntime, CreateRuntimeFactory, CreateRuntimeOptions, CreateRuntimeResult,
+    ReplaceResult,
+};
+pub use session::services::{
+    AgentSessionServices, CreateAgentSessionServicesOptions, DiagnosticLevel, RuntimeDiagnostic,
+    create_agent_session_services,
+};
 
 pub mod tools;

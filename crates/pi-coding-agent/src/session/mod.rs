@@ -10,6 +10,8 @@
 //! registry, lifecycle hooks in [`runtime`]) exist without them.
 
 pub mod events;
+pub mod runtime;
+pub mod services;
 
 use std::path::PathBuf;
 use std::sync::Arc;
