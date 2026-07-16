@@ -350,7 +350,7 @@ fn discovers_manifest_and_convention_resources_with_filters() {
     );
 
     let resources = manager.resolve().unwrap();
-    assert_eq!(resources.extensions.len(), 2);
+    assert_eq!(resources.extensions.len(), 1);
     assert!(
         resources
             .extensions
@@ -358,14 +358,146 @@ fn discovers_manifest_and_convention_resources_with_filters() {
             .any(|r| r.path.ends_with("src/a.ts") && !r.enabled)
     );
     assert!(
-        resources
+        !resources
             .extensions
             .iter()
-            .any(|r| r.path.ends_with("src/b.ts") && !r.enabled)
+            .any(|r| r.path.ends_with("src/b.ts"))
     );
     assert_eq!(resources.skills.len(), 1);
     assert!(resources.skills[0].enabled);
     assert_eq!(resources.skills[0].metadata.scope, PackageScope::User);
+}
+
+#[test]
+fn empty_filter_array_disables_all_resources() {
+    let (_temp, cwd, agent) = fixture();
+    let package = cwd.join("pkg-empty-filter");
+    fs::create_dir_all(package.join("extensions")).unwrap();
+    fs::write(package.join("extensions/foo.ts"), "export default () => {};").unwrap();
+    fs::write(package.join("extensions/bar.ts"), "export default () => {};").unwrap();
+    let mut settings = Settings::new();
+    settings.insert(
+        "packages",
+        json!([{
+            "source": package.to_string_lossy(),
+            "extensions": []
+        }]),
+    );
+    let mut manager = DefaultPackageManager::with_runner(
+        &cwd,
+        &agent,
+        SettingsManager::in_memory(settings, true),
+        RecordingRunner::default(),
+    );
+    let resources = manager.resolve().unwrap();
+    assert_eq!(resources.extensions.len(), 2);
+    assert!(resources.extensions.iter().all(|r| !r.enabled));
+}
+
+#[test]
+fn empty_filter_array_autoload_false_produces_nothing() {
+    let (_temp, cwd, agent) = fixture();
+    let package = cwd.join("pkg-delta-empty");
+    fs::create_dir_all(package.join("extensions")).unwrap();
+    fs::write(package.join("extensions/foo.ts"), "export default () => {};").unwrap();
+    let mut settings = Settings::new();
+    settings.insert(
+        "packages",
+        json!([{
+            "source": package.to_string_lossy(),
+            "autoload": false,
+            "extensions": []
+        }]),
+    );
+    let mut manager = DefaultPackageManager::with_runner(
+        &cwd,
+        &agent,
+        SettingsManager::in_memory(settings, true),
+        RecordingRunner::default(),
+    );
+    let resources = manager.resolve().unwrap();
+    assert_eq!(resources.extensions.len(), 0);
+}
+
+#[test]
+fn root_only_index_with_empty_filter_loads_nothing() {
+    let (_temp, cwd, agent) = fixture();
+    let package = cwd.join("pkg-root-index-filter");
+    fs::create_dir_all(&package).unwrap();
+    fs::write(package.join("index.ts"), "export default () => {};").unwrap();
+    let mut settings = Settings::new();
+    settings.insert(
+        "packages",
+        json!([{
+            "source": package.to_string_lossy(),
+            "extensions": []
+        }]),
+    );
+    let mut manager = DefaultPackageManager::with_runner(
+        &cwd,
+        &agent,
+        SettingsManager::in_memory(settings, true),
+        RecordingRunner::default(),
+    );
+    let resources = manager.resolve().unwrap();
+    assert_eq!(resources.extensions.len(), 0);
+}
+
+#[test]
+fn layered_manifest_and_user_filters() {
+    let (_temp, cwd, agent) = fixture();
+    let package = cwd.join("pkg-layered");
+    fs::create_dir_all(package.join("extensions")).unwrap();
+    fs::write(package.join("extensions/foo.ts"), "export default () => {};").unwrap();
+    fs::write(package.join("extensions/bar.ts"), "export default () => {};").unwrap();
+    fs::write(package.join("extensions/baz.ts"), "export default () => {};").unwrap();
+    fs::write(
+        package.join("package.json"),
+        serde_json::to_vec_pretty(&json!({
+            "name": "layered",
+            "pi": {
+                "extensions": ["extensions/*.ts", "!extensions/baz.ts"]
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut settings = Settings::new();
+    settings.insert(
+        "packages",
+        json!([{
+            "source": package.to_string_lossy(),
+            "extensions": ["!**/bar.ts"]
+        }]),
+    );
+    let mut manager = DefaultPackageManager::with_runner(
+        &cwd,
+        &agent,
+        SettingsManager::in_memory(settings, true),
+        RecordingRunner::default(),
+    );
+    let resources = manager.resolve().unwrap();
+    // foo.ts: included (not excluded by anyone)
+    assert!(
+        resources
+            .extensions
+            .iter()
+            .any(|r| r.path.ends_with("foo.ts") && r.enabled)
+    );
+    // bar.ts: excluded by user filter, present but disabled
+    assert!(
+        resources
+            .extensions
+            .iter()
+            .any(|r| r.path.ends_with("bar.ts") && !r.enabled)
+    );
+    // baz.ts: excluded by manifest, completely absent
+    assert!(
+        !resources
+            .extensions
+            .iter()
+            .any(|r| r.path.ends_with("baz.ts"))
+    );
 }
 
 #[test]

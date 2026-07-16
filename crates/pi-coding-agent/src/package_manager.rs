@@ -620,11 +620,10 @@ impl<R: CommandRunner> DefaultPackageManager<R> {
                 );
                 continue;
             }
-            let before = resolved_len(&result);
-            self.collect_package_resources(&installed, filter.as_ref(), &metadata, &mut result)?;
+            let is_package = self.collect_package_resources(&installed, filter.as_ref(), &metadata, &mut result)?;
             if matches!(parsed_source, PackageSource::Local { .. })
                 && installed.is_dir()
-                && resolved_len(&result) == before
+                && !is_package
             {
                 add_resolved(
                     &mut result,
@@ -680,17 +679,31 @@ impl<R: CommandRunner> DefaultPackageManager<R> {
         filter: Option<&PackageFilter>,
         metadata: &PathMetadata,
         output: &mut ResolvedPaths,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let manifest = read_pi_manifest(root);
+        let is_package = filter.is_some()
+            || manifest.is_some()
+            || RESOURCE_TYPES.iter().any(|r| root.join(r.key()).exists())
+            || root.join("index.ts").is_file()
+            || root.join("index.js").is_file();
+        if !is_package {
+            return Ok(false);
+        }
+
         let mut found = false;
         for resource_type in RESOURCE_TYPES {
+            let dir = root.join(resource_type.key());
+            if manifest.is_none() && filter.is_none() && !dir.exists() {
+                continue;
+            }
+
             let manifest_patterns = manifest
                 .as_ref()
                 .and_then(|m| string_array(m.get(resource_type.key())));
             let all = if let Some(entries) = manifest_patterns.as_ref() {
                 collect_manifest_files(root, resource_type, entries)
             } else {
-                collect_resource_files(&root.join(resource_type.key()), resource_type)
+                collect_resource_files(&dir, resource_type)
             };
             if !all.is_empty() {
                 found = true;
@@ -699,6 +712,14 @@ impl<R: CommandRunner> DefaultPackageManager<R> {
                 || all.iter().cloned().collect::<HashSet<_>>(),
                 |patterns| apply_patterns(&all, &override_patterns(patterns), root),
             );
+            // Apply manifest override collection: manifest-excluded paths are absent from resolve output
+            let all = if manifest_patterns.is_some() {
+                all.into_iter()
+                    .filter(|path| manifest_enabled.contains(path))
+                    .collect::<Vec<_>>()
+            } else {
+                all
+            };
             let states: Vec<(PathBuf, bool)> = match filter {
                 Some(filter) if filter.autoload == Some(false) => {
                     let patterns = filter.patterns(resource_type).unwrap_or_default();
@@ -708,21 +729,23 @@ impl<R: CommandRunner> DefaultPackageManager<R> {
                 }
                 Some(filter) if filter.patterns(resource_type).is_some() => {
                     let patterns = filter.patterns(resource_type).unwrap_or_default();
-                    let enabled = apply_patterns(&all, patterns, root);
-                    all.into_iter()
-                        .map(|path| {
-                            let is_enabled =
-                                enabled.contains(&path) && manifest_enabled.contains(&path);
-                            (path, is_enabled)
-                        })
-                        .collect()
+                    if patterns.is_empty() {
+                        all.into_iter()
+                            .map(|path| (path, false))
+                            .collect()
+                    } else {
+                        let enabled = apply_patterns(&all, patterns, root);
+                        all.into_iter()
+                            .map(|path| {
+                                let is_enabled = enabled.contains(&path);
+                                (path, is_enabled)
+                            })
+                            .collect()
+                    }
                 }
                 _ => all
                     .into_iter()
-                    .map(|path| {
-                        let enabled = manifest_enabled.contains(&path);
-                        (path, enabled)
-                    })
+                    .map(|path| (path, true))
                     .collect(),
             };
             for (path, enabled) in states {
@@ -737,7 +760,7 @@ impl<R: CommandRunner> DefaultPackageManager<R> {
                 );
             }
         }
-        if !found && manifest.is_none() {
+        if filter.is_none() && !found && manifest.is_none() {
             for name in ["index.ts", "index.js"] {
                 let path = root.join(name);
                 if path.is_file() {
@@ -754,7 +777,7 @@ impl<R: CommandRunner> DefaultPackageManager<R> {
                 }
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     fn install_parsed(&self, parsed: &PackageSource, scope: PackageScope) -> Result<()> {
@@ -1740,9 +1763,6 @@ fn has_glob(entry: &str) -> bool {
     entry.contains(['*', '?', '[', '{'])
 }
 
-fn resolved_len(output: &ResolvedPaths) -> usize {
-    output.extensions.len() + output.skills.len() + output.prompts.len() + output.themes.len()
-}
 
 fn add_resolved(
     output: &mut ResolvedPaths,
