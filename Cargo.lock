@@ -1415,6 +1415,8 @@ dependencies = [
  "dirs",
  "hostname",
  "jiff",
+ "log",
+ "parking_lot",
  "pi-ai",
  "pi-coding-agent",
  "rand 0.9.5",

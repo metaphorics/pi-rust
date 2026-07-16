@@ -42,6 +42,7 @@ import signal
 import sys
 
 pairs = []
+session = 0
 
 def write(value):
     sys.stdout.write(json.dumps(value, separators=(",", ":")) + "\n")
@@ -50,6 +51,8 @@ def write(value):
 def terminate(received_signal, _frame):
     sys.stderr.write("received SIGTERM")
     sys.stderr.flush()
+    with open("sigterm.marker", "w") as marker:
+        marker.write("sigterm")
     signal.signal(received_signal, signal.SIG_DFL)
     os.kill(os.getpid(), received_signal)
 
@@ -61,6 +64,13 @@ for raw in sys.stdin:
     request_id = command.get("id")
     if kind == "echo":
         write({"type": "response", "id": request_id, "command": kind, "success": True, "data": command.get("value")})
+    elif kind == "get_state":
+        write({"type": "response", "id": request_id, "command": kind, "success": True, "data": {"sessionId": "session-%d" % session, "sessionFile": "/tmp/session-%d.jsonl" % session}})
+    elif kind in ("new_session", "switch_session", "fork", "clone", "set_session_name", "prompt", "advance"):
+        session += 1
+        write({"type": "response", "id": request_id, "command": kind, "success": True})
+    elif kind == "crash":
+        os._exit(9)
     elif kind == "pair":
         pairs.append(command)
         if len(pairs) == 2:

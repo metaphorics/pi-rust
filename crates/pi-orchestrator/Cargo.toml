@@ -12,6 +12,10 @@ dirs = "6"
 # Node-compatible hostname for Radius registration payloads.
 hostname = "0.4"
 jiff.workspace = true
+# Lifecycle diagnostics (console.error analog) without stderr writes in library code.
+log = "0.4"
+# Poison-free synchronous guards for supervisor state.
+parking_lot = "0.12"
 # Radius OAuth credential storage.
 pi-ai = { path = "../pi-ai" }
 # Shared ~/.pi/agent/auth.json path resolution.

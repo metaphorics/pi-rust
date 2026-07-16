@@ -313,10 +313,7 @@ mod tests {
         assert!(Arc::ptr_eq(&first.lock, &second.lock));
         let barrier = Arc::new(std::sync::Barrier::new(3));
         let mut workers = Vec::new();
-        for (id, storage) in [
-            ("concurrent-one", first),
-            ("concurrent-two", second),
-        ] {
+        for (id, storage) in [("concurrent-one", first), ("concurrent-two", second)] {
             let barrier = Arc::clone(&barrier);
             workers.push(std::thread::spawn(move || {
                 barrier.wait();
