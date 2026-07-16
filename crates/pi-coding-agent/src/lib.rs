@@ -4,6 +4,7 @@
 
 pub mod config;
 pub mod cli;
+pub mod source_info;
 pub mod extension_bridge;
 pub mod migrations;
 pub mod resource_loader;
@@ -33,9 +34,11 @@ pub use config::{
     get_package_dir, get_sessions_dir, get_settings_path,
 };
 pub use extension_bridge::{
-    DiscoveredExtensions, ExtensionBridge, ForkPosition, HookOutcome, NoopExtensionBridge,
-    SessionLifecycleEvent, SessionShutdownReason, SessionStartReason,
+    DiscoveredExtensions, ExtensionBridge, ExtensionUiHost, ForkPosition, HookOutcome,
+    NoopExtensionBridge, NotifyType, RegisteredCommand, SessionLifecycleEvent,
+    SessionShutdownReason, SessionStartReason, UiDialogOptions, WidgetPlacement,
 };
+pub use source_info::{SourceInfo, SourceOrigin, SourceScope};
 pub use migrations::{MigrationResult, run_migrations, run_migrations_with_agent_dir};
 pub use resource_loader::{
     DefaultResourceLoader, DiscoveredResources, ResourceLoaderOptions, ResourcePath,
@@ -62,10 +65,10 @@ pub use system_prompt::{
 };
 pub use session::{
     AgentSession, AgentSessionConfig, AgentSessionEvent, AgentSessionEventListener, BashResult,
-    CompactionReason, CompactionResult, ContextUsage, ModelCycleResult, NavigateTreeOptions,
-    NavigateTreeResult, PromptOptions, PromptTemplate, ScopedModel, SessionStats,
-    SessionToolDefinition, StreamingBehavior, ToolInfo, convert_to_llm,
-    format_no_api_key_found_message, format_no_model_selected_message,
+    CompactionReason, CompactionResult, ContextUsage, CustomMessageDelivery, ModelCycleResult,
+    NavigateTreeOptions, NavigateTreeResult, PromptOptions, PromptTemplate, ScopedModel,
+    SendCustomMessageOptions, SessionStats, SessionToolDefinition, StreamingBehavior, ToolInfo,
+    convert_to_llm, format_no_api_key_found_message, format_no_model_selected_message,
     format_no_models_available_message,
 };
 pub use session::runtime::{

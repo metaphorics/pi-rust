@@ -858,6 +858,7 @@ async fn skill_and_template_expansion_produce_verbatim_blocks() {
         argument_hint: None,
         content: "X $1 and all: $ARGUMENTS (${2:-fallback})".to_string(),
         file_path: PathBuf::from("tpl.md"),
+        source_info: Default::default(),
     };
 
     let fixture = tokio::task::spawn_blocking(move || {

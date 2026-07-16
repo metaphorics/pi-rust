@@ -63,11 +63,18 @@ pub struct SessionInfo {
 }
 
 /// Tree node returned by [`SessionManager::get_tree`].
-#[derive(Clone, Debug)]
+///
+/// Serialize shape is the RPC `get_tree` wire contract (oracle
+/// `SessionTreeNode`): `entry`, `children`, optional `label` /
+/// `labelTimestamp`.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionTreeNode {
     pub entry: SessionEntry,
     pub children: Vec<SessionTreeNode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub label_timestamp: Option<String>,
 }
 

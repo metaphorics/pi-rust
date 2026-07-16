@@ -120,6 +120,11 @@ impl AgentSessionRuntime {
         self.state.lock().rebind_session = rebind_session;
     }
 
+    /// The extension bridge shared by this runtime (modes bind UI hosts here).
+    pub fn bridge(&self) -> Arc<dyn ExtensionBridge> {
+        self.bridge.clone()
+    }
+
     fn emit_before_switch(
         &self,
         reason: SessionStartReason,
