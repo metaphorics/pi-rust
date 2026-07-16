@@ -352,11 +352,11 @@ struct RunGuard {
 
 impl Drop for RunGuard {
     fn drop(&mut self) {
-        {
-            let mut state = self.inner.state.lock();
-            state.run_active = false;
-            state.run_cancel = None;
-        }
+        let mut state = self.inner.state.lock();
+        state.run_active = false;
+        state.run_cancel = None;
+        // Send under the SAME lock: a release outside the lock could land
+        // after a new claim's send(true) and mark an active run as idle.
         let _ = self.inner.active_tx.send(false);
     }
 }
@@ -758,11 +758,11 @@ impl AgentSession {
     pub async fn prompt(&self, text: &str, mut options: PromptOptions) -> Result<(), String> {
         let preflight = options.preflight_result.take();
         match self.prompt_inner(text, options).await {
-            Ok(Some(messages)) => {
+            Ok(Some((messages, run_claim))) => {
                 if let Some(preflight) = preflight {
                     preflight(true);
                 }
-                self.run_agent_prompt(messages).await;
+                self.run_agent_prompt(messages, run_claim).await;
                 Ok(())
             }
             Ok(None) => {
@@ -781,12 +781,13 @@ impl AgentSession {
     }
 
     /// Preflight portion of `prompt()`. `Ok(Some(_))` means "run these
-    /// messages"; `Ok(None)` means the prompt was queued.
+    /// messages under the returned run claim"; `Ok(None)` means the prompt
+    /// was queued (steer/followUp).
     async fn prompt_inner(
         &self,
         text: &str,
         options: PromptOptions,
-    ) -> Result<Option<Vec<AgentMessage>>, String> {
+    ) -> Result<Option<(Vec<AgentMessage>, RunGuard)>, String> {
         let expand = options.expand_prompt_templates.unwrap_or(true);
 
         let mut expanded_text = text.to_string();
@@ -795,9 +796,13 @@ impl AgentSession {
             expanded_text = self.expand_prompt_template(&expanded_text);
         }
 
-        // If streaming, queue via steer/followUp (active-run invariant).
-        {
-            let state = self.inner.state.lock();
+        // Claim-or-queue in ONE lock acquisition: if a run is active, queue
+        // via steer/followUp (active-run invariant); otherwise claim the run
+        // immediately so a concurrent prompt deterministically observes the
+        // claim (no gap between the preflight check and the run start). Any
+        // later preflight error drops the claim, releasing the run.
+        let run_claim = {
+            let mut state = self.inner.state.lock();
             if state.run_active {
                 drop(state);
                 let Some(behavior) = options.streaming_behavior else {
@@ -814,7 +819,15 @@ impl AgentSession {
                 }
                 return Ok(None);
             }
-        }
+            state.run_active = true;
+            // Mirror the claim into the idle watch under the SAME lock so a
+            // wait_for_idle caller can never observe run_active=true with a
+            // still-false watch value (early spurious return).
+            let _ = self.inner.active_tx.send(true);
+            RunGuard {
+                inner: self.inner.clone(),
+            }
+        };
 
         // Flush any pending bash messages before the new prompt.
         self.flush_pending_bash_messages();
@@ -857,7 +870,7 @@ impl AgentSession {
             state.effective_system_prompt = state.base_system_prompt.clone();
         }
 
-        Ok(Some(messages))
+        Ok(Some((messages, run_claim)))
     }
 
     /// Queue a steering message while the agent is running.
@@ -952,22 +965,7 @@ impl AgentSession {
     // Run lifecycle (Agent.prompt/continue collapsed)
     // =====================================================================
 
-    async fn run_agent_prompt(&self, messages: Vec<AgentMessage>) {
-        // Atomic check-and-set of the active-run flag.
-        {
-            let mut state = self.inner.state.lock();
-            if state.run_active {
-                // prompt_inner already handles the streaming path; this is a
-                // programming-error guard equivalent to Agent.prompt's throw.
-                return;
-            }
-            state.run_active = true;
-        }
-        let _ = self.inner.active_tx.send(true);
-        let _guard = RunGuard {
-            inner: self.inner.clone(),
-        };
-
+    async fn run_agent_prompt(&self, messages: Vec<AgentMessage>, run_claim: RunGuard) {
         self.run_prompt_messages(messages, false).await;
         while self.handle_post_agent_run().await {
             self.continue_run().await;
@@ -981,7 +979,8 @@ impl AgentSession {
         }
         self.flush_pending_bash_messages();
         self.inner.emit(&AgentSessionEvent::AgentSettled);
-        // RunGuard drop clears run_active and wakes idle waiters.
+        // run_claim drop clears run_active and wakes idle waiters.
+        drop(run_claim);
     }
 
     /// One `runAgentLoop` invocation with fresh context snapshot.

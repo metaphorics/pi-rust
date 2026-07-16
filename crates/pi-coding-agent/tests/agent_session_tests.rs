@@ -1404,3 +1404,91 @@ async fn tool_loop_second_provider_call_receives_turn_history() {
         Some("done")
     );
 }
+
+/// Prompt preflight and run claim are one atomic step: a second concurrent
+/// prompt issued while the first is still inside preflight deterministically
+/// gets the verbatim already-processing error and is never silently dropped.
+/// The first prompt's `preflight_result` callback is the barrier: it fires
+/// exactly in the historical gap between preflight and run start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_prompt_in_preflight_window_gets_verbatim_error() {
+    let fixture = tokio::task::spawn_blocking(|| {
+        let script = Arc::new(Mutex::new(VecDeque::new()));
+        let options = FixtureOptions {
+            stream_fn: Some(scripted_stream_fn(script.clone())),
+            ..Default::default()
+        };
+        let fixture = make_fixture(vec![], options);
+        script
+            .lock()
+            .push_back(assistant_text_message(&fixture.model, "only"));
+        fixture
+    })
+    .await
+    .expect("fixture");
+    let session = fixture.session.clone();
+
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+
+    let first_session = session.clone();
+    let first = tokio::spawn(async move {
+        first_session
+            .prompt(
+                "first",
+                PromptOptions {
+                    preflight_result: Some(Box::new(move |accepted| {
+                        assert!(accepted, "first prompt passes preflight");
+                        entered_tx.send(()).expect("signal entered");
+                        // Hold the preflight→run window open until released.
+                        release_rx.recv().expect("await release");
+                    })),
+                    ..Default::default()
+                },
+            )
+            .await
+    });
+
+    // Barrier: first prompt has passed preflight and is parked pre-run.
+    tokio::task::spawn_blocking(move || entered_rx.recv().expect("entered"))
+        .await
+        .expect("join");
+
+    // Second prompt: deterministic verbatim rejection, never a silent drop.
+    let error = session
+        .prompt("second", PromptOptions::default())
+        .await
+        .expect_err("concurrent prompt must be rejected");
+    assert_eq!(
+        error,
+        "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message."
+    );
+    assert!(
+        session.is_streaming(),
+        "run claim is visible during preflight hold"
+    );
+
+    // Steer/follow-up queueing still works while the claim is held.
+    session
+        .prompt(
+            "queued follow-up",
+            PromptOptions {
+                streaming_behavior: Some(StreamingBehavior::FollowUp),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("follow-up queues");
+    assert_eq!(session.get_follow_up_messages(), vec!["queued follow-up"]);
+    session.clear_queue();
+
+    release_tx.send(()).expect("release first prompt");
+    first.await.expect("join first").expect("first prompt runs");
+    session.wait_for_idle().await;
+
+    // Exactly the first exchange landed; the rejected prompt left no trace.
+    let events = fixture.events.lock().clone();
+    let agent_starts = events.iter().filter(|e| e["type"] == "agent_start").count();
+    assert_eq!(agent_starts, 1, "exactly one run started");
+    assert_eq!(session.messages().len(), 2, "user 'first' + assistant reply");
+}
