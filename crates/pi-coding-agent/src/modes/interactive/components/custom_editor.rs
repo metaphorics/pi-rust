@@ -11,6 +11,7 @@ use crate::modes::interactive::theme::{ThemeColor, theme};
 pub struct CustomEditor<C: Component> {
     pub inner: C,
     pub bash_mode: bool,
+    border_color: Option<ThemeColor>,
     interceptor: Box<dyn FnMut(&str) -> bool>,
     cached: Vec<Line>,
     status: RenderStatus,
@@ -22,6 +23,7 @@ impl<C: Component> CustomEditor<C> {
         Self {
             inner,
             bash_mode: false,
+            border_color: None,
             interceptor: Box::new(interceptor),
             cached: Vec::new(),
             status: RenderStatus::Changed,
@@ -38,6 +40,15 @@ impl<C: Component> CustomEditor<C> {
             self.invalidate();
         }
     }
+
+    /// Border color while NOT in bash mode (oracle `editor.borderColor =
+    /// theme.getThinkingBorderColor(level)`); bash mode always overrides.
+    pub fn set_border_color(&mut self, color: ThemeColor) {
+        if self.border_color != Some(color) {
+            self.border_color = Some(color);
+            self.invalidate();
+        }
+    }
 }
 
 impl<C: Component> Component for CustomEditor<C> {
@@ -49,11 +60,18 @@ impl<C: Component> Component for CustomEditor<C> {
             self.cached.extend_from_slice(rendered);
             inner_status = self.inner.last_render_status();
         }
-        if self.bash_mode && !self.cached.is_empty() {
+        let border = if self.bash_mode {
+            Some(ThemeColor::BashMode)
+        } else {
+            self.border_color
+        };
+        if let Some(color) = border
+            && !self.cached.is_empty()
+        {
             let last = self.cached.len() - 1;
             for index in [0, last] {
                 let ansi = self.cached[index].to_ansi();
-                self.cached[index] = Line::from_ansi(&theme().fg(ThemeColor::BashMode, &ansi));
+                self.cached[index] = Line::from_ansi(&theme().fg(color, &ansi));
             }
         }
         self.status = if self.bash_mode {

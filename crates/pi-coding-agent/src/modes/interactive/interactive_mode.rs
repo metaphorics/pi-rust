@@ -774,6 +774,7 @@ impl InteractiveMode {
             return;
         }
         self.initialized = true;
+        self.update_editor_border_color();
         self.update_terminal_title();
         self.render_current_session_state();
         if let Some(fallback) = self.options.model_fallback_message.take() {
@@ -891,6 +892,7 @@ impl InteractiveMode {
         });
         if theme_flag || self.theme_changed.replace(false) {
             self.tui.invalidate();
+            self.update_editor_border_color();
             self.tui.request_render(false);
         }
 
@@ -987,8 +989,7 @@ impl InteractiveMode {
                 let bash = text.trim_start().starts_with('!');
                 if bash != self.is_bash_mode {
                     self.is_bash_mode = bash;
-                    self.custom_editor.borrow_mut().set_bash_mode(bash);
-                    self.tui.request_render(false);
+                    self.update_editor_border_color();
                 }
             }
             UiCommand::Action(action) => self.handle_app_action(action),
@@ -1133,6 +1134,7 @@ impl InteractiveMode {
                 self.session
                     .set_thinking_level(model_thinking_to_agent(level));
                 self.footer.borrow_mut().invalidate();
+                self.update_editor_border_color();
             }
             SettingChange::Theme(name) => {
                 if let Err(error) = set_theme(&name, false) {
@@ -1261,7 +1263,7 @@ impl InteractiveMode {
             AppAction::ThinkingCycle => {
                 if self.session.cycle_thinking_level().is_some() {
                     self.footer.borrow_mut().invalidate();
-                    self.tui.request_render(false);
+                    self.update_editor_border_color();
                 }
             }
             AppAction::ModelCycleForward => self.spawn_cycle_model(true),
@@ -1318,8 +1320,7 @@ impl InteractiveMode {
         if self.is_bash_mode {
             self.editor.borrow_mut().set_text("");
             self.is_bash_mode = false;
-            self.custom_editor.borrow_mut().set_bash_mode(false);
-            self.tui.request_render(false);
+            self.update_editor_border_color();
         }
     }
 
@@ -1335,6 +1336,18 @@ impl InteractiveMode {
             self.editor.borrow_mut().set_text("");
             self.last_sigint_time = Some(now);
         }
+    }
+
+    /// Oracle `updateEditorBorderColor` (:3713-3721): bash mode wins, else
+    /// the current thinking level picks the editor border color.
+    fn update_editor_border_color(&mut self) {
+        {
+            let mut editor = self.custom_editor.borrow_mut();
+            editor.set_bash_mode(self.is_bash_mode);
+            let level = crate::session::thinking_level_str(self.session.thinking_level());
+            editor.set_border_color(theme().thinking_border_color(level));
+        }
+        self.tui.request_render(false);
     }
 
     // ========================================================================
@@ -1366,7 +1379,7 @@ impl InteractiveMode {
                 self.editor.borrow_mut().set_text("");
                 self.handle_bash_command(command, excluded);
                 self.is_bash_mode = false;
-                self.custom_editor.borrow_mut().set_bash_mode(false);
+                self.update_editor_border_color();
             }
             DispatchAction::BashBusy { original_text } => {
                 self.show_warning(
@@ -1637,6 +1650,7 @@ impl InteractiveMode {
             }
             AgentSessionEvent::ThinkingLevelChanged { .. } => {
                 self.footer.borrow_mut().invalidate();
+                self.update_editor_border_color();
             }
             AgentSessionEvent::MessageStart { message } => match message.role() {
                 "custom" => {
@@ -1954,6 +1968,7 @@ impl InteractiveMode {
             OpOutcome::ModelSet { model, result } => match result {
                 Ok(()) => {
                     self.footer.borrow_mut().invalidate();
+                    self.update_editor_border_color();
                     self.show_status(&format!("Model set to {}/{}", model.provider, model.id));
                 }
                 Err(error) => self.show_error(&error),
@@ -1961,6 +1976,7 @@ impl InteractiveMode {
             OpOutcome::ModelCycled(result) => {
                 if result.is_some() {
                     self.footer.borrow_mut().invalidate();
+                    self.update_editor_border_color();
                     self.tui.request_render(false);
                 }
             }
@@ -2081,6 +2097,7 @@ impl InteractiveMode {
         self.events_rx = events_rx;
         self.unsubscribe = Some(Box::new(unsubscribe));
         self.render_current_session_state();
+        self.update_editor_border_color();
         self.update_terminal_title();
     }
 

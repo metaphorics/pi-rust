@@ -461,6 +461,65 @@ async fn escape_aborts_a_mid_stream_run_and_clears_working_status() {
     assert!(!screen.contains("Working..."));
     assert_no_flicker(&handle);
 }
+/// Fg color of the editor's bottom border (last full-width `─` row).
+fn editor_border_fg(handle: &VtHandle) -> pi_vt::Color {
+    handle.screen(|screen| {
+        let rows = screen.rows();
+        let row = rows
+            .iter()
+            .rposition(|r| {
+                let dashes = r.chars().filter(|c| *c == '─').count();
+                dashes > 40 && r.chars().all(|c| c == '─' || c == ' ')
+            })
+            .expect("editor border row");
+        screen.cell(0, row).expect("border cell").style.fg
+    })
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn editor_border_tracks_thinking_level_and_bash_mode() {
+    let test = make_runtime(TestRuntimeOptions {
+        with_auth: true,
+        ..Default::default()
+    })
+    .await;
+    let session = test.runtime.session();
+    let (terminal, handle) = VtTerminal::new(80, 24);
+    let mut mode = InteractiveMode::new(
+        test.runtime.clone(),
+        terminal,
+        InteractiveModeOptions::default(),
+    );
+    mode.init();
+    mode.pump();
+    let off_color = editor_border_fg(&handle);
+
+    // `!` prefix → bash mode border override.
+    send(&mut mode, &handle, "!echo hi");
+    mode.pump();
+    let bash_color = editor_border_fg(&handle);
+    assert_ne!(off_color, bash_color, "bash mode must recolor the border");
+
+    // Escape leaves bash mode and restores the thinking-level border.
+    send(&mut mode, &handle, "\x1b");
+    mode.pump();
+    assert_eq!(editor_border_fg(&handle), off_color);
+    assert!(handle.screen(|s| !s.serialize().contains("!echo")));
+
+    // Shift+Tab cycles the thinking level → new border color.
+    send(&mut mode, &handle, "\x1b[Z");
+    mode.pump();
+    assert_ne!(
+        session.thinking_level(),
+        pi_agent::AgentThinkingLevel::Off,
+        "shift+tab should cycle thinking"
+    );
+    let minimal_color = editor_border_fg(&handle);
+    assert_ne!(minimal_color, off_color, "thinking border must change");
+    assert_ne!(minimal_color, bash_color);
+    assert_no_flicker(&handle);
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn terminal_progress_setting_drives_osc_9_4_around_agent_runs() {
     // Enabled: agent_start → set_progress(true), agent_end → set_progress(false).
