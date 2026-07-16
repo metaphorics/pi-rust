@@ -375,6 +375,10 @@ pub struct ToolExecuteResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<Value>,
     pub is_error: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub added_tool_names: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminate: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1209,6 +1213,50 @@ mod tests {
         let theme = GetThemeResult(Some(ThemeDto { name: "dark".into(), json: json!({"name":"dark"}) }));
         let result = ResponseResult::ok(&theme).unwrap();
         assert_eq!(result.decode_ok::<GetThemeResult>().unwrap(), Some(theme));
+
+        let old_json = json!({
+            "content": [],
+            "isError": false
+        });
+        let old_decoded: ToolExecuteResult = serde_json::from_value(old_json.clone()).unwrap();
+        assert_eq!(
+            old_decoded,
+            ToolExecuteResult {
+                content: vec![],
+                details: None,
+                is_error: false,
+                added_tool_names: None,
+                terminate: None,
+            }
+        );
+        let old_serialized = serde_json::to_value(&old_decoded).unwrap();
+        assert_eq!(old_serialized, old_json);
+
+        let new_json = json!({
+            "content": [{"type": "text", "text": "hello"}],
+            "details": {"progress": 1.0},
+            "isError": false,
+            "addedToolNames": ["new_tool"],
+            "terminate": true
+        });
+        let new_decoded: ToolExecuteResult = serde_json::from_value(new_json.clone()).unwrap();
+        let expected_new = ToolExecuteResult {
+            content: vec![Content::Text(pi_ai::TextContent {
+                text: "hello".into(),
+                text_signature: None,
+            })],
+            details: Some(json!({"progress": 1.0})),
+            is_error: false,
+            added_tool_names: Some(vec!["new_tool".into()]),
+            terminate: Some(true),
+        };
+        assert_eq!(new_decoded, expected_new);
+        let serialized_new_str = serde_json::to_string(&expected_new).unwrap();
+        let expected_json_str = "{\"content\":[{\"type\":\"text\",\"text\":\"hello\"}],\"details\":{\"progress\":1.0},\"isError\":false,\"addedToolNames\":[\"new_tool\"],\"terminate\":true}";
+        assert_eq!(serialized_new_str, expected_json_str);
+
+        let result = ResponseResult::ok(&expected_new).unwrap();
+        assert_eq!(result.decode_ok::<ToolExecuteResult>().unwrap(), Some(expected_new));
     }
 
     #[test]

@@ -51,6 +51,7 @@ const RESULT_FIXTURES = [
   "sidecar-to-rust-ui-terminal-input-result.json",
   "rust-to-sidecar-ui-theme-catalog-result.json",
   "rust-to-sidecar-ui-theme-lookup-result.json",
+  "sidecar-to-rust-tool-execute-result.json",
 ];
 
 const fixtureNames = readdirSync(FIXTURE_DIR).sort();
@@ -61,7 +62,7 @@ function fixtureBytes(name: string): Uint8Array {
 
 describe("golden fixtures", () => {
   test("crate fixture directory is reachable and complete", () => {
-    expect(fixtureNames.length).toBe(20);
+    expect(fixtureNames.length).toBe(21);
   });
 
   for (const name of fixtureNames) {
@@ -189,6 +190,20 @@ describe("constructed sidecar-to-rust envelopes reproduce fixture bytes", () => 
     {
       fixture: "sidecar-to-rust-ui-terminal-input-result.json",
       envelope: { type: "res", id: 3, ok: { consume: false, data: "rewritten" } },
+    },
+    {
+      fixture: "sidecar-to-rust-tool-execute-result.json",
+      envelope: {
+        type: "res",
+        id: 6,
+        ok: {
+          content: [{ type: "text", text: "saved" }],
+          details: { progress: 1 },
+          isError: false,
+          addedToolNames: ["new_tool"],
+          terminate: true,
+        },
+      },
     },
   ];
 
