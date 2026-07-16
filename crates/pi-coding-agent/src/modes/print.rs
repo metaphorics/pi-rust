@@ -126,9 +126,8 @@ pub async fn run_print_mode_with_out(
             let mut sigterm =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                     .expect("SIGTERM handler");
-            let mut sighup =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
-                    .expect("SIGHUP handler");
+            let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+                .expect("SIGHUP handler");
             let code = tokio::select! {
                 _ = sigterm.recv() => 143,
                 _ = sighup.recv() => 129,

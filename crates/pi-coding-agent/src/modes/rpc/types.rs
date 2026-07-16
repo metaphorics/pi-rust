@@ -218,7 +218,11 @@ impl RpcExtensionUiRequest {
 
 /// Method-specific request payloads (`method` + fields, oracle order).
 #[derive(Clone, Debug, Serialize)]
-#[serde(tag = "method", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "method",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum UiRequestPayload {
     Select {
         title: String,

@@ -38,9 +38,9 @@ use crate::wire_out::WireOut;
 
 use jsonl::{JsonlDecoder, serialize_json_line};
 use types::{
-    BashPayload, CompactPayload, ForkPayload, GetEntriesPayload, MessagePayload,
-    NewSessionPayload, PromptPayload, RpcExtensionUiRequest, RpcExtensionUiResponse, RpcResponse,
-    RpcSessionState, RpcSlashCommand, SetEnabledPayload, SetModelPayload, SetQueueModePayload,
+    BashPayload, CompactPayload, ForkPayload, GetEntriesPayload, MessagePayload, NewSessionPayload,
+    PromptPayload, RpcExtensionUiRequest, RpcExtensionUiResponse, RpcResponse, RpcSessionState,
+    RpcSlashCommand, SetEnabledPayload, SetModelPayload, SetQueueModePayload,
     SetSessionNamePayload, SetThinkingLevelPayload, SwitchSessionPayload,
 };
 
@@ -145,7 +145,11 @@ impl RpcUiHost {
         payload: types::UiRequestPayload,
         parse: impl FnOnce(RpcExtensionUiResponse) -> T + Send + 'static,
     ) -> BoxFuture<'static, T> {
-        if opts.signal.as_ref().is_some_and(CancellationToken::is_cancelled) {
+        if opts
+            .signal
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
             return Box::pin(std::future::ready(default));
         }
 
@@ -258,11 +262,7 @@ impl ExtensionUiHost for RpcUiHost {
         )
     }
 
-    fn editor(
-        &self,
-        title: String,
-        prefill: Option<String>,
-    ) -> BoxFuture<'static, Option<String>> {
+    fn editor(&self, title: String, prefill: Option<String>) -> BoxFuture<'static, Option<String>> {
         // Oracle `editor`: no timeout/abort support (rpc-mode.ts:236-253).
         self.dialog(
             UiDialogOptions::default(),
@@ -360,9 +360,9 @@ async fn handle_command(
         // =================================================================
         "prompt" => {
             let p: PromptPayload = match payload(&raw, &id, "prompt") {
-                            Ok(p) => p,
-                            Err(response) => return Some(*response),
-                        };
+                Ok(p) => p,
+                Err(response) => return Some(*response),
+            };
             // Emit the authoritative response only after prompt preflight
             // succeeds; queued and immediately handled prompts also count as
             // success (rpc-mode.ts:373-395).
@@ -403,18 +403,18 @@ async fn handle_command(
 
         "steer" => {
             let p: MessagePayload = match payload(&raw, &id, "steer") {
-                            Ok(p) => p,
-                            Err(response) => return Some(*response),
-                        };
+                Ok(p) => p,
+                Err(response) => return Some(*response),
+            };
             session.steer(&p.message, p.images.unwrap_or_default());
             Some(success(id, "steer", None))
         }
 
         "follow_up" => {
             let p: MessagePayload = match payload(&raw, &id, "follow_up") {
-                            Ok(p) => p,
-                            Err(response) => return Some(*response),
-                        };
+                Ok(p) => p,
+                Err(response) => return Some(*response),
+            };
             session.follow_up(&p.message, p.images.unwrap_or_default());
             Some(success(id, "follow_up", None))
         }
@@ -426,9 +426,9 @@ async fn handle_command(
 
         "new_session" => {
             let p: NewSessionPayload = match payload(&raw, &id, "new_session") {
-                            Ok(p) => p,
-                            Err(response) => return Some(*response),
-                        };
+                Ok(p) => p,
+                Err(response) => return Some(*response),
+            };
             match runtime.new_session(p.parent_session).await {
                 Ok(result) => Some(success(
                     id,
@@ -467,9 +467,9 @@ async fn handle_command(
         // =================================================================
         "set_model" => {
             let p: SetModelPayload = match payload(&raw, &id, "set_model") {
-                            Ok(p) => p,
-                            Err(response) => return Some(*response),
-                        };
+                Ok(p) => p,
+                Err(response) => return Some(*response),
+            };
             let registry = runtime.services().model_registry;
             let model = {
                 let registry = registry.read().await;
@@ -520,9 +520,9 @@ async fn handle_command(
         // =================================================================
         "set_thinking_level" => {
             let p: SetThinkingLevelPayload = match payload(&raw, &id, "set_thinking_level") {
-                            Ok(p) => p,
-                            Err(response) => return Some(*response),
-                        };
+                Ok(p) => p,
+                Err(response) => return Some(*response),
+            };
             session.set_thinking_level(parse_thinking_level(&p.level));
             Some(success(id, "set_thinking_level", None))
         }
@@ -541,18 +541,18 @@ async fn handle_command(
         // =================================================================
         "set_steering_mode" => {
             let p: SetQueueModePayload = match payload(&raw, &id, "set_steering_mode") {
-                            Ok(p) => p,
-                            Err(response) => return Some(*response),
-                        };
+                Ok(p) => p,
+                Err(response) => return Some(*response),
+            };
             session.set_steering_mode(&p.mode);
             Some(success(id, "set_steering_mode", None))
         }
 
         "set_follow_up_mode" => {
             let p: SetQueueModePayload = match payload(&raw, &id, "set_follow_up_mode") {
-                            Ok(p) => p,
-                            Err(response) => return Some(*response),
-                        };
+                Ok(p) => p,
+                Err(response) => return Some(*response),
+            };
             session.set_follow_up_mode(&p.mode);
             Some(success(id, "set_follow_up_mode", None))
         }
@@ -562,9 +562,9 @@ async fn handle_command(
         // =================================================================
         "compact" => {
             let p: CompactPayload = match payload(&raw, &id, "compact") {
-                            Ok(p) => p,
-                            Err(response) => return Some(*response),
-                        };
+                Ok(p) => p,
+                Err(response) => return Some(*response),
+            };
             let shared = shared.clone();
             tasks.spawn(async move {
                 let response = match shared.session().compact(p.custom_instructions).await {
@@ -578,9 +578,9 @@ async fn handle_command(
 
         "set_auto_compaction" => {
             let p: SetEnabledPayload = match payload(&raw, &id, "set_auto_compaction") {
-                            Ok(p) => p,
-                            Err(response) => return Some(*response),
-                        };
+                Ok(p) => p,
+                Err(response) => return Some(*response),
+            };
             session.set_auto_compaction_enabled(p.enabled);
             Some(success(id, "set_auto_compaction", None))
         }
@@ -590,9 +590,9 @@ async fn handle_command(
         // =================================================================
         "set_auto_retry" => {
             let p: SetEnabledPayload = match payload(&raw, &id, "set_auto_retry") {
-                            Ok(p) => p,
-                            Err(response) => return Some(*response),
-                        };
+                Ok(p) => p,
+                Err(response) => return Some(*response),
+            };
             session.set_auto_retry_enabled(p.enabled);
             Some(success(id, "set_auto_retry", None))
         }
@@ -607,9 +607,9 @@ async fn handle_command(
         // =================================================================
         "bash" => {
             let p: BashPayload = match payload(&raw, &id, "bash") {
-                            Ok(p) => p,
-                            Err(response) => return Some(*response),
-                        };
+                Ok(p) => p,
+                Err(response) => return Some(*response),
+            };
             let shared = shared.clone();
             tasks.spawn(async move {
                 let response = match shared
@@ -646,9 +646,9 @@ async fn handle_command(
                 output_path: Option<String>,
             }
             let p: ExportHtmlPayload = match payload(&raw, &id, "export_html") {
-                            Ok(p) => p,
-                            Err(response) => return Some(*response),
-                        };
+                Ok(p) => p,
+                Err(response) => return Some(*response),
+            };
             let Some(export_html) = shared.export_html.clone() else {
                 return Some(error(
                     id,
@@ -668,10 +668,13 @@ async fn handle_command(
 
         "switch_session" => {
             let p: SwitchSessionPayload = match payload(&raw, &id, "switch_session") {
-                            Ok(p) => p,
-                            Err(response) => return Some(*response),
-                        };
-            match runtime.switch_session(Path::new(&p.session_path), None).await {
+                Ok(p) => p,
+                Err(response) => return Some(*response),
+            };
+            match runtime
+                .switch_session(Path::new(&p.session_path), None)
+                .await
+            {
                 Ok(result) => Some(success(
                     id,
                     "switch_session",
@@ -683,9 +686,9 @@ async fn handle_command(
 
         "fork" => {
             let p: ForkPayload = match payload(&raw, &id, "fork") {
-                            Ok(p) => p,
-                            Err(response) => return Some(*response),
-                        };
+                Ok(p) => p,
+                Err(response) => return Some(*response),
+            };
             match runtime
                 .fork(&p.entry_id, crate::extension_bridge::ForkPosition::Before)
                 .await
@@ -703,8 +706,7 @@ async fn handle_command(
         }
 
         "clone" => {
-            let leaf_id =
-                session.with_session_manager(|sm| sm.get_leaf_id().map(str::to_string));
+            let leaf_id = session.with_session_manager(|sm| sm.get_leaf_id().map(str::to_string));
             let Some(leaf_id) = leaf_id else {
                 return Some(error(
                     id,
@@ -729,9 +731,7 @@ async fn handle_command(
             let messages: Vec<Value> = session
                 .get_user_messages_for_forking()
                 .into_iter()
-                .map(|(entry_id, text)| {
-                    serde_json::json!({ "entryId": entry_id, "text": text })
-                })
+                .map(|(entry_id, text)| serde_json::json!({ "entryId": entry_id, "text": text }))
                 .collect();
             Some(success(
                 id,
@@ -742,16 +742,14 @@ async fn handle_command(
 
         "get_entries" => {
             let p: GetEntriesPayload = match payload(&raw, &id, "get_entries") {
-                            Ok(p) => p,
-                            Err(response) => return Some(*response),
-                        };
+                Ok(p) => p,
+                Err(response) => return Some(*response),
+            };
             let (mut entries, leaf_id) = session.with_session_manager(|sm| {
                 (sm.get_entries(), sm.get_leaf_id().map(str::to_string))
             });
             if let Some(since) = &p.since {
-                let Some(since_index) = entries
-                    .iter()
-                    .position(|e| e.id() == Some(since.as_str()))
+                let Some(since_index) = entries.iter().position(|e| e.id() == Some(since.as_str()))
                 else {
                     return Some(error(
                         id,
@@ -789,9 +787,9 @@ async fn handle_command(
 
         "set_session_name" => {
             let p: SetSessionNamePayload = match payload(&raw, &id, "set_session_name") {
-                            Ok(p) => p,
-                            Err(response) => return Some(*response),
-                        };
+                Ok(p) => p,
+                Err(response) => return Some(*response),
+            };
             let name = p.name.trim();
             if name.is_empty() {
                 return Some(error(
@@ -831,8 +829,7 @@ async fn handle_command(
             for template in session.prompt_templates() {
                 commands.push(RpcSlashCommand {
                     name: template.name,
-                    description: (!template.description.is_empty())
-                        .then_some(template.description),
+                    description: (!template.description.is_empty()).then_some(template.description),
                     source: "prompt",
                     source_info: template.source_info,
                 });
@@ -923,22 +920,31 @@ where
     let mut buf = [0u8; 8192];
     let mut tasks = tokio::task::JoinSet::new();
 
-    // Shutdown ladder (oracle `shutdown`): unsubscribe, dispose the runtime,
-    // detach input, flush (unless SIGTERM), exit.
-    let shutdown = |shared: &Arc<RpcShared>,
-                    runtime: &Arc<AgentSessionRuntime>,
-                    tasks: &mut tokio::task::JoinSet<()>,
-                    flush: bool| {
+    // Shutdown ladder (oracle `shutdown`): unsubscribe, dispose the runtime
+    // (cancels in-flight session work), give detached command tasks a
+    // bounded grace to emit their final responses (oracle: `dispose` is
+    // awaited, letting pending command promises settle before exit), then
+    // abort stragglers and flush (unless SIGTERM).
+    async fn shutdown(
+        shared: &Arc<RpcShared>,
+        runtime: &Arc<AgentSessionRuntime>,
+        tasks: &mut tokio::task::JoinSet<()>,
+        flush: bool,
+    ) {
         if let Some(unsubscribe) = shared.unsubscribe.lock().take() {
             unsubscribe();
         }
         runtime.set_rebind_session(None);
         runtime.dispose();
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+            while tasks.join_next().await.is_some() {}
+        })
+        .await;
         tasks.abort_all();
         if flush {
             shared.out.flush();
         }
-    };
+    }
 
     loop {
         tokio::select! {
@@ -971,17 +977,17 @@ where
             },
             _ = shared.shutdown_notify.notified() => break,
             _ = async { sigterm.as_mut().expect("sigterm stream").recv().await }, if sigterm.is_some() => {
-                shutdown(&shared, &runtime, &mut tasks, false);
+                shutdown(&shared, &runtime, &mut tasks, false).await;
                 std::process::exit(143);
             }
             _ = async { sighup.as_mut().expect("sighup stream").recv().await }, if sighup.is_some() => {
-                shutdown(&shared, &runtime, &mut tasks, true);
+                shutdown(&shared, &runtime, &mut tasks, true).await;
                 std::process::exit(129);
             }
         }
     }
 
-    shutdown(&shared, &runtime, &mut tasks, true);
+    shutdown(&shared, &runtime, &mut tasks, true).await;
     0
 }
 
