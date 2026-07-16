@@ -6,6 +6,7 @@ pub mod config;
 pub mod cli;
 pub mod source_info;
 pub mod extension_bridge;
+pub mod export_html;
 pub mod migrations;
 pub mod resource_loader;
 pub mod serde_util;
@@ -39,6 +40,10 @@ pub use extension_bridge::{
     DiscoveredExtensions, ExtensionBridge, ExtensionUiHost, ForkPosition, HookOutcome,
     NoopExtensionBridge, NotifyType, RegisteredCommand, SessionLifecycleEvent,
     SessionShutdownReason, SessionStartReason, UiDialogOptions, WidgetPlacement,
+};
+pub use export_html::{
+    ExportHtmlOptions, RenderedToolResult, ToolHtmlRenderer, export_session_file_to_html,
+    export_session_to_html, rpc_export_html_handler,
 };
 pub use source_info::{SourceInfo, SourceOrigin, SourceScope};
 pub use migrations::{MigrationResult, run_migrations, run_migrations_with_agent_dir};

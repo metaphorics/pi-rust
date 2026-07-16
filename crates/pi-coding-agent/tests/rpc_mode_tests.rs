@@ -15,6 +15,7 @@ use common::{
 };
 use parking_lot::Mutex;
 use pi_coding_agent::extension_bridge::UiDialogOptions;
+use pi_coding_agent::rpc_export_html_handler;
 use pi_coding_agent::modes::rpc::{RpcModeOptions, run_rpc_mode_with_io};
 use pi_coding_agent::session::PromptTemplate;
 use pi_coding_agent::source_info::{SourceInfo, SourceScope};
@@ -699,29 +700,51 @@ async fn export_html_without_wired_handler_fails_and_with_handler_succeeds() {
     );
     assert_eq!(rpc.finish().await, 0);
 
-    // With an injected handler: oracle success envelope { path }.
+    // Bind the concrete exporter through the existing handler seam.
+    let model_probe = Arc::new(pi_coding_agent::AuthStorage::new(
+        std::env::temp_dir().join("unused-export-auth.json"),
+    ));
+    let model = common::test_model(model_probe);
     let mode_options = RpcModeOptions {
-        export_html: Some(Arc::new(|_session, output_path| {
-            Box::pin(async move {
-                Ok(output_path.unwrap_or_else(|| "/tmp/session-export.html".to_string()))
-            })
-        })),
+        export_html: Some(rpc_export_html_handler(Some("dark".to_string()))),
     };
     let mut rpc = Rpc::start_with(
         TestRuntimeOptions {
             with_auth: true,
+            persisted: true,
+            script: vec![assistant_text_message(&model, "exported")],
             ..Default::default()
         },
         mode_options,
     )
     .await;
-    rpc.send(r#"{"id":"2","type":"export_html","outputPath":"/tmp/x.html"}"#)
+    rpc.send(r#"{"id":"p","type":"prompt","message":"Export this"}"#)
         .await;
-    let lines = rpc.wait_responses(1).await;
+    wait_for_lines(&rpc.out, 5000, |lines| {
+        lines
+            .iter()
+            .any(|line| line.contains(r#""type":"agent_settled""#))
+    })
+    .await;
+
+    let output = rpc.harness.tmp.path().join("x.html");
+    let command = json!({
+        "id": "2",
+        "type": "export_html",
+        "outputPath": output,
+    });
+    rpc.send(&serde_json::to_string(&command).unwrap()).await;
+    let lines = rpc.wait_responses(2).await;
     assert_eq!(
-        response_lines(&lines)[0],
-        r#"{"id":"2","type":"response","command":"export_html","success":true,"data":{"path":"/tmp/x.html"}}"#
+        response_lines(&lines)[1],
+        format!(
+            r#"{{"id":"2","type":"response","command":"export_html","success":true,"data":{{"path":{}}}}}"#,
+            serde_json::to_string(&output.to_string_lossy()).unwrap()
+        )
     );
+    let html = std::fs::read_to_string(&output).expect("RPC HTML output");
+    assert!(html.starts_with("<!DOCTYPE html>"));
+    assert!(!html.contains("<script src="));
     assert_eq!(rpc.finish().await, 0);
 }
 
