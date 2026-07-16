@@ -19,6 +19,18 @@ pub enum StorageError {
 
 pub type Result<T, E = StorageError> = std::result::Result<T, E>;
 
+/// A mutating instance operation, identified so a
+/// [`Storage::with_fault_injection`] hook can target one exact call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StorageOp<'a> {
+    /// `upsert_instance` for the given instance id.
+    UpsertInstance(&'a str),
+    /// `remove_instance` for the given instance id.
+    RemoveInstance(&'a str),
+}
+
+type FaultHook = dyn for<'a> Fn(StorageOp<'a>) -> Result<()> + Send + Sync;
+
 /// JSON persistence for orchestrator state.
 ///
 /// All instances targeting the same directory share one lock so a read-modify-write
@@ -26,6 +38,7 @@ pub type Result<T, E = StorageError> = std::result::Result<T, E>;
 pub struct Storage {
     orchestrator_dir: PathBuf,
     lock: Arc<Mutex<()>>,
+    fault: Option<Arc<FaultHook>>,
 }
 
 impl Storage {
@@ -39,6 +52,26 @@ impl Storage {
         Self {
             orchestrator_dir,
             lock,
+            fault: None,
+        }
+    }
+
+    /// Test seam: `hook` runs at the start of every instance mutation and an
+    /// `Err` fails that call before any file I/O, so lifecycle tests can
+    /// break one exact persist or removal. Production code never installs a
+    /// hook.
+    pub fn with_fault_injection(
+        mut self,
+        hook: impl for<'a> Fn(StorageOp<'a>) -> Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        self.fault = Some(Arc::new(hook));
+        self
+    }
+
+    fn check_fault(&self, op: StorageOp<'_>) -> Result<()> {
+        match &self.fault {
+            Some(hook) => hook(op),
+            None => Ok(()),
         }
     }
 
@@ -80,6 +113,7 @@ impl Storage {
     }
 
     pub fn upsert_instance(&self, instance: InstanceRecord) -> Result<()> {
+        self.check_fault(StorageOp::UpsertInstance(&instance.id))?;
         let _guard = self.acquire()?;
         let mut instances = self.load_instances_unlocked()?;
         if let Some(existing) = instances
@@ -94,6 +128,7 @@ impl Storage {
     }
 
     pub fn remove_instance(&self, instance_id: &str) -> Result<()> {
+        self.check_fault(StorageOp::RemoveInstance(instance_id))?;
         let _guard = self.acquire()?;
         let mut instances = self.load_instances_unlocked()?;
         instances.retain(|instance| instance.id != instance_id);
