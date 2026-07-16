@@ -44,9 +44,10 @@ impl KillRing {
     /// Move last entry to front (yank-pop cycling).
     pub fn rotate(&mut self) {
         if self.ring.len() > 1
-            && let Some(last) = self.ring.pop() {
-                self.ring.insert(0, last);
-            }
+            && let Some(last) = self.ring.pop()
+        {
+            self.ring.insert(0, last);
+        }
     }
 
     pub fn len(&self) -> usize {

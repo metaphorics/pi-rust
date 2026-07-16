@@ -2,9 +2,9 @@
 #![allow(dead_code, unused_imports)]
 
 use pi_tui::autocomplete::{
-    AutocompleteItem, AutocompleteProvider, AutocompleteSuggestions, AppliedCompletion,
-    CancellationToken, CombinedAutocompleteProvider, CommandEntry, SlashCommand,
-    SuggestionOptions, SuggestionStart,
+    AppliedCompletion, AutocompleteItem, AutocompleteProvider, AutocompleteSuggestions,
+    CancellationToken, CombinedAutocompleteProvider, CommandEntry, SlashCommand, SuggestionOptions,
+    SuggestionStart,
 };
 use pi_tui::component::Component;
 use pi_tui::components::editor::{
@@ -252,7 +252,9 @@ fn undoes_ctrl_k_delete_to_line_end() {
     e.handle_input("l");
     e.handle_input("d");
     e.handle_input("\x01");
-    for _ in 0..6 { e.handle_input("\x1b[C"); }
+    for _ in 0..6 {
+        e.handle_input("\x1b[C");
+    }
     e.handle_input("\x0b");
     assert_eq!(e.get_text(), "hello ");
     e.handle_input("\x1b[45;5u");
@@ -277,7 +279,9 @@ fn undoes_ctrl_u_delete_to_line_start() {
     e.handle_input("l");
     e.handle_input("d");
     e.handle_input("\x01");
-    for _ in 0..6 { e.handle_input("\x1b[C"); }
+    for _ in 0..6 {
+        e.handle_input("\x1b[C");
+    }
     e.handle_input("\x15");
     assert_eq!(e.get_text(), "world");
     e.handle_input("\x1b[45;5u");
@@ -307,7 +311,9 @@ fn undoes_single_line_paste_atomically() {
     let mut e = editor(&t);
     e.set_text("hello world");
     e.handle_input("\x01");
-    for _ in 0..5 { e.handle_input("\x1b[C"); }
+    for _ in 0..5 {
+        e.handle_input("\x1b[C");
+    }
     e.handle_input("\x1b[200~beep boop\x1b[201~");
     assert_eq!(e.get_text(), "hellobeep boop world");
     e.handle_input("\x1b[45;5u");
@@ -330,7 +336,9 @@ fn undoes_multi_line_paste_atomically() {
     let mut e = editor(&t);
     e.set_text("hello world");
     e.handle_input("\x01");
-    for _ in 0..5 { e.handle_input("\x1b[C"); }
+    for _ in 0..5 {
+        e.handle_input("\x1b[C");
+    }
     e.handle_input("\x1b[200~line1\nline2\nline3\x1b[201~");
     assert_eq!(e.get_text(), "helloline1\nline2\nline3 world");
     e.handle_input("\x1b[45;5u");
@@ -345,7 +353,9 @@ fn undoes_inserttextatcursor_atomically() {
     let mut e = editor(&t);
     e.set_text("hello world");
     e.handle_input("\x01");
-    for _ in 0..5 { e.handle_input("\x1b[C"); }
+    for _ in 0..5 {
+        e.handle_input("\x1b[C");
+    }
     e.insert_text_at_cursor("/tmp/image.png");
     assert_eq!(e.get_text(), "hello/tmp/image.png world");
     e.handle_input("\x1b[45;5u");
@@ -456,7 +466,9 @@ fn cursor_movement_starts_new_undo_unit() {
     e.handle_input("l");
     e.handle_input("d");
     assert_eq!(e.get_text(), "hello world");
-    for _ in 0..5 { e.handle_input("\x1b[D"); }
+    for _ in 0..5 {
+        e.handle_input("\x1b[D");
+    }
     e.handle_input("l");
     e.handle_input("o");
     e.handle_input("l");
@@ -506,7 +518,9 @@ fn clears_undo_stack_on_submit() {
     let mut e = editor(&t);
     let submitted = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
     let s2 = submitted.clone();
-    e.on_submit = Some(Box::new(move |text| { *s2.borrow_mut() = text; }));
+    e.on_submit = Some(Box::new(move |text| {
+        *s2.borrow_mut() = text;
+    }));
     e.handle_input("h");
     e.handle_input("i");
     e.handle_input("\r");
@@ -518,7 +532,9 @@ fn clears_undo_stack_on_submit() {
 
 #[test]
 fn does_not_trigger_autocomplete_during_single_line_paste() {
-    struct P { calls: std::sync::Arc<std::sync::Mutex<usize>> }
+    struct P {
+        calls: std::sync::Arc<std::sync::Mutex<usize>>,
+    }
     impl pi_tui::autocomplete::AutocompleteProvider for P {
         fn get_suggestions(
             &self,
@@ -544,7 +560,9 @@ fn does_not_trigger_autocomplete_during_single_line_paste() {
     let t = tui();
     let mut e = editor(&t);
     let calls = std::sync::Arc::new(std::sync::Mutex::new(0usize));
-    e.set_autocomplete_provider(Box::new(P { calls: calls.clone() }));
+    e.set_autocomplete_provider(Box::new(P {
+        calls: calls.clone(),
+    }));
     e.handle_input("\x1b[200~@file\x1b[201~");
     e.flush_autocomplete();
     assert_eq!(*calls.lock().unwrap(), 0);

@@ -21,5 +21,5 @@ pub mod util;
 pub mod word_navigation;
 
 pub use component::{Component, ComponentBox, Container, Focusable, RenderStatus};
-pub use line::{Line, CURSOR_MARKER};
+pub use line::{CURSOR_MARKER, Line};
 pub use tui::{Tui, VirtualTerminal};

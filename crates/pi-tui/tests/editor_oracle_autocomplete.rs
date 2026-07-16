@@ -2,9 +2,9 @@
 #![allow(dead_code, unused_imports)]
 
 use pi_tui::autocomplete::{
-    AutocompleteItem, AutocompleteProvider, AutocompleteSuggestions, AppliedCompletion,
-    CancellationToken, CombinedAutocompleteProvider, CommandEntry, SlashCommand,
-    SuggestionOptions, SuggestionStart,
+    AppliedCompletion, AutocompleteItem, AutocompleteProvider, AutocompleteSuggestions,
+    CancellationToken, CombinedAutocompleteProvider, CommandEntry, SlashCommand, SuggestionOptions,
+    SuggestionStart,
 };
 use pi_tui::component::Component;
 use pi_tui::components::editor::{
@@ -108,9 +108,10 @@ fn paste_with_marker(editor: &mut Editor<'_>) -> String {
     editor.get_text()
 }
 
-
 fn force_files(items: Vec<(&str, &str)>) -> Box<dyn AutocompleteProvider> {
-    struct P { items: Vec<AutocompleteItem> }
+    struct P {
+        items: Vec<AutocompleteItem>,
+    }
     impl AutocompleteProvider for P {
         fn get_suggestions(
             &self,
@@ -167,10 +168,7 @@ fn auto_applies_single_force_file_suggestion_without_showing_menu() {
 fn shows_menu_when_force_file_has_multiple_suggestions() {
     let t = tui();
     let mut e = editor(&t);
-    e.set_autocomplete_provider(force_files(vec![
-        ("a.txt", "a.txt"),
-        ("b.txt", "b.txt"),
-    ]));
+    e.set_autocomplete_provider(force_files(vec![("a.txt", "a.txt"), ("b.txt", "b.txt")]));
     e.handle_input("\t");
     assert!(e.is_showing_autocomplete());
     e.handle_input("\x1b"); // cancel
@@ -179,7 +177,9 @@ fn shows_menu_when_force_file_has_multiple_suggestions() {
 
 #[test]
 fn debounces_at_autocomplete_while_typing() {
-    struct P { calls: Arc<Mutex<usize>> }
+    struct P {
+        calls: Arc<Mutex<usize>>,
+    }
     impl AutocompleteProvider for P {
         fn get_suggestions(
             &self,
@@ -213,7 +213,9 @@ fn debounces_at_autocomplete_while_typing() {
     let t = tui();
     let mut e = editor(&t);
     let calls = Arc::new(Mutex::new(0usize));
-    e.set_autocomplete_provider(Box::new(P { calls: calls.clone() }));
+    e.set_autocomplete_provider(Box::new(P {
+        calls: calls.clone(),
+    }));
     e.handle_input("@");
     e.handle_input("m");
     assert_eq!(*calls.lock().unwrap(), 0);
@@ -405,7 +407,8 @@ fn aborts_active_at_autocomplete_when_typing_continues() {
                         let _ = tx.send(None);
                         return;
                     }
-                    let before = &lines[line][..utf16_to_byte(&lines[line], col.min(utf16_len(&lines[line])))];
+                    let before = &lines[line]
+                        [..utf16_to_byte(&lines[line], col.min(utf16_len(&lines[line])))];
                     let _ = tx.send(Some(AutocompleteSuggestions {
                         items: vec![AutocompleteItem {
                             value: "@main.rs".into(),
@@ -430,7 +433,8 @@ fn aborts_active_at_autocomplete_when_typing_continues() {
             if options.aborted() {
                 return None;
             }
-            let before = &lines[line][..utf16_to_byte(&lines[line], col.min(utf16_len(&lines[line])))];
+            let before =
+                &lines[line][..utf16_to_byte(&lines[line], col.min(utf16_len(&lines[line])))];
             Some(AutocompleteSuggestions {
                 items: vec![AutocompleteItem {
                     value: "@main.rs".into(),
@@ -698,10 +702,12 @@ fn awaits_async_slash_command_argument_completions() {
     let t = tui();
     let mut e = editor(&t);
     let provider = CombinedAutocompleteProvider::new(
-        vec![SlashCommand::new("load-skills")
-            .with_description("Load skills")
-            .with_argument_completions(load_skills_args)
-            .into()],
+        vec![
+            SlashCommand::new("load-skills")
+                .with_description("Load skills")
+                .with_argument_completions(load_skills_args)
+                .into(),
+        ],
         ".",
     );
     e.set_autocomplete_provider(Box::new(provider));
@@ -720,7 +726,9 @@ fn does_not_show_argument_completions_when_command_has_no_argument_completer() {
     let mut e = editor(&t);
     let provider = CombinedAutocompleteProvider::new(
         vec![
-            SlashCommand::new("help").with_description("Show help").into(),
+            SlashCommand::new("help")
+                .with_description("Show help")
+                .into(),
             SlashCommand::new("model")
                 .with_description("Switch model")
                 .with_argument_completions(|_| {
@@ -912,7 +920,10 @@ fn re_queries_autocomplete_when_cursor_moves_back_into_command_name() {
     e.handle_input("\x1b[D"); // left out of arg region
     e.flush_autocomplete();
     let after_move = render_plain(&mut e, 80).join("\n");
-    assert!(!after_move.contains("message"), "stale argument menu must not survive");
+    assert!(
+        !after_move.contains("message"),
+        "stale argument menu must not survive"
+    );
 }
 
 #[test]
@@ -980,9 +991,11 @@ fn ignores_invalid_slash_command_argument_completion_results() {
     let t = tui();
     let mut e = editor(&t);
     let provider = pi_tui::autocomplete::CombinedAutocompleteProvider::new(
-        vec![pi_tui::autocomplete::SlashCommand::new("load-skills")
-            .with_argument_completions(bad)
-            .into()],
+        vec![
+            pi_tui::autocomplete::SlashCommand::new("load-skills")
+                .with_argument_completions(bad)
+                .into(),
+        ],
         ".",
     );
     e.set_autocomplete_provider(Box::new(provider));

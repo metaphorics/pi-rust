@@ -547,10 +547,11 @@ pub fn decode_and_resize_to_png_base64(
             (w, h) = out.dimensions();
         }
     } else if let Some(mh) = max_height_px
-        && h > mh {
-            out = out.resize(u32::MAX, mh, FilterType::Triangle);
-            (w, h) = out.dimensions();
-        }
+        && h > mh
+    {
+        out = out.resize(u32::MAX, mh, FilterType::Triangle);
+        (w, h) = out.dimensions();
+    }
     let mut buf = Vec::new();
     out.write_to(&mut std::io::Cursor::new(&mut buf), ImageFormat::Png)
         .ok()?;

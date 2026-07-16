@@ -202,11 +202,12 @@ impl SettingsList {
         };
         if let Some(val) = selected
             && let Some(item_idx) = self.submenu_item_idx
-                && let Some(item) = self.items.get_mut(item_idx) {
-                    item.current_value = val.clone();
-                    let id = item.id.clone();
-                    (self.on_change)(&id, &val);
-                }
+            && let Some(item) = self.items.get_mut(item_idx)
+        {
+            item.current_value = val.clone();
+            let id = item.id.clone();
+            (self.on_change)(&id, &val);
+        }
         self.close_submenu();
     }
 
@@ -271,10 +272,11 @@ impl SettingsList {
         let mut lines: Vec<Line> = Vec::new();
 
         if self.search_enabled
-            && let Some(input) = &mut self.search_input {
-                lines.extend_from_slice(input.render(width));
-                lines.push(Line::empty());
-            }
+            && let Some(input) = &mut self.search_input
+        {
+            lines.extend_from_slice(input.render(width));
+            lines.push(Line::empty());
+        }
 
         if self.items.is_empty() {
             let msg = (self.theme.hint)("  No settings available");
@@ -313,12 +315,7 @@ impl SettingsList {
             .unwrap_or(0)
             .min(30);
 
-        for (i, &item_idx) in display
-            .iter()
-            .enumerate()
-            .take(end_index)
-            .skip(start_index)
-        {
+        for (i, &item_idx) in display.iter().enumerate().take(end_index).skip(start_index) {
             let item = &self.items[item_idx];
             let is_selected = i == self.selected_index;
             let prefix = if is_selected {
@@ -350,14 +347,15 @@ impl SettingsList {
         }
 
         if let Some(&item_idx) = display.get(self.selected_index)
-            && let Some(desc) = &self.items[item_idx].description {
-                lines.push(Line::empty());
-                let wrapped = wrap_text_with_ansi(desc, w.saturating_sub(4));
-                for line in wrapped {
-                    let styled = (self.theme.description)(&format!("  {line}"));
-                    lines.push(Line::from_ansi(&styled));
-                }
+            && let Some(desc) = &self.items[item_idx].description
+        {
+            lines.push(Line::empty());
+            let wrapped = wrap_text_with_ansi(desc, w.saturating_sub(4));
+            for line in wrapped {
+                let styled = (self.theme.description)(&format!("  {line}"));
+                lines.push(Line::from_ansi(&styled));
             }
+        }
 
         self.add_hint_line(&mut lines, w);
         lines
@@ -463,6 +461,48 @@ impl Component for SettingsList {
 
 #[cfg(test)]
 mod tests {
+    /// Regression: typing into the search box re-enters the global
+    /// keybindings registry through `Input::handle_input`; a held guard
+    /// (instead of a snapshot) deadlocks here.
+    #[test]
+    fn search_typing_filters_without_deadlock() {
+        use super::*;
+        let items = vec![
+            SettingItem {
+                id: "a".into(),
+                label: "Alpha".into(),
+                description: Some("First".into()),
+                current_value: "true".into(),
+                values: Some(vec!["true".into(), "false".into()]),
+                submenu: None,
+            },
+            SettingItem {
+                id: "w".into(),
+                label: "Warnings".into(),
+                description: None,
+                current_value: "configure".into(),
+                values: None,
+                submenu: None,
+            },
+        ];
+        let mut list = SettingsList::new(
+            items,
+            10,
+            SettingsListTheme::identity(),
+            Box::new(|_, _| {}),
+            Box::new(|| {}),
+            SettingsListOptions {
+                enable_search: true,
+            },
+        );
+        let _ = list.render(80);
+        list.handle_input("w");
+        let lines: Vec<String> = list.render(80).iter().map(Line::to_ansi).collect();
+        let joined = lines.join("\n");
+        assert!(joined.contains("Warnings"), "{joined}");
+        assert!(!joined.contains("Alpha"), "{joined}");
+    }
+
     use super::*;
     use crate::component::{Component, RenderStatus};
     use crate::line::Line;
@@ -492,7 +532,7 @@ mod tests {
             } else if data == "cancel"
                 && let Some(mut done) = self.done.take()
             {
-                    done(None);
+                done(None);
             }
         }
 

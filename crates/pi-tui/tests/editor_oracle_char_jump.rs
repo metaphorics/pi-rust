@@ -2,9 +2,9 @@
 #![allow(dead_code, unused_imports)]
 
 use pi_tui::autocomplete::{
-    AutocompleteItem, AutocompleteProvider, AutocompleteSuggestions, AppliedCompletion,
-    CancellationToken, CombinedAutocompleteProvider, CommandEntry, SlashCommand,
-    SuggestionOptions, SuggestionStart,
+    AppliedCompletion, AutocompleteItem, AutocompleteProvider, AutocompleteSuggestions,
+    CancellationToken, CombinedAutocompleteProvider, CommandEntry, SlashCommand, SuggestionOptions,
+    SuggestionStart,
 };
 use pi_tui::component::Component;
 use pi_tui::components::editor::{
@@ -126,7 +126,9 @@ fn jumps_forward_to_next_occurrence_after_cursor() {
     let mut e = editor(&t);
     e.set_text("hello world");
     e.handle_input("\x01");
-    for _ in 0..4 { e.handle_input("\x1b[C"); }
+    for _ in 0..4 {
+        e.handle_input("\x1b[C");
+    }
     assert_eq!(e.get_cursor(), (0, 4));
     e.handle_input("\x1d");
     e.handle_input("o");
