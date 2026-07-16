@@ -3,6 +3,10 @@ name = "pi-ext-protocol"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "serde types for the sidecar RPC protocol (single source of truth)"
+description = "Versioned serde protocol for the pi extension sidecar bridge"
 
 [dependencies]
+pi-ai = { path = "../pi-ai" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
