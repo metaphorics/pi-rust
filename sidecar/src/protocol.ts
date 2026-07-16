@@ -16,6 +16,23 @@ export const MAX_ERROR_STACK_BYTES = 512 * 1024;
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 export type JsonObject = { [key: string]: JsonValue };
 
+
+
+/**
+ * Wire boundary seam. Values crossing between wire JSON and pi's typed
+ * surfaces are structurally identical (fixture-locked protocol mirror) but
+ * nominally unrelated to TS; these are the single documented conversion
+ * points in each direction. JSON validity of `toWire` inputs is guaranteed
+ * by construction: pi serializes the same objects itself.
+ */
+export function toWire(value: unknown): JsonValue {
+  return value as JsonValue;
+}
+
+export function fromWire<T>(value: unknown): T {
+  return value as T;
+}
+
 // ---------------------------------------------------------------------------
 // Envelope
 // ---------------------------------------------------------------------------

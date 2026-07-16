@@ -4,6 +4,8 @@
 
 # Node / Bun
 node_modules/
+# Committed fixture dependencies (offline jiti-identity test corpus)
+!sidecar/test/fixtures/**/node_modules/
 .npm
 dist/
 
