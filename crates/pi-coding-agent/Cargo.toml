@@ -33,6 +33,7 @@ parking_lot = "0.12"
 rustix = { workspace = true, features = ["fs", "process", "stdio", "termios", "system"] }
 
 [dev-dependencies]
+pi-vt = { path = "../pi-vt" }
 tempfile = "3"
 tokio = { workspace = true }
 

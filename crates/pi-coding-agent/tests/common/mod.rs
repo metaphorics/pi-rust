@@ -4,6 +4,8 @@
 //! Compiled once per test crate; not every crate uses every helper.
 #![allow(dead_code)]
 
+pub mod vt_terminal;
+
 use std::collections::VecDeque;
 use std::io::Write;
 use std::path::PathBuf;
