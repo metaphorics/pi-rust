@@ -110,12 +110,10 @@ fn is_print_allowlisted(rel: &str) -> bool {
     if rel == "src/wire_out.rs" {
         return true;
     }
-    // Binary entrypoint (help/version).
+    // Grandfathered: pre-B1 --version/--help prints in the boot stub.
+    // The modes wave (B2) owns main.rs and must route these through
+    // wire_out (or stderr) and then remove this exception.
     if rel == "src/main.rs" {
-        return true;
-    }
-    // CLI package: arg parsing / help text surfaces.
-    if rel.starts_with("src/cli/") {
         return true;
     }
     false
@@ -192,7 +190,7 @@ fn stdout_purity_no_print_macros_outside_allowlist() {
 
     assert!(
         offenders.is_empty(),
-        "print!/println! outside allowlist (wire_out, main, cli/). \
+        "print!/println! outside allowlist (wire_out.rs, grandfathered main.rs). \
          In json/rpc modes only wire_out may write stdout.\n{}",
         offenders.join("\n")
     );

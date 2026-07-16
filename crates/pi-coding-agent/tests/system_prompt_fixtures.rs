@@ -157,7 +157,7 @@ fn custom_prompt_assembly_order_and_skills_gate() {
     };
     let p = build_system_prompt(&with_read);
 
-    let skills_section = format_skills_for_prompt(&[skill.clone()]);
+    let skills_section = format_skills_for_prompt(std::slice::from_ref(&skill));
     let expected = format!(
         "CUSTOM BASE\n\
 \n\
