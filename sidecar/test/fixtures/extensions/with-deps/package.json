@@ -1,0 +1,14 @@
+{
+  "name": "pi-fixture-with-deps",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "dependencies": {
+    "fixture-dep": "1.0.0"
+  }
+}
