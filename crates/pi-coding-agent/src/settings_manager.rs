@@ -113,12 +113,14 @@ pub fn migrate_settings(mut settings: Map<String, Value>) -> Settings {
 
     // websockets boolean → transport enum only when the current key is absent.
     if !settings.contains_key("transport")
-        && let Some(Value::Bool(websockets)) = settings.remove("websockets")
+        && settings.get("websockets").is_some_and(Value::is_boolean)
     {
-        settings.insert(
-            "transport".into(),
-            Value::String(if websockets { "websocket" } else { "sse" }.into()),
-        );
+        if let Some(Value::Bool(websockets)) = settings.remove("websockets") {
+            settings.insert(
+                "transport".into(),
+                Value::String(if websockets { "websocket" } else { "sse" }.into()),
+            );
+        }
     }
 
     // skills object → array + enableSkillCommands
@@ -157,7 +159,7 @@ pub fn migrate_settings(mut settings: Map<String, Value>) -> Settings {
                 .get("maxRetryDelayMs")
                 .map(|v| v.is_null())
                 .unwrap_or(true);
-            if needs {
+            if needs && max_delay.is_number() {
                 let mut provider = provider;
                 provider.insert("maxRetryDelayMs".into(), max_delay);
                 retry.insert("provider".into(), Value::Object(provider));
@@ -816,6 +818,76 @@ mod tests {
         // second migrate
         let s2 = migrate_settings(s.0.clone());
         assert_eq!(s2.get_str("steeringMode"), Some("all"));
+    }
+
+    #[test]
+    fn migrate_websockets_boolean_to_transport_when_absent() {
+        let mut m = Map::new();
+        m.insert("websockets".into(), Value::Bool(true));
+        assert_eq!(migrate_settings(m).get_str("transport"), Some("websocket"));
+        let mut m = Map::new();
+        m.insert("websockets".into(), Value::Bool(false));
+        let s = migrate_settings(m);
+        assert_eq!(s.get_str("transport"), Some("sse"));
+        assert!(s.get("websockets").is_none());
+    }
+
+    #[test]
+    fn migrate_websockets_preserves_non_boolean_when_transport_absent() {
+        let mut m = Map::new();
+        m.insert("websockets".into(), Value::String("auto".into()));
+        let s = migrate_settings(m);
+        assert_eq!(s.get_str("websockets"), Some("auto"));
+        assert!(s.get("transport").is_none());
+
+        let mut m = Map::new();
+        m.insert("websockets".into(), serde_json::json!({"mode":"auto"}));
+        let s = migrate_settings(m);
+        assert!(s.get("websockets").unwrap().is_object());
+        assert!(s.get("transport").is_none());
+    }
+
+    #[test]
+    fn migrate_retry_numeric_promotes_and_removes_legacy_key() {
+        let mut m = Map::new();
+        m.insert("retry".into(), serde_json::json!({"maxDelayMs": 5000}));
+        let s = migrate_settings(m);
+        assert_eq!(s.get("retry").unwrap()["provider"]["maxRetryDelayMs"], 5000);
+        assert!(s.get("retry").unwrap().get("maxDelayMs").is_none());
+    }
+
+    #[test]
+    fn migrate_retry_numeric_promotes_when_provider_max_retry_delay_ms_null() {
+        let mut m = Map::new();
+        m.insert(
+            "retry".into(),
+            serde_json::json!({"maxDelayMs": 3000, "provider": {"maxRetryDelayMs": null}}),
+        );
+        let s = migrate_settings(m);
+        assert_eq!(s.get("retry").unwrap()["provider"]["maxRetryDelayMs"], 3000);
+        assert!(s.get("retry").unwrap().get("maxDelayMs").is_none());
+    }
+
+    #[test]
+    fn migrate_retry_non_numeric_removes_key_without_promoting() {
+        let mut m = Map::new();
+        m.insert("retry".into(), serde_json::json!({"maxDelayMs": "soon"}));
+        let s = migrate_settings(m);
+        let prov = s.get("retry").unwrap().get("provider");
+        assert!(prov.is_none() || prov.unwrap().get("maxRetryDelayMs").is_none());
+        assert!(s.get("retry").unwrap().get("maxDelayMs").is_none());
+    }
+
+    #[test]
+    fn migrate_retry_numeric_skips_overwrite_but_still_removes_legacy_key() {
+        let mut m = Map::new();
+        m.insert(
+            "retry".into(),
+            serde_json::json!({"maxDelayMs": 9000, "provider": {"maxRetryDelayMs": 1000}}),
+        );
+        let s = migrate_settings(m);
+        assert_eq!(s.get("retry").unwrap()["provider"]["maxRetryDelayMs"], 1000);
+        assert!(s.get("retry").unwrap().get("maxDelayMs").is_none());
     }
 
     #[test]
