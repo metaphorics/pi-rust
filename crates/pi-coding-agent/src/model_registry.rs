@@ -1,10 +1,10 @@
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
-use crate::auth_storage::{AuthStorage, AuthStatus};
+use crate::auth_storage::{AuthStatus, AuthStorage};
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -241,55 +241,89 @@ impl ModelRegistry {
     }
 
     pub async fn get_available(&self) -> Vec<pi_ai::types::Model> {
+        // Authentication is provider-scoped. The catalog contains hundreds of
+        // models but only a few dozen providers; resolving auth per model
+        // repeatedly rereads auth.json and makes `/model` take seconds.
+        let mut configured_by_provider = HashMap::new();
         let mut available = Vec::new();
-        for m in &self.models {
-            if self.has_configured_auth(m).await {
-                available.push(m.clone());
+        for model in &self.models {
+            let configured = if let Some(configured) = configured_by_provider.get(&model.provider) {
+                *configured
+            } else {
+                let configured = self.has_configured_auth(model).await;
+                configured_by_provider.insert(model.provider.clone(), configured);
+                configured
+            };
+            if configured {
+                available.push(model.clone());
             }
         }
         available
     }
 
     pub fn find(&self, provider: &str, model_id: &str) -> Option<&pi_ai::types::Model> {
-        self.models.iter().find(|m| m.provider == provider && m.id == model_id)
+        self.models
+            .iter()
+            .find(|m| m.provider == provider && m.id == model_id)
     }
 
     pub async fn has_configured_auth(&self, model: &pi_ai::types::Model) -> bool {
-        let provider_api_key = self.provider_request_configs.get(&model.provider).and_then(|pc| pc.api_key.as_ref());
-        if self.auth_storage.has_auth(&model.provider).await.unwrap_or(false) {
+        let provider_api_key = self
+            .provider_request_configs
+            .get(&model.provider)
+            .and_then(|pc| pc.api_key.as_ref());
+        if self
+            .auth_storage
+            .has_auth(&model.provider)
+            .await
+            .unwrap_or(false)
+        {
             return true;
         }
         if let Some(key) = provider_api_key {
-            let provider_env = self.auth_storage.get_provider_env(&model.provider).await.ok().flatten();
+            let provider_env = self
+                .auth_storage
+                .get_provider_env(&model.provider)
+                .await
+                .ok()
+                .flatten();
             crate::resolve_config_value::is_config_value_configured(key, provider_env.as_ref())
         } else {
             false
         }
     }
 
-    pub async fn get_api_key_and_headers(&self, model: &pi_ai::types::Model) -> ResolvedRequestAuth {
+    pub async fn get_api_key_and_headers(
+        &self,
+        model: &pi_ai::types::Model,
+    ) -> ResolvedRequestAuth {
         let provider_config = self.provider_request_configs.get(&model.provider);
         let provider_env = match self.auth_storage.get_provider_env(&model.provider).await {
             Ok(env) => env,
-            Err(e) => return ResolvedRequestAuth {
-                ok: false,
-                error: Some(e.to_string()),
-                api_key: None,
-                headers: None,
-                env: None,
-            },
+            Err(e) => {
+                return ResolvedRequestAuth {
+                    ok: false,
+                    error: Some(e.to_string()),
+                    api_key: None,
+                    headers: None,
+                    env: None,
+                };
+            }
         };
 
-        let api_key_from_auth_storage = match self.auth_storage.get_api_key(&model.provider, false).await {
-            Ok(key) => key,
-            Err(e) => return ResolvedRequestAuth {
-                ok: false,
-                error: Some(e.to_string()),
-                api_key: None,
-                headers: None,
-                env: None,
-            },
-        };
+        let api_key_from_auth_storage =
+            match self.auth_storage.get_api_key(&model.provider, false).await {
+                Ok(key) => key,
+                Err(e) => {
+                    return ResolvedRequestAuth {
+                        ok: false,
+                        error: Some(e.to_string()),
+                        api_key: None,
+                        headers: None,
+                        env: None,
+                    };
+                }
+            };
 
         let api_key = match api_key_from_auth_storage {
             Some(key) => Some(key),
@@ -302,13 +336,15 @@ impl ModelRegistry {
                             provider_env.as_ref(),
                         ) {
                             Ok(val) => Some(val),
-                            Err(e) => return ResolvedRequestAuth {
-                                ok: false,
-                                error: Some(e),
-                                api_key: None,
-                                headers: None,
-                                env: None,
-                            },
+                            Err(e) => {
+                                return ResolvedRequestAuth {
+                                    ok: false,
+                                    error: Some(e),
+                                    api_key: None,
+                                    headers: None,
+                                    env: None,
+                                };
+                            }
                         }
                     } else {
                         None
@@ -326,13 +362,15 @@ impl ModelRegistry {
                 provider_env.as_ref(),
             ) {
                 Ok(h) => h,
-                Err(e) => return ResolvedRequestAuth {
-                    ok: false,
-                    error: Some(e),
-                    api_key: None,
-                    headers: None,
-                    env: None,
-                },
+                Err(e) => {
+                    return ResolvedRequestAuth {
+                        ok: false,
+                        error: Some(e),
+                        api_key: None,
+                        headers: None,
+                        env: None,
+                    };
+                }
             }
         } else {
             None
@@ -346,13 +384,15 @@ impl ModelRegistry {
             provider_env.as_ref(),
         ) {
             Ok(h) => h,
-            Err(e) => return ResolvedRequestAuth {
-                ok: false,
-                error: Some(e),
-                api_key: None,
-                headers: None,
-                env: None,
-            },
+            Err(e) => {
+                return ResolvedRequestAuth {
+                    ok: false,
+                    error: Some(e),
+                    api_key: None,
+                    headers: None,
+                    env: None,
+                };
+            }
         };
 
         let mut headers = HashMap::new();
@@ -372,7 +412,10 @@ impl ModelRegistry {
             }
         }
 
-        if provider_config.and_then(|pc| pc.auth_header).unwrap_or(false) {
+        if provider_config
+            .and_then(|pc| pc.auth_header)
+            .unwrap_or(false)
+        {
             let Some(key) = &api_key else {
                 return ResolvedRequestAuth {
                     ok: false,
@@ -385,7 +428,11 @@ impl ModelRegistry {
             headers.insert("Authorization".to_string(), format!("Bearer {}", key));
         }
 
-        let final_headers = if headers.is_empty() { None } else { Some(headers) };
+        let final_headers = if headers.is_empty() {
+            None
+        } else {
+            Some(headers)
+        };
         let final_env = if let Some(e) = &provider_env {
             if e.is_empty() { None } else { Some(e.clone()) }
         } else {
@@ -415,7 +462,10 @@ impl ModelRegistry {
             return auth_status;
         }
 
-        let provider_api_key = self.provider_request_configs.get(provider).and_then(|pc| pc.api_key.as_ref());
+        let provider_api_key = self
+            .provider_request_configs
+            .get(provider)
+            .and_then(|pc| pc.api_key.as_ref());
         let Some(key) = provider_api_key else {
             return auth_status;
         };
@@ -430,8 +480,16 @@ impl ModelRegistry {
 
         let env_var_names = crate::resolve_config_value::get_config_value_env_var_names(key);
         if !env_var_names.is_empty() {
-            let provider_env = self.auth_storage.get_provider_env(provider).await.ok().flatten();
-            return if crate::resolve_config_value::is_config_value_configured(key, provider_env.as_ref()) {
+            let provider_env = self
+                .auth_storage
+                .get_provider_env(provider)
+                .await
+                .ok()
+                .flatten();
+            return if crate::resolve_config_value::is_config_value_configured(
+                key,
+                provider_env.as_ref(),
+            ) {
                 AuthStatus {
                     configured: true,
                     source: Some("environment".to_string()),
@@ -454,7 +512,11 @@ impl ModelRegistry {
     }
 
     pub fn get_provider_display_name(&self, provider: &str) -> String {
-        if let Some(name) = self.registered_providers.get(provider).and_then(|r| r.name.as_ref()) {
+        if let Some(name) = self
+            .registered_providers
+            .get(provider)
+            .and_then(|r| r.name.as_ref())
+        {
             return name.clone();
         }
 
@@ -478,9 +540,17 @@ impl ModelRegistry {
             return Some(key);
         }
 
-        let provider_api_key = self.provider_request_configs.get(provider).and_then(|pc| pc.api_key.as_ref());
+        let provider_api_key = self
+            .provider_request_configs
+            .get(provider)
+            .and_then(|pc| pc.api_key.as_ref());
         if let Some(key) = provider_api_key {
-            let provider_env = self.auth_storage.get_provider_env(provider).await.ok().flatten();
+            let provider_env = self
+                .auth_storage
+                .get_provider_env(provider)
+                .await
+                .ok()
+                .flatten();
             crate::resolve_config_value::resolve_config_value_uncached(key, provider_env.as_ref())
         } else {
             None
@@ -488,10 +558,17 @@ impl ModelRegistry {
     }
 
     pub async fn is_using_oauth(&self, model: &pi_ai::types::Model) -> bool {
-        matches!(self.auth_storage.get(&model.provider).await, Ok(Some(pi_ai::auth::Credential::OAuth(_))))
+        matches!(
+            self.auth_storage.get(&model.provider).await,
+            Ok(Some(pi_ai::auth::Credential::OAuth(_)))
+        )
     }
 
-    pub fn register_provider(&mut self, provider_name: String, config: ProviderConfigInput) -> Result<(), String> {
+    pub fn register_provider(
+        &mut self,
+        provider_name: String,
+        config: ProviderConfigInput,
+    ) -> Result<(), String> {
         self.validate_provider_config(&provider_name, &config)?;
         self.apply_provider_config(&provider_name, &config);
         self.upsert_registered_provider(provider_name, config);
@@ -506,24 +583,37 @@ impl ModelRegistry {
         self.refresh();
     }
 
-    fn validate_provider_config(&self, provider_name: &str, config: &ProviderConfigInput) -> Result<(), String> {
+    fn validate_provider_config(
+        &self,
+        provider_name: &str,
+        config: &ProviderConfigInput,
+    ) -> Result<(), String> {
         let models = config.models.as_deref().unwrap_or(&[]);
         if models.is_empty() {
             return Ok(());
         }
 
         if config.base_url.is_none() {
-            return Err(format!("Provider {}: \"baseUrl\" is required when defining models.", provider_name));
+            return Err(format!(
+                "Provider {}: \"baseUrl\" is required when defining models.",
+                provider_name
+            ));
         }
 
         if config.api_key.is_none() && config.oauth.is_none() {
-            return Err(format!("Provider {}: \"apiKey\" or \"oauth\" is required when defining models.", provider_name));
+            return Err(format!(
+                "Provider {}: \"apiKey\" or \"oauth\" is required when defining models.",
+                provider_name
+            ));
         }
 
         for model_def in models {
             let api = model_def.api.as_ref().or(config.api.as_ref());
             if api.is_none() {
-                return Err(format!("Provider {}, model {}: no \"api\" specified.", provider_name, model_def.id));
+                return Err(format!(
+                    "Provider {}, model {}: no \"api\" specified.",
+                    provider_name, model_def.id
+                ));
             }
         }
         Ok(())
@@ -535,15 +625,22 @@ impl ModelRegistry {
             headers: config.headers.clone(),
             auth_header: config.auth_header,
         };
-        self.provider_request_configs.insert(provider_name.to_string(), req_cfg);
+        self.provider_request_configs
+            .insert(provider_name.to_string(), req_cfg);
 
         let models = config.models.as_deref().unwrap_or(&[]);
         if !models.is_empty() {
             self.models.retain(|m| m.provider != provider_name);
 
             for model_def in models {
-                let api = model_def.api.as_ref().or(config.api.as_ref()).cloned().unwrap_or_default();
-                let model_override = self.get_configured_model_override(provider_name, &model_def.id);
+                let api = model_def
+                    .api
+                    .as_ref()
+                    .or(config.api.as_ref())
+                    .cloned()
+                    .unwrap_or_default();
+                let model_override =
+                    self.get_configured_model_override(provider_name, &model_def.id);
 
                 let mut headers = HashMap::new();
                 if let Some(mh) = &model_def.headers {
@@ -556,27 +653,47 @@ impl ModelRegistry {
                         headers.insert(k.clone(), v.clone());
                     }
                 }
-                let headers_opt = if headers.is_empty() { None } else { Some(headers) };
+                let headers_opt = if headers.is_empty() {
+                    None
+                } else {
+                    Some(headers)
+                };
                 if let Some(h) = &headers_opt {
-                    self.model_request_headers.insert(format!("{}:{}", provider_name, model_def.id), h.clone());
+                    self.model_request_headers
+                        .insert(format!("{}:{}", provider_name, model_def.id), h.clone());
                 }
 
-                let base_url = model_def.base_url.as_ref().or(config.base_url.as_ref()).cloned().unwrap_or_default();
+                let base_url = model_def
+                    .base_url
+                    .as_ref()
+                    .or(config.base_url.as_ref())
+                    .cloned()
+                    .unwrap_or_default();
 
-                let input = model_def.input.clone().unwrap_or_else(|| vec![pi_ai::types::ModelInput::Text]);
-                let cost = model_def.cost.as_ref().map(|c| pi_ai::types::ModelCost {
-                    input: c.input,
-                    output: c.output,
-                    cache_read: c.cache_read,
-                    cache_write: c.cache_write,
-                    tiers: c.tiers.clone().unwrap_or_default(),
-                }).unwrap_or_default();
+                let input = model_def
+                    .input
+                    .clone()
+                    .unwrap_or_else(|| vec![pi_ai::types::ModelInput::Text]);
+                let cost = model_def
+                    .cost
+                    .as_ref()
+                    .map(|c| pi_ai::types::ModelCost {
+                        input: c.input,
+                        output: c.output,
+                        cache_read: c.cache_read,
+                        cache_write: c.cache_write,
+                        tiers: c.tiers.clone().unwrap_or_default(),
+                    })
+                    .unwrap_or_default();
                 let context_window = model_def.context_window.unwrap_or(128000);
                 let max_tokens = model_def.max_tokens.unwrap_or(16384);
 
                 let mut m = pi_ai::types::Model {
                     id: model_def.id.clone(),
-                    name: model_def.name.clone().unwrap_or_else(|| model_def.id.clone()),
+                    name: model_def
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| model_def.id.clone()),
                     api: pi_ai::types::Api(api),
                     provider: provider_name.to_string(),
                     base_url,
@@ -638,17 +755,18 @@ impl ModelRegistry {
 
     fn load_models(&mut self) {
         self.radius_oauth_providers.clear();
-        let (custom_models, overrides, model_overrides) = if let Some(path) = self.models_json_path.clone() {
-            match self.load_custom_models(&path) {
-                Ok(res) => res,
-                Err(err_msg) => {
-                    self.load_error = Some(err_msg);
-                    (Vec::new(), HashMap::new(), HashMap::new())
+        let (custom_models, overrides, model_overrides) =
+            if let Some(path) = self.models_json_path.clone() {
+                match self.load_custom_models(&path) {
+                    Ok(res) => res,
+                    Err(err_msg) => {
+                        self.load_error = Some(err_msg);
+                        (Vec::new(), HashMap::new(), HashMap::new())
+                    }
                 }
-            }
-        } else {
-            (Vec::new(), HashMap::new(), HashMap::new())
-        };
+            } else {
+                (Vec::new(), HashMap::new(), HashMap::new())
+            };
 
         self.config_model_overrides = model_overrides.clone();
 
@@ -662,11 +780,21 @@ impl ModelRegistry {
             return Ok((Vec::new(), HashMap::new(), HashMap::new()));
         }
 
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| format!("Failed to read models.json: {}\n\nFile: {}", e, path.display()))?;
+        let content = std::fs::read_to_string(path).map_err(|e| {
+            format!(
+                "Failed to read models.json: {}\n\nFile: {}",
+                e,
+                path.display()
+            )
+        })?;
         let stripped = strip_json_comments(&content);
-        let config: ModelsConfig = serde_json::from_str(&stripped)
-            .map_err(|e| format!("Failed to parse models.json: {}\n\nFile: {}", e, path.display()))?;
+        let config: ModelsConfig = serde_json::from_str(&stripped).map_err(|e| {
+            format!(
+                "Failed to parse models.json: {}\n\nFile: {}",
+                e,
+                path.display()
+            )
+        })?;
 
         validate_config(&config)?;
 
@@ -685,7 +813,10 @@ impl ModelRegistry {
             }
 
             if matches!(provider_config.oauth, Some(OAuthProviderType::Radius)) {
-                let base_url = provider_config.base_url.as_deref().expect("validated Radius baseUrl");
+                let base_url = provider_config
+                    .base_url
+                    .as_deref()
+                    .expect("validated Radius baseUrl");
                 let gateway = base_url
                     .strip_suffix("/v1/")
                     .or_else(|| base_url.strip_suffix("/v1"))
@@ -693,7 +824,10 @@ impl ModelRegistry {
                 let provider = Arc::new(pi_ai::oauth::radius::create_radius_oauth_provider(
                     pi_ai::oauth::radius::RadiusOAuthProviderOptions {
                         id: provider_name.clone(),
-                        name: provider_config.name.clone().unwrap_or_else(|| provider_name.clone()),
+                        name: provider_config
+                            .name
+                            .clone()
+                            .unwrap_or_else(|| provider_name.clone()),
                         gateway: gateway.to_owned(),
                     },
                 ));
@@ -706,13 +840,15 @@ impl ModelRegistry {
                 headers: provider_config.headers.clone(),
                 auth_header: provider_config.auth_header,
             };
-            self.provider_request_configs.insert(provider_name.clone(), req_cfg);
+            self.provider_request_configs
+                .insert(provider_name.clone(), req_cfg);
 
             if let Some(mo_map) = &provider_config.model_overrides {
                 model_overrides.insert(provider_name.clone(), mo_map.clone());
                 for (model_id, mo) in mo_map {
                     if let Some(h) = &mo.headers {
-                        self.model_request_headers.insert(format!("{}:{}", provider_name, model_id), h.clone());
+                        self.model_request_headers
+                            .insert(format!("{}:{}", provider_name, model_id), h.clone());
                     }
                 }
             }
@@ -756,25 +892,37 @@ impl ModelRegistry {
                     continue;
                 };
 
-                let compat = merge_json_values(provider_config.compat.clone(), model_def.compat.clone());
+                let compat =
+                    merge_json_values(provider_config.compat.clone(), model_def.compat.clone());
                 if let Some(h) = &model_def.headers {
-                    self.model_request_headers.insert(format!("{}:{}", provider_name, model_def.id), h.clone());
+                    self.model_request_headers
+                        .insert(format!("{}:{}", provider_name, model_def.id), h.clone());
                 }
 
-                let input = model_def.input.clone().unwrap_or_else(|| vec![pi_ai::types::ModelInput::Text]);
-                let cost = model_def.cost.as_ref().map(|c| pi_ai::types::ModelCost {
-                    input: c.input,
-                    output: c.output,
-                    cache_read: c.cache_read,
-                    cache_write: c.cache_write,
-                    tiers: c.tiers.clone().unwrap_or_default(),
-                }).unwrap_or_default();
+                let input = model_def
+                    .input
+                    .clone()
+                    .unwrap_or_else(|| vec![pi_ai::types::ModelInput::Text]);
+                let cost = model_def
+                    .cost
+                    .as_ref()
+                    .map(|c| pi_ai::types::ModelCost {
+                        input: c.input,
+                        output: c.output,
+                        cache_read: c.cache_read,
+                        cache_write: c.cache_write,
+                        tiers: c.tiers.clone().unwrap_or_default(),
+                    })
+                    .unwrap_or_default();
                 let context_window = model_def.context_window.unwrap_or(128000);
                 let max_tokens = model_def.max_tokens.unwrap_or(16384);
 
                 models.push(pi_ai::types::Model {
                     id: model_def.id.clone(),
-                    name: model_def.name.clone().unwrap_or_else(|| model_def.id.clone()),
+                    name: model_def
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| model_def.id.clone()),
                     api: pi_ai::types::Api(api_str),
                     provider: provider_name.clone(),
                     base_url: base_url_str,
@@ -811,7 +959,10 @@ impl ModelRegistry {
                 model.compat = merge_json_values(model.compat, po.compat.clone());
             }
 
-            if let Some(mo) = model_overrides.get(&model.provider).and_then(|mo_map| mo_map.get(&model.id)) {
+            if let Some(mo) = model_overrides
+                .get(&model.provider)
+                .and_then(|mo_map| mo_map.get(&model.id))
+            {
                 model = apply_model_override(model, mo);
             }
 
@@ -868,7 +1019,10 @@ impl ModelRegistry {
                 if model.provider != "github-copilot" {
                     return true;
                 }
-                if available_ids.as_ref().is_some_and(|ids| !ids.contains(&model.id)) {
+                if available_ids
+                    .as_ref()
+                    .is_some_and(|ids| !ids.contains(&model.id))
+                {
                     return false;
                 }
                 model.base_url = base_url.clone();
@@ -924,8 +1078,14 @@ impl ModelRegistry {
         models
     }
 
-    fn get_configured_model_override(&self, provider_name: &str, model_id: &str) -> Option<ModelOverride> {
-        self.config_model_overrides.get(provider_name).and_then(|mo| mo.get(model_id).cloned())
+    fn get_configured_model_override(
+        &self,
+        provider_name: &str,
+        model_id: &str,
+    ) -> Option<ModelOverride> {
+        self.config_model_overrides
+            .get(provider_name)
+            .and_then(|mo| mo.get(model_id).cloned())
     }
 
     pub async fn resolve(
@@ -949,7 +1109,10 @@ impl ModelRegistry {
                 model: None,
                 thinking_level: None,
                 warning: None,
-                error: Some("No models available. Check your installation or add models to models.json.".to_string()),
+                error: Some(
+                    "No models available. Check your installation or add models to models.json."
+                        .to_string(),
+                ),
             };
         }
 
@@ -988,7 +1151,8 @@ impl ModelRegistry {
         if provider.is_none() {
             let lower = cli_model_str.to_lowercase();
             let exact = available_models.iter().find(|m| {
-                m.id.to_lowercase() == lower || format!("{}/{}", m.provider, m.id).to_lowercase() == lower
+                m.id.to_lowercase() == lower
+                    || format!("{}/{}", m.provider, m.id).to_lowercase() == lower
             });
             if let Some(m) = exact {
                 return ResolveResult {
@@ -1002,13 +1166,20 @@ impl ModelRegistry {
 
         if let (Some(p), true) = (&provider, cli_provider.is_some()) {
             let prefix = format!("{}/", p);
-            if cli_model_str.to_lowercase().starts_with(&prefix.to_lowercase()) {
+            if cli_model_str
+                .to_lowercase()
+                .starts_with(&prefix.to_lowercase())
+            {
                 pattern = cli_model_str[prefix.len()..].to_string();
             }
         }
 
         let candidates = if let Some(p) = &provider {
-            available_models.iter().filter(|m| &m.provider == p).cloned().collect()
+            available_models
+                .iter()
+                .filter(|m| &m.provider == p)
+                .cloned()
+                .collect()
         } else {
             available_models.clone()
         };
@@ -1019,7 +1190,10 @@ impl ModelRegistry {
             if inferred_provider {
                 let raw_exact_matches: Vec<_> = available_models
                     .iter()
-                    .filter(|x| x.id.to_lowercase() == cli_model_str.to_lowercase() && (x.id != m.id || x.provider != m.provider))
+                    .filter(|x| {
+                        x.id.to_lowercase() == cli_model_str.to_lowercase()
+                            && (x.id != m.id || x.provider != m.provider)
+                    })
                     .collect();
                 if !raw_exact_matches.is_empty() && !self.has_configured_auth(m).await {
                     let mut authenticated_raw_matches = Vec::new();
@@ -1049,7 +1223,8 @@ impl ModelRegistry {
         if inferred_provider {
             let lower = cli_model_str.to_lowercase();
             let exact = available_models.iter().find(|m| {
-                m.id.to_lowercase() == lower || format!("{}/{}", m.provider, m.id).to_lowercase() == lower
+                m.id.to_lowercase() == lower
+                    || format!("{}/{}", m.provider, m.id).to_lowercase() == lower
             });
             if let Some(m) = exact {
                 return ResolveResult {
@@ -1060,7 +1235,8 @@ impl ModelRegistry {
                 };
             }
 
-            let (fallback_model, fallback_thinking, fallback_warning) = parse_model_pattern(cli_model_str, &available_models, false);
+            let (fallback_model, fallback_thinking, fallback_warning) =
+                parse_model_pattern(cli_model_str, &available_models, false);
             if let Some(m) = fallback_model {
                 return ResolveResult {
                     model: Some(m),
@@ -1074,7 +1250,7 @@ impl ModelRegistry {
         if let Some(p) = &provider {
             let mut fallback_pattern = pattern.clone();
             let mut fallback_thinking = None;
-            
+
             let mut last_colon_opt = None;
             if cli_thinking.is_none() {
                 last_colon_opt = pattern.rfind(':');
@@ -1090,13 +1266,21 @@ impl ModelRegistry {
             let fallback_model = build_fallback_model(p, &fallback_pattern, &available_models);
             if let Some(mut fm) = fallback_model {
                 let requested_thinking = cli_thinking.or(fallback_thinking);
-                if requested_thinking.unwrap_or(pi_ai::types::ModelThinkingLevel::Off) != pi_ai::types::ModelThinkingLevel::Off {
+                if requested_thinking.unwrap_or(pi_ai::types::ModelThinkingLevel::Off)
+                    != pi_ai::types::ModelThinkingLevel::Off
+                {
                     fm.reasoning = true;
                 }
                 let fallback_warning = if let Some(w) = &warning {
-                    format!("{} Model \"{}\" not found for provider \"{}\". Using custom model id.", w, fallback_pattern, p)
+                    format!(
+                        "{} Model \"{}\" not found for provider \"{}\". Using custom model id.",
+                        w, fallback_pattern, p
+                    )
                 } else {
-                    format!("Model \"{}\" not found for provider \"{}\". Using custom model id.", fallback_pattern, p)
+                    format!(
+                        "Model \"{}\" not found for provider \"{}\". Using custom model id.",
+                        fallback_pattern, p
+                    )
                 };
                 return ResolveResult {
                     model: Some(fm),
@@ -1117,7 +1301,10 @@ impl ModelRegistry {
             model: None,
             thinking_level: None,
             warning: None,
-            error: Some(format!("Model \"{}\" not found. Use --list-models to see available models.", display)),
+            error: Some(format!(
+                "Model \"{}\" not found. Use --list-models to see available models.",
+                display
+            )),
         }
     }
 }
@@ -1199,7 +1386,9 @@ fn try_match_model(pattern: &str, models: &[pi_ai::types::Model]) -> Option<pi_a
     let pattern_lower = pattern.to_lowercase();
     let mut matches = Vec::new();
     for m in models {
-        if m.id.to_lowercase().contains(&pattern_lower) || m.name.to_lowercase().contains(&pattern_lower) {
+        if m.id.to_lowercase().contains(&pattern_lower)
+            || m.name.to_lowercase().contains(&pattern_lower)
+        {
             matches.push(m.clone());
         }
     }
@@ -1244,7 +1433,11 @@ fn parse_model_pattern(
     pattern: &str,
     models: &[pi_ai::types::Model],
     allow_invalid_fallback: bool,
-) -> (Option<pi_ai::types::Model>, Option<pi_ai::types::ModelThinkingLevel>, Option<String>) {
+) -> (
+    Option<pi_ai::types::Model>,
+    Option<pi_ai::types::ModelThinkingLevel>,
+    Option<String>,
+) {
     if let Some(exact) = try_match_model(pattern, models) {
         return (Some(exact), None, None);
     }
@@ -1258,7 +1451,8 @@ fn parse_model_pattern(
     let suffix = &pattern[colon_idx + 1..];
 
     if let Some(level) = parse_thinking_level(suffix) {
-        let (model, inner_level, warning) = parse_model_pattern(prefix, models, allow_invalid_fallback);
+        let (model, inner_level, warning) =
+            parse_model_pattern(prefix, models, allow_invalid_fallback);
         if model.is_some() {
             return (
                 model,
@@ -1272,12 +1466,16 @@ fn parse_model_pattern(
             return (None, None, None);
         }
 
-        let (model, inner_level, warning) = parse_model_pattern(prefix, models, allow_invalid_fallback);
+        let (model, inner_level, warning) =
+            parse_model_pattern(prefix, models, allow_invalid_fallback);
         if model.is_some() {
             return (
                 model,
                 None,
-                Some(format!("Invalid thinking level \"{}\" in pattern \"{}\". Using default instead.", suffix, pattern)),
+                Some(format!(
+                    "Invalid thinking level \"{}\" in pattern \"{}\". Using default instead.",
+                    suffix, pattern
+                )),
             );
         }
         (model, inner_level, warning)
@@ -1338,7 +1536,11 @@ fn build_fallback_model(
 
     let default_id = default_model_id(provider);
     let base_model = if let Some(def_id) = default_id {
-        provider_models.iter().find(|m| m.id == def_id).copied().unwrap_or(provider_models[0])
+        provider_models
+            .iter()
+            .find(|m| m.id == def_id)
+            .copied()
+            .unwrap_or(provider_models[0])
     } else {
         provider_models[0]
     };
@@ -1349,7 +1551,10 @@ fn build_fallback_model(
     Some(model)
 }
 
-fn apply_model_override(mut model: pi_ai::types::Model, r#override: &ModelOverride) -> pi_ai::types::Model {
+fn apply_model_override(
+    mut model: pi_ai::types::Model,
+    r#override: &ModelOverride,
+) -> pi_ai::types::Model {
     if let Some(name) = &r#override.name {
         model.name = name.clone();
     }
@@ -1414,11 +1619,17 @@ fn validate_config(config: &ModelsConfig) -> Result<(), String> {
         let is_built_in = built_in_providers.contains(provider_name.as_str());
         let has_provider_api = provider_config.api.is_some();
         let models = provider_config.models.as_deref().unwrap_or(&[]);
-        let has_model_overrides = provider_config.model_overrides.as_ref().map(|mo| !mo.is_empty()).unwrap_or(false);
-
+        let has_model_overrides = provider_config
+            .model_overrides
+            .as_ref()
+            .map(|mo| !mo.is_empty())
+            .unwrap_or(false);
 
         if provider_config.oauth.is_some() && provider_config.base_url.is_none() {
-            return Err(format!("Provider {}: \"baseUrl\" is required when \"oauth\" is set.", provider_name));
+            return Err(format!(
+                "Provider {}: \"baseUrl\" is required when \"oauth\" is set.",
+                provider_name
+            ));
         }
 
         if models.is_empty() && provider_config.oauth.is_none() {
@@ -1433,7 +1644,10 @@ fn validate_config(config: &ModelsConfig) -> Result<(), String> {
                 ));
             }
         } else if !is_built_in && provider_config.base_url.is_none() {
-            return Err(format!("Provider {}: \"baseUrl\" is required when defining custom models.", provider_name));
+            return Err(format!(
+                "Provider {}: \"baseUrl\" is required when defining custom models.",
+                provider_name
+            ));
         }
 
         for model_def in models {
@@ -1451,11 +1665,17 @@ fn validate_config(config: &ModelsConfig) -> Result<(), String> {
             }
 
             if model_def.context_window == Some(0) {
-                return Err(format!("Provider {}, model {}: invalid contextWindow", provider_name, model_def.id));
+                return Err(format!(
+                    "Provider {}, model {}: invalid contextWindow",
+                    provider_name, model_def.id
+                ));
             }
 
             if model_def.max_tokens == Some(0) {
-                return Err(format!("Provider {}, model {}: invalid maxTokens", provider_name, model_def.id));
+                return Err(format!(
+                    "Provider {}, model {}: invalid maxTokens",
+                    provider_name, model_def.id
+                ));
             }
         }
     }
@@ -1547,23 +1767,24 @@ fn merge_json_values(base: Option<Value>, r#override: Option<Value>) -> Option<V
         (None, None) => None,
         (Some(b), None) => Some(b),
         (None, Some(o)) => Some(o),
-        (Some(b), Some(o)) => {
-            match (b, o) {
-                (Value::Object(mut b_map), Value::Object(o_map)) => {
-                    for (k, v) in o_map {
-                        if k == "openRouterRouting" || k == "vercelGatewayRouting" || k == "chatTemplateKwargs" {
-                            let merged = merge_json_values(b_map.remove(&k), Some(v));
-                            if let Some(m) = merged {
-                                b_map.insert(k, m);
-                            }
-                        } else {
-                            b_map.insert(k, v);
+        (Some(b), Some(o)) => match (b, o) {
+            (Value::Object(mut b_map), Value::Object(o_map)) => {
+                for (k, v) in o_map {
+                    if k == "openRouterRouting"
+                        || k == "vercelGatewayRouting"
+                        || k == "chatTemplateKwargs"
+                    {
+                        let merged = merge_json_values(b_map.remove(&k), Some(v));
+                        if let Some(m) = merged {
+                            b_map.insert(k, m);
                         }
+                    } else {
+                        b_map.insert(k, v);
                     }
-                    Some(Value::Object(b_map))
                 }
-                (_, o_val) => Some(o_val),
+                Some(Value::Object(b_map))
             }
-        }
+            (_, o_val) => Some(o_val),
+        },
     }
 }

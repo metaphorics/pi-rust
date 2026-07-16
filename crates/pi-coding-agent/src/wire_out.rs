@@ -8,8 +8,8 @@
 
 use std::io::{self, Write};
 use std::process;
-use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::LazyLock;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::Duration;
 
@@ -62,7 +62,11 @@ impl WireOut {
             return;
         }
         // Writer thread death is unrecoverable — same as an stdout I/O failure.
-        if self.tx.send(Command::Write(text.as_bytes().to_vec())).is_err() {
+        if self
+            .tx
+            .send(Command::Write(text.as_bytes().to_vec()))
+            .is_err()
+        {
             process::exit(1);
         }
     }

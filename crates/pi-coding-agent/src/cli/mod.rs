@@ -1,8 +1,8 @@
 pub mod args;
 
 pub use args::{
-    parse_args, get_help_text, validate_arg_combinations, Args, Mode, AppMode, ThinkingLevel, ListModels,
-    UnknownFlagValue, Diagnostic, DiagnosticType, ExtensionFlag,
+    AppMode, Args, Diagnostic, DiagnosticType, ExtensionFlag, ListModels, Mode, ThinkingLevel,
+    UnknownFlagValue, get_help_text, parse_args, validate_arg_combinations,
 };
 
 /// Resolve the AppMode from parsed CLI arguments, process stdin, and stdout TTY status.

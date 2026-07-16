@@ -618,6 +618,31 @@ impl SettingsManager {
         self.save_global();
     }
 
+    /// Persist one top-level global setting while preserving unknown keys.
+    pub(crate) fn set_global_value(&mut self, key: &str, value: Value) {
+        self.global_settings.insert(key.to_owned(), value);
+        self.mark_modified(key, None);
+        self.save_global();
+    }
+
+    /// Persist one nested global setting while preserving sibling keys.
+    pub(crate) fn set_global_nested_value(&mut self, section: &str, key: &str, value: Value) {
+        let object = self
+            .global_settings
+            .0
+            .entry(section.to_owned())
+            .or_insert_with(|| Value::Object(Map::new()));
+        if !object.is_object() {
+            *object = Value::Object(Map::new());
+        }
+        object
+            .as_object_mut()
+            .expect("object initialized above")
+            .insert(key.to_owned(), value);
+        self.mark_modified(section, Some(key));
+        self.save_global();
+    }
+
     pub fn get_theme(&self) -> Option<&str> {
         let theme = self.settings.get_str("theme")?;
         if theme.contains('/') {

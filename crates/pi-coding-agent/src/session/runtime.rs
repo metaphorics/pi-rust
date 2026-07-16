@@ -191,10 +191,7 @@ impl AgentSessionRuntime {
         session_path: &Path,
         cwd_override: Option<&str>,
     ) -> Result<ReplaceResult, String> {
-        if self.emit_before_switch(
-            SessionStartReason::Resume,
-            Some(session_path.to_path_buf()),
-        ) {
+        if self.emit_before_switch(SessionStartReason::Resume, Some(session_path.to_path_buf())) {
             return Ok(ReplaceResult {
                 cancelled: true,
                 selected_text: None,
@@ -202,8 +199,8 @@ impl AgentSessionRuntime {
         }
 
         let previous_session_file = self.session().session_file();
-        let session_manager = SessionManager::open(session_path, None, cwd_override)
-            .map_err(|e| e.to_string())?;
+        let session_manager =
+            SessionManager::open(session_path, None, cwd_override).map_err(|e| e.to_string())?;
         assert_session_cwd_exists(&session_manager, &self.cwd())?;
         let target_file = session_manager.get_session_file().map(PathBuf::from);
         self.teardown_current(SessionShutdownReason::Resume, target_file);
@@ -238,9 +235,8 @@ impl AgentSessionRuntime {
         let session = self.session();
         let previous_session_file = session.session_file();
         let cwd = self.cwd();
-        let (is_persisted, session_dir) = session.with_session_manager(|sm| {
-            (sm.is_persisted(), sm.get_session_dir().to_path_buf())
-        });
+        let (is_persisted, session_dir) = session
+            .with_session_manager(|sm| (sm.is_persisted(), sm.get_session_dir().to_path_buf()));
 
         let mut session_manager = if is_persisted {
             SessionManager::create(&cwd, Some(session_dir), None).map_err(|e| e.to_string())?
@@ -316,9 +312,8 @@ impl AgentSessionRuntime {
         let previous_session_file = session.session_file();
         let cwd = self.cwd();
         let agent_dir = self.services().agent_dir.clone();
-        let (is_persisted, session_dir) = session.with_session_manager(|sm| {
-            (sm.is_persisted(), sm.get_session_dir().to_path_buf())
-        });
+        let (is_persisted, session_dir) = session
+            .with_session_manager(|sm| (sm.is_persisted(), sm.get_session_dir().to_path_buf()));
 
         let session_manager = if is_persisted {
             let current_session_file = session
@@ -327,9 +322,8 @@ impl AgentSessionRuntime {
 
             match &target_leaf_id {
                 None => {
-                    let mut session_manager =
-                        SessionManager::create(&cwd, Some(session_dir), None)
-                            .map_err(|e| e.to_string())?;
+                    let mut session_manager = SessionManager::create(&cwd, Some(session_dir), None)
+                        .map_err(|e| e.to_string())?;
                     session_manager
                         .new_session(crate::session_manager::NewSessionOptions {
                             parent_session: Some(
@@ -341,12 +335,9 @@ impl AgentSessionRuntime {
                     session_manager
                 }
                 Some(target_leaf_id) => {
-                    let mut session_manager = SessionManager::open(
-                        &current_session_file,
-                        Some(session_dir),
-                        None,
-                    )
-                    .map_err(|e| e.to_string())?;
+                    let mut session_manager =
+                        SessionManager::open(&current_session_file, Some(session_dir), None)
+                            .map_err(|e| e.to_string())?;
                     session_manager
                         .create_branched_session(target_leaf_id)
                         .map_err(|e| e.to_string())?

@@ -22,17 +22,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use pi_agent::{
-    AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentThinkingLevel,
-    CancellationToken, QueueMode, StreamFn, ToolDefinition, run_agent_loop,
-    run_agent_loop_continue,
-};
-use pi_ai::{
-    AssistantMessage, Content, ImageContent, Message, Model, StopReason, TextContent, Usage,
-    UserContent, UserMessage,
+    AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentThinkingLevel, CancellationToken,
+    QueueMode, StreamFn, ToolDefinition, run_agent_loop, run_agent_loop_continue,
 };
 use pi_ai::models::{clamp_thinking_level, get_supported_thinking_levels, models_are_equal};
 use pi_ai::types::ModelThinkingLevel;
 use pi_ai::utils::{is_context_overflow, is_retryable_assistant_error};
+use pi_ai::{
+    AssistantMessage, Content, ImageContent, Message, Model, StopReason, TextContent, Usage,
+    UserContent, UserMessage,
+};
 
 use crate::model_registry::ModelRegistry;
 use crate::session_manager::SessionManager;
@@ -469,7 +468,9 @@ impl AgentSession {
         let excluded: Option<Vec<String>> = config.excluded_tool_names.clone();
         let is_allowed = |name: &str| -> bool {
             allowed.as_ref().is_none_or(|a| a.iter().any(|n| n == name))
-                && !excluded.as_ref().is_some_and(|e| e.iter().any(|n| n == name))
+                && !excluded
+                    .as_ref()
+                    .is_some_and(|e| e.iter().any(|n| n == name))
         };
         for tool in builtins {
             if !is_allowed(&tool.name) {
@@ -718,12 +719,9 @@ impl AgentSession {
     /// Move the session manager out of a disposed session (runtime fork path
     /// reuses the live manager, oracle agent-session-runtime.ts:334-352).
     pub(crate) fn take_session_manager(&self) -> SessionManager {
-        let placeholder = SessionManager::in_memory(None, None)
-            .expect("in-memory placeholder session manager");
-        std::mem::replace(
-            &mut self.inner.state.lock().session_manager,
-            placeholder,
-        )
+        let placeholder =
+            SessionManager::in_memory(None, None).expect("in-memory placeholder session manager");
+        std::mem::replace(&mut self.inner.state.lock().session_manager, placeholder)
     }
 
     // =====================================================================
@@ -861,9 +859,7 @@ impl AgentSession {
         self.flush_pending_bash_messages();
 
         // Validate model + auth.
-        let model = self
-            .model()
-            .ok_or_else(format_no_model_selected_message)?;
+        let model = self.model().ok_or_else(format_no_model_selected_message)?;
         {
             let registry = self.inner.registry.read().await;
             if !registry.has_configured_auth(&model).await {
@@ -1155,8 +1151,7 @@ impl AgentSession {
                         Next::Steering(steering)
                     } else {
                         let follow_up_mode = state.follow_up_mode;
-                        let follow_ups =
-                            drain_queue(&mut state.follow_up_queue, follow_up_mode);
+                        let follow_ups = drain_queue(&mut state.follow_up_queue, follow_up_mode);
                         if !follow_ups.is_empty() {
                             Next::FollowUps(follow_ups)
                         } else {
@@ -1392,8 +1387,7 @@ impl AgentSession {
                             steering: state.steering_texts.clone(),
                             follow_up: state.follow_up_texts.clone(),
                         });
-                    } else if let Some(idx) =
-                        state.follow_up_texts.iter().position(|t| *t == text)
+                    } else if let Some(idx) = state.follow_up_texts.iter().position(|t| *t == text)
                     {
                         state.follow_up_texts.remove(idx);
                         pending_events.push(AgentSessionEvent::QueueUpdate {
@@ -1415,7 +1409,10 @@ impl AgentSession {
             } else {
                 false
             };
-            pending_events.push(AgentSessionEvent::from_agent_event(event.clone(), will_retry));
+            pending_events.push(AgentSessionEvent::from_agent_event(
+                event.clone(),
+                will_retry,
+            ));
 
             // Session persistence + assistant bookkeeping.
             if let AgentEvent::MessageEnd { message } = &event {
@@ -1446,7 +1443,13 @@ impl AgentSession {
     // =====================================================================
 
     fn is_retryable_error(&self, message: &AssistantMessage) -> bool {
-        let context_window = self.inner.state.lock().model.as_ref().map(|m| m.context_window);
+        let context_window = self
+            .inner
+            .state
+            .lock()
+            .model
+            .as_ref()
+            .map(|m| m.context_window);
         if is_context_overflow(message, context_window) {
             return false;
         }
@@ -1541,7 +1544,9 @@ impl AgentSession {
         let mut state = self.inner.state.lock();
         let pending = std::mem::take(&mut state.pending_bash);
         for bash_value in pending {
-            state.messages.push(AgentMessage::Custom(bash_value.clone()));
+            state
+                .messages
+                .push(AgentMessage::Custom(bash_value.clone()));
             let _ = state.session_manager.append_message(bash_value);
         }
     }
@@ -1694,8 +1699,14 @@ fn persist_message(state: &mut SessionState, message: &AgentMessage) {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string();
-                let content = value.get("content").cloned().unwrap_or(Value::Array(vec![]));
-                let display = value.get("display").and_then(Value::as_bool).unwrap_or(false);
+                let content = value
+                    .get("content")
+                    .cloned()
+                    .unwrap_or(Value::Array(vec![]));
+                let display = value
+                    .get("display")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 let details = value.get("details").cloned();
                 let _ = state.session_manager.append_custom_message_entry(
                     custom_type,
@@ -1721,10 +1732,7 @@ async fn cancellable_sleep(delay_ms: u64, cancel: &CancellationToken) -> bool {
         if now >= deadline {
             return false;
         }
-        let step = std::cmp::min(
-            std::time::Duration::from_millis(25),
-            deadline - now,
-        );
+        let step = std::cmp::min(std::time::Duration::from_millis(25), deadline - now);
         tokio::time::sleep(step).await;
     }
 }
@@ -1743,7 +1751,10 @@ fn bash_execution_to_text(msg: &Value) -> String {
     } else {
         text.push_str("(no output)");
     }
-    let cancelled = msg.get("cancelled").and_then(Value::as_bool).unwrap_or(false);
+    let cancelled = msg
+        .get("cancelled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let exit_code = msg.get("exitCode").and_then(Value::as_i64);
     if cancelled {
         text.push_str("\n\n(command cancelled)");
@@ -1752,7 +1763,10 @@ fn bash_execution_to_text(msg: &Value) -> String {
     {
         text.push_str(&format!("\n\nCommand exited with code {code}"));
     }
-    let truncated = msg.get("truncated").and_then(Value::as_bool).unwrap_or(false);
+    let truncated = msg
+        .get("truncated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     if truncated && let Some(path) = msg.get("fullOutputPath").and_then(Value::as_str) {
         text.push_str(&format!("\n\n[Output truncated. Full output: {path}]"));
     }
@@ -1800,27 +1814,25 @@ pub fn convert_to_llm(messages: Vec<AgentMessage>) -> Vec<Message> {
                                     text_signature: None,
                                 })])
                             }
-                            Some(other) => match serde_json::from_value::<Vec<Content>>(
-                                other.clone(),
-                            ) {
-                                Ok(blocks) => UserContent::Blocks(blocks),
-                                Err(_) => UserContent::Blocks(Vec::new()),
-                            },
+                            Some(other) => {
+                                match serde_json::from_value::<Vec<Content>>(other.clone()) {
+                                    Ok(blocks) => UserContent::Blocks(blocks),
+                                    Err(_) => UserContent::Blocks(Vec::new()),
+                                }
+                            }
                             None => UserContent::Blocks(Vec::new()),
                         };
                         result.push(Message::User(UserMessage { content, timestamp }));
                     }
                     "branchSummary" => {
-                        let summary =
-                            value.get("summary").and_then(Value::as_str).unwrap_or("");
+                        let summary = value.get("summary").and_then(Value::as_str).unwrap_or("");
                         result.push(text_message_value_to_user(
                             format!("{BRANCH_SUMMARY_PREFIX}{summary}{BRANCH_SUMMARY_SUFFIX}"),
                             timestamp,
                         ));
                     }
                     "compactionSummary" => {
-                        let summary =
-                            value.get("summary").and_then(Value::as_str).unwrap_or("");
+                        let summary = value.get("summary").and_then(Value::as_str).unwrap_or("");
                         result.push(text_message_value_to_user(
                             format!(
                                 "{COMPACTION_SUMMARY_PREFIX}{summary}{COMPACTION_SUMMARY_SUFFIX}"
@@ -1921,7 +1933,8 @@ fn default_stream_fn(
             if !auth.ok {
                 return error_event_stream(
                     &model,
-                    auth.error.unwrap_or_else(|| "Authentication failed".to_string()),
+                    auth.error
+                        .unwrap_or_else(|| "Authentication failed".to_string()),
                 );
             }
             let timeout_ms = {
@@ -2042,7 +2055,11 @@ fn normalize_prompt_snippet(text: Option<&str>) -> Option<String> {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    if one_line.is_empty() { None } else { Some(one_line) }
+    if one_line.is_empty() {
+        None
+    } else {
+        Some(one_line)
+    }
 }
 
 fn normalize_prompt_guidelines(guidelines: &[String]) -> Vec<String> {
@@ -2112,10 +2129,8 @@ pub fn parse_command_args(args_string: &str) -> Vec<String> {
 /// `${@:N}`, `${@:N:L}` substitution.
 pub fn substitute_args(content: &str, args: &[String]) -> String {
     static PATTERN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(
-            r"\$\{(\d+):-([^}]*)\}|\$\{@:(\d+)(?::(\d+))?\}|\$(ARGUMENTS|@|\d+)",
-        )
-        .expect("template regex")
+        regex::Regex::new(r"\$\{(\d+):-([^}]*)\}|\$\{@:(\d+)(?::(\d+))?\}|\$(ARGUMENTS|@|\d+)")
+            .expect("template regex")
     });
     let all_args = args.join(" ");
     PATTERN
@@ -2125,7 +2140,10 @@ pub fn substitute_args(content: &str, args: &[String]) -> String {
                 let value = index.checked_sub(1).and_then(|i| args.get(i));
                 return match value {
                     Some(v) if !v.is_empty() => v.clone(),
-                    _ => caps.get(2).map(|m| m.as_str().to_string()).unwrap_or_default(),
+                    _ => caps
+                        .get(2)
+                        .map(|m| m.as_str().to_string())
+                        .unwrap_or_default(),
                 };
             }
             if let Some(slice_start) = caps.get(3) {
@@ -2426,7 +2444,8 @@ impl AgentSession {
                     .lock()
                     .set_default_thinking_level(thinking_level_str(effective));
             }
-            self.inner.emit(&AgentSessionEvent::ThinkingLevelChanged { level: effective });
+            self.inner
+                .emit(&AgentSessionEvent::ThinkingLevelChanged { level: effective });
         }
     }
 
@@ -2865,22 +2884,20 @@ pub fn estimate_tokens(message: &AgentMessage) -> u64 {
         AgentMessage::Standard(Message::ToolResult(result)) => {
             text_and_image_chars_blocks(&result.content)
         }
-        AgentMessage::Custom(value) => {
-            match value.get("role").and_then(Value::as_str) {
-                Some("custom") => text_and_image_chars_value(value.get("content")),
-                Some("bashExecution") => {
-                    let command = value.get("command").and_then(Value::as_str).unwrap_or("");
-                    let output = value.get("output").and_then(Value::as_str).unwrap_or("");
-                    (command.len() + output.len()) as u64
-                }
-                Some("branchSummary") | Some("compactionSummary") => value
-                    .get("summary")
-                    .and_then(Value::as_str)
-                    .map(|s| s.len() as u64)
-                    .unwrap_or(0),
-                _ => return 0,
+        AgentMessage::Custom(value) => match value.get("role").and_then(Value::as_str) {
+            Some("custom") => text_and_image_chars_value(value.get("content")),
+            Some("bashExecution") => {
+                let command = value.get("command").and_then(Value::as_str).unwrap_or("");
+                let output = value.get("output").and_then(Value::as_str).unwrap_or("");
+                (command.len() + output.len()) as u64
             }
-        }
+            Some("branchSummary") | Some("compactionSummary") => value
+                .get("summary")
+                .and_then(Value::as_str)
+                .map(|s| s.len() as u64)
+                .unwrap_or(0),
+            _ => return 0,
+        },
     };
     chars.div_ceil(4)
 }
@@ -3956,26 +3973,25 @@ impl AgentSession {
 
         // Case 2: threshold.
         let direct_context_tokens = calculate_context_tokens(&assistant_message.usage);
-        let context_tokens = if assistant_message.stop_reason == StopReason::Error
-            || direct_context_tokens == 0
-        {
-            let state = self.inner.state.lock();
-            let estimate = estimate_context_tokens(&state.messages);
-            let Some(last_usage_index) = estimate.last_usage_index else {
-                return false; // No usage data at all.
+        let context_tokens =
+            if assistant_message.stop_reason == StopReason::Error || direct_context_tokens == 0 {
+                let state = self.inner.state.lock();
+                let estimate = estimate_context_tokens(&state.messages);
+                let Some(last_usage_index) = estimate.last_usage_index else {
+                    return false; // No usage data at all.
+                };
+                // Verify the usage source is post-compaction.
+                if let Some(compaction_ms) = compaction_timestamp
+                    && let Some(AgentMessage::Standard(Message::Assistant(usage_msg))) =
+                        state.messages.get(last_usage_index)
+                    && usage_msg.timestamp <= compaction_ms
+                {
+                    return false;
+                }
+                estimate.tokens
+            } else {
+                direct_context_tokens
             };
-            // Verify the usage source is post-compaction.
-            if let Some(compaction_ms) = compaction_timestamp
-                && let Some(AgentMessage::Standard(Message::Assistant(usage_msg))) =
-                    state.messages.get(last_usage_index)
-                && usage_msg.timestamp <= compaction_ms
-            {
-                return false;
-            }
-            estimate.tokens
-        } else {
-            direct_context_tokens
-        };
 
         if should_compact(
             context_tokens,
@@ -4155,7 +4171,8 @@ static ANSI_REGEX: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(
     // the first string terminator, plus CSI/C1 sequences.
     let st = "(?:\\x07|\\x1B\\x5C|\\u{9C})";
     let osc = format!("(?:\\x1B\\][\\s\\S]*?{st})");
-    let csi = "[\\x1B\\u{9B}][\\[\\]()#;?]*(?:[0-9]{1,4}(?:[;:][0-9]{0,4})*)?[0-9A-PR-TZcf-nq-uy=><~]";
+    let csi =
+        "[\\x1B\\u{9B}][\\[\\]()#;?]*(?:[0-9]{1,4}(?:[;:][0-9]{0,4})*)?[0-9A-PR-TZcf-nq-uy=><~]";
     regex::RegexBuilder::new(&format!("{osc}|{csi}"))
         .build()
         .expect("ansi regex")
@@ -4268,24 +4285,22 @@ async fn execute_bash_impl(
     let mut killed = false;
     let mut streams_done = 0;
 
-    let ensure_temp_file =
-        |chunks: &[String]| -> Option<(std::path::PathBuf, std::fs::File)> {
-            let id = uuid::Uuid::new_v4().simple().to_string();
-            let path = std::env::temp_dir().join(format!("pi-bash-{}.log", &id[..16]));
-            let mut file = std::fs::File::create(&path).ok()?;
-            for chunk in chunks {
-                let _ = file.write_all(chunk.as_bytes());
-            }
-            Some((path, file))
-        };
+    let ensure_temp_file = |chunks: &[String]| -> Option<(std::path::PathBuf, std::fs::File)> {
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let path = std::env::temp_dir().join(format!("pi-bash-{}.log", &id[..16]));
+        let mut file = std::fs::File::create(&path).ok()?;
+        for chunk in chunks {
+            let _ = file.write_all(chunk.as_bytes());
+        }
+        Some((path, file))
+    };
 
     loop {
         if cancel.is_cancelled() && !killed {
             crate::tools::kill_process_tree(child_pid);
             killed = true;
         }
-        let next =
-            tokio::time::timeout(std::time::Duration::from_millis(25), rx.recv()).await;
+        let next = tokio::time::timeout(std::time::Duration::from_millis(25), rx.recv()).await;
         let chunk = match next {
             Err(_) => continue,
             Ok(None) => break,
@@ -4300,7 +4315,8 @@ async fn execute_bash_impl(
         };
 
         total_bytes += chunk.len();
-        let text = sanitize_binary_output(&strip_ansi(&decoder.decode(&chunk, false))).replace('\r', "");
+        let text =
+            sanitize_binary_output(&strip_ansi(&decoder.decode(&chunk, false))).replace('\r', "");
 
         if total_bytes > BASH_MAX_BYTES && temp_file.is_none() {
             temp_file = ensure_temp_file(&output_chunks);
@@ -4388,9 +4404,7 @@ impl AgentSession {
         };
 
         let result = match resolve_shell(shell_path.as_deref()) {
-            Ok(shell) => {
-                execute_bash_impl(&resolved_command, &shell, &cwd, on_chunk, cancel).await
-            }
+            Ok(shell) => execute_bash_impl(&resolved_command, &shell, &cwd, on_chunk, cancel).await,
             Err(error) => Err(error),
         };
         self.inner.state.lock().bash_cancel = None;
@@ -4448,8 +4462,7 @@ impl AgentSession {
 // (core/compaction/branch-summarization.ts + agent-session.ts navigateTree)
 // ============================================================================
 
-const BRANCH_SUMMARY_PREAMBLE: &str =
-    "The user explored a different conversation branch before returning here.\nSummary of that exploration:\n\n";
+const BRANCH_SUMMARY_PREAMBLE: &str = "The user explored a different conversation branch before returning here.\nSummary of that exploration:\n\n";
 
 const BRANCH_SUMMARY_PROMPT: &str = r#"Create a structured summary of this conversation branch for context when returning later.
 
@@ -4648,7 +4661,8 @@ async fn generate_branch_summary(
         (false, Some(ci)) => format!("{BRANCH_SUMMARY_PROMPT}\n\nAdditional focus: {ci}"),
         (_, None) => BRANCH_SUMMARY_PROMPT.to_string(),
     };
-    let prompt_text = format!("<conversation>\n{conversation_text}\n</conversation>\n\n{instructions}");
+    let prompt_text =
+        format!("<conversation>\n{conversation_text}\n</conversation>\n\n{instructions}");
 
     let request_messages = vec![Message::User(UserMessage {
         content: UserContent::Blocks(vec![Content::Text(TextContent {
@@ -4846,9 +4860,9 @@ impl AgentSession {
         // Determine the new leaf position based on target type.
         let mut editor_text: Option<String> = None;
         let new_leaf_id: Option<String> = match &target_entry {
-            SessionEntry::Message { message, parent_id, .. }
-                if message.get("role").and_then(Value::as_str) == Some("user") =>
-            {
+            SessionEntry::Message {
+                message, parent_id, ..
+            } if message.get("role").and_then(Value::as_str) == Some("user") => {
                 editor_text = Some(extract_user_content_text(message.get("content")));
                 parent_id.as_option().cloned()
             }

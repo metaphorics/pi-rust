@@ -4,8 +4,8 @@ use parking_lot::Mutex;
 use pi_coding_agent::wire_out::WireOut;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
 /// In-memory sink shared across the writer thread and test assertions.

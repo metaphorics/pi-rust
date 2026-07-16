@@ -122,7 +122,8 @@ pub struct Args {
 
 impl Args {
     pub fn get_unknown_flag(&self, name: &str) -> Option<&UnknownFlagValue> {
-        self.unknown_flags.iter()
+        self.unknown_flags
+            .iter()
             .find(|(k, _)| k == name)
             .map(|(_, v)| v)
     }
@@ -298,7 +299,8 @@ pub fn parse_args(args: &[String]) -> Args {
         } else if arg == "--no-context-files" || arg == "-nc" {
             result.no_context_files = true;
         } else if arg == "--list-models" {
-            if i + 1 < args.len() && !args[i + 1].starts_with('-') && !args[i + 1].starts_with('@') {
+            if i + 1 < args.len() && !args[i + 1].starts_with('-') && !args[i + 1].starts_with('@')
+            {
                 i += 1;
                 result.list_models = Some(ListModels::Search(args[i].clone()));
             } else {
@@ -318,19 +320,35 @@ pub fn parse_args(args: &[String]) -> Args {
             if let Some(eq_index) = stripped.find('=') {
                 let flag_name = &stripped[..eq_index];
                 let flag_val = &stripped[eq_index + 1..];
-                insert_unknown_flag(&mut result.unknown_flags, flag_name.to_string(), UnknownFlagValue::Str(flag_val.to_string()));
+                insert_unknown_flag(
+                    &mut result.unknown_flags,
+                    flag_name.to_string(),
+                    UnknownFlagValue::Str(flag_val.to_string()),
+                );
             } else {
                 let flag_name = stripped;
                 if i + 1 < args.len() {
                     let next = &args[i + 1];
                     if !next.starts_with('-') && !next.starts_with('@') {
-                        insert_unknown_flag(&mut result.unknown_flags, flag_name.to_string(), UnknownFlagValue::Str(next.clone()));
+                        insert_unknown_flag(
+                            &mut result.unknown_flags,
+                            flag_name.to_string(),
+                            UnknownFlagValue::Str(next.clone()),
+                        );
                         i += 1;
                     } else {
-                        insert_unknown_flag(&mut result.unknown_flags, flag_name.to_string(), UnknownFlagValue::Bool(true));
+                        insert_unknown_flag(
+                            &mut result.unknown_flags,
+                            flag_name.to_string(),
+                            UnknownFlagValue::Bool(true),
+                        );
                     }
                 } else {
-                    insert_unknown_flag(&mut result.unknown_flags, flag_name.to_string(), UnknownFlagValue::Bool(true));
+                    insert_unknown_flag(
+                        &mut result.unknown_flags,
+                        flag_name.to_string(),
+                        UnknownFlagValue::Bool(true),
+                    );
                 }
             }
         } else if arg.starts_with('-') && !arg.starts_with("--") {
@@ -354,10 +372,18 @@ pub fn validate_arg_combinations(parsed: &Args) -> Vec<Diagnostic> {
     // Validate fork flags combination
     if parsed.fork.is_some() {
         let mut conflicting = Vec::new();
-        if parsed.session.is_some() { conflicting.push("--session"); }
-        if parsed.r#continue { conflicting.push("--continue"); }
-        if parsed.resume { conflicting.push("--resume"); }
-        if parsed.no_session { conflicting.push("--no-session"); }
+        if parsed.session.is_some() {
+            conflicting.push("--session");
+        }
+        if parsed.r#continue {
+            conflicting.push("--continue");
+        }
+        if parsed.resume {
+            conflicting.push("--resume");
+        }
+        if parsed.no_session {
+            conflicting.push("--no-session");
+        }
         if !conflicting.is_empty() {
             diagnostics.push(Diagnostic {
                 r#type: DiagnosticType::Error,
@@ -369,13 +395,22 @@ pub fn validate_arg_combinations(parsed: &Args) -> Vec<Diagnostic> {
     // Validate session-id flags combination
     if parsed.session_id.is_some() {
         let mut conflicting = Vec::new();
-        if parsed.session.is_some() { conflicting.push("--session"); }
-        if parsed.r#continue { conflicting.push("--continue"); }
-        if parsed.resume { conflicting.push("--resume"); }
+        if parsed.session.is_some() {
+            conflicting.push("--session");
+        }
+        if parsed.r#continue {
+            conflicting.push("--continue");
+        }
+        if parsed.resume {
+            conflicting.push("--resume");
+        }
         if !conflicting.is_empty() {
             diagnostics.push(Diagnostic {
                 r#type: DiagnosticType::Error,
-                message: format!("--session-id cannot be combined with {}", conflicting.join(", ")),
+                message: format!(
+                    "--session-id cannot be combined with {}",
+                    conflicting.join(", ")
+                ),
             });
         }
     }
@@ -397,7 +432,11 @@ pub fn get_help_text(extension_flags: Option<&[ExtensionFlag]>) -> String {
             let mut s = String::new();
             s.push_str("\n\x1b[1mExtension CLI Flags:\x1b[22m\n");
             for flag in flags {
-                let val_suffix = if flag.r#type == "string" { " <value>" } else { "" };
+                let val_suffix = if flag.r#type == "string" {
+                    " <value>"
+                } else {
+                    ""
+                };
                 let flag_str = format!("  --{}{}", flag.name, val_suffix);
                 let desc_buf;
                 let desc = match &flag.description {
@@ -684,8 +723,18 @@ mod tests {
             },
             FlagTest {
                 name: "append system prompt multiple",
-                args: vec!["--append-system-prompt", "file1", "--append-system-prompt", "file2"],
-                check: Box::new(|p| assert_eq!(p.append_system_prompt.as_ref().unwrap(), &vec!["file1".to_string(), "file2".to_string()])),
+                args: vec![
+                    "--append-system-prompt",
+                    "file1",
+                    "--append-system-prompt",
+                    "file2",
+                ],
+                check: Box::new(|p| {
+                    assert_eq!(
+                        p.append_system_prompt.as_ref().unwrap(),
+                        &vec!["file1".to_string(), "file2".to_string()]
+                    )
+                }),
             },
             FlagTest {
                 name: "name long",
@@ -720,12 +769,23 @@ mod tests {
             FlagTest {
                 name: "session dir",
                 args: vec!["--session-dir", "/path/to/sessions"],
-                check: Box::new(|p| assert_eq!(p.session_dir.as_deref(), Some("/path/to/sessions"))),
+                check: Box::new(|p| {
+                    assert_eq!(p.session_dir.as_deref(), Some("/path/to/sessions"))
+                }),
             },
             FlagTest {
                 name: "models cycling",
                 args: vec!["--models", "gpt-4,claude-3-5,haiku"],
-                check: Box::new(|p| assert_eq!(p.models.as_ref().unwrap(), &vec!["gpt-4".to_string(), "claude-3-5".to_string(), "haiku".to_string()])),
+                check: Box::new(|p| {
+                    assert_eq!(
+                        p.models.as_ref().unwrap(),
+                        &vec![
+                            "gpt-4".to_string(),
+                            "claude-3-5".to_string(),
+                            "haiku".to_string()
+                        ]
+                    )
+                }),
             },
             FlagTest {
                 name: "no tools long",
@@ -750,22 +810,42 @@ mod tests {
             FlagTest {
                 name: "tools long",
                 args: vec!["--tools", "read,write,bash"],
-                check: Box::new(|p| assert_eq!(p.tools.as_ref().unwrap(), &vec!["read".to_string(), "write".to_string(), "bash".to_string()])),
+                check: Box::new(|p| {
+                    assert_eq!(
+                        p.tools.as_ref().unwrap(),
+                        &vec!["read".to_string(), "write".to_string(), "bash".to_string()]
+                    )
+                }),
             },
             FlagTest {
                 name: "tools short",
                 args: vec!["-t", "read,write,bash"],
-                check: Box::new(|p| assert_eq!(p.tools.as_ref().unwrap(), &vec!["read".to_string(), "write".to_string(), "bash".to_string()])),
+                check: Box::new(|p| {
+                    assert_eq!(
+                        p.tools.as_ref().unwrap(),
+                        &vec!["read".to_string(), "write".to_string(), "bash".to_string()]
+                    )
+                }),
             },
             FlagTest {
                 name: "exclude tools long",
                 args: vec!["--exclude-tools", "grep,find"],
-                check: Box::new(|p| assert_eq!(p.exclude_tools.as_ref().unwrap(), &vec!["grep".to_string(), "find".to_string()])),
+                check: Box::new(|p| {
+                    assert_eq!(
+                        p.exclude_tools.as_ref().unwrap(),
+                        &vec!["grep".to_string(), "find".to_string()]
+                    )
+                }),
             },
             FlagTest {
                 name: "exclude tools short",
                 args: vec!["-xt", "grep,find"],
-                check: Box::new(|p| assert_eq!(p.exclude_tools.as_ref().unwrap(), &vec!["grep".to_string(), "find".to_string()])),
+                check: Box::new(|p| {
+                    assert_eq!(
+                        p.exclude_tools.as_ref().unwrap(),
+                        &vec!["grep".to_string(), "find".to_string()]
+                    )
+                }),
             },
             FlagTest {
                 name: "thinking valid",
@@ -798,12 +878,16 @@ mod tests {
             FlagTest {
                 name: "extension flag long",
                 args: vec!["--extension", "foo.ts"],
-                check: Box::new(|p| assert_eq!(p.extensions.as_ref().unwrap(), &vec!["foo.ts".to_string()])),
+                check: Box::new(|p| {
+                    assert_eq!(p.extensions.as_ref().unwrap(), &vec!["foo.ts".to_string()])
+                }),
             },
             FlagTest {
                 name: "extension flag short",
                 args: vec!["-e", "foo.ts"],
-                check: Box::new(|p| assert_eq!(p.extensions.as_ref().unwrap(), &vec!["foo.ts".to_string()])),
+                check: Box::new(|p| {
+                    assert_eq!(p.extensions.as_ref().unwrap(), &vec!["foo.ts".to_string()])
+                }),
             },
             FlagTest {
                 name: "no extensions long",
@@ -818,17 +902,26 @@ mod tests {
             FlagTest {
                 name: "skill",
                 args: vec!["--skill", "skill_dir"],
-                check: Box::new(|p| assert_eq!(p.skills.as_ref().unwrap(), &vec!["skill_dir".to_string()])),
+                check: Box::new(|p| {
+                    assert_eq!(p.skills.as_ref().unwrap(), &vec!["skill_dir".to_string()])
+                }),
             },
             FlagTest {
                 name: "prompt template",
                 args: vec!["--prompt-template", "prompt_dir"],
-                check: Box::new(|p| assert_eq!(p.prompt_templates.as_ref().unwrap(), &vec!["prompt_dir".to_string()])),
+                check: Box::new(|p| {
+                    assert_eq!(
+                        p.prompt_templates.as_ref().unwrap(),
+                        &vec!["prompt_dir".to_string()]
+                    )
+                }),
             },
             FlagTest {
                 name: "theme",
                 args: vec!["--theme", "theme_dir"],
-                check: Box::new(|p| assert_eq!(p.themes.as_ref().unwrap(), &vec!["theme_dir".to_string()])),
+                check: Box::new(|p| {
+                    assert_eq!(p.themes.as_ref().unwrap(), &vec!["theme_dir".to_string()])
+                }),
             },
             FlagTest {
                 name: "no skills long",
@@ -873,7 +966,9 @@ mod tests {
             FlagTest {
                 name: "list models search",
                 args: vec!["--list-models", "gpt"],
-                check: Box::new(|p| assert_eq!(p.list_models, Some(ListModels::Search("gpt".to_string())))),
+                check: Box::new(|p| {
+                    assert_eq!(p.list_models, Some(ListModels::Search("gpt".to_string())))
+                }),
             },
             FlagTest {
                 name: "verbose",
@@ -928,34 +1023,57 @@ mod tests {
     fn test_precedence_and_repeated_flags() {
         // Repeated single-value flags overwrite
         let args = vec![
-            "--provider".to_string(), "google".to_string(),
-            "--provider".to_string(), "openai".to_string(),
+            "--provider".to_string(),
+            "google".to_string(),
+            "--provider".to_string(),
+            "openai".to_string(),
         ];
         let parsed = parse_args(&args);
         assert_eq!(parsed.provider, Some("openai".to_string()));
 
         // Repeated --print with message consumption
         let args = vec![
-            "-p".to_string(), "hello".to_string(),
-            "-p".to_string(), "world".to_string(),
+            "-p".to_string(),
+            "hello".to_string(),
+            "-p".to_string(),
+            "world".to_string(),
         ];
         let parsed = parse_args(&args);
         assert!(parsed.print);
-        assert_eq!(parsed.messages, vec!["hello".to_string(), "world".to_string()]);
+        assert_eq!(
+            parsed.messages,
+            vec!["hello".to_string(), "world".to_string()]
+        );
     }
 
     #[test]
     fn test_unknown_flags_and_order() {
         let args = vec![
-            "--custom-val".to_string(), "hello".to_string(),
+            "--custom-val".to_string(),
+            "hello".to_string(),
             "--custom-bool".to_string(),
             "--custom-eq=world".to_string(),
         ];
         let parsed = parse_args(&args);
         assert_eq!(parsed.unknown_flags.len(), 3);
-        assert_eq!(parsed.unknown_flags[0], ("custom-val".to_string(), UnknownFlagValue::Str("hello".to_string())));
-        assert_eq!(parsed.unknown_flags[1], ("custom-bool".to_string(), UnknownFlagValue::Bool(true)));
-        assert_eq!(parsed.unknown_flags[2], ("custom-eq".to_string(), UnknownFlagValue::Str("world".to_string())));
+        assert_eq!(
+            parsed.unknown_flags[0],
+            (
+                "custom-val".to_string(),
+                UnknownFlagValue::Str("hello".to_string())
+            )
+        );
+        assert_eq!(
+            parsed.unknown_flags[1],
+            ("custom-bool".to_string(), UnknownFlagValue::Bool(true))
+        );
+        assert_eq!(
+            parsed.unknown_flags[2],
+            (
+                "custom-eq".to_string(),
+                UnknownFlagValue::Str("world".to_string())
+            )
+        );
 
         // Overwrites do not change insertion position
         let args = vec![
@@ -965,56 +1083,66 @@ mod tests {
         ];
         let parsed = parse_args(&args);
         assert_eq!(parsed.unknown_flags.len(), 2);
-        assert_eq!(parsed.unknown_flags[0], ("z".to_string(), UnknownFlagValue::Str("new_val".to_string())));
-        assert_eq!(parsed.unknown_flags[1], ("a".to_string(), UnknownFlagValue::Bool(true)));
+        assert_eq!(
+            parsed.unknown_flags[0],
+            (
+                "z".to_string(),
+                UnknownFlagValue::Str("new_val".to_string())
+            )
+        );
+        assert_eq!(
+            parsed.unknown_flags[1],
+            ("a".to_string(), UnknownFlagValue::Bool(true))
+        );
     }
 
     #[test]
     fn test_double_dash_handling() {
-        let args = vec![
-            "--".to_string(),
-            "next_arg".to_string(),
-        ];
+        let args = vec!["--".to_string(), "next_arg".to_string()];
         let parsed = parse_args(&args);
         assert_eq!(parsed.unknown_flags.len(), 1);
-        assert_eq!(parsed.unknown_flags[0], ("".to_string(), UnknownFlagValue::Str("next_arg".to_string())));
+        assert_eq!(
+            parsed.unknown_flags[0],
+            (
+                "".to_string(),
+                UnknownFlagValue::Str("next_arg".to_string())
+            )
+        );
 
-        let args = vec![
-            "--".to_string(),
-        ];
+        let args = vec!["--".to_string()];
         let parsed = parse_args(&args);
         assert_eq!(parsed.unknown_flags.len(), 1);
-        assert_eq!(parsed.unknown_flags[0], ("".to_string(), UnknownFlagValue::Bool(true)));
+        assert_eq!(
+            parsed.unknown_flags[0],
+            ("".to_string(), UnknownFlagValue::Bool(true))
+        );
     }
 
     #[test]
     fn test_errors_and_warnings() {
         // Missing name value
-        let args = vec![
-            "--name".to_string(),
-        ];
+        let args = vec!["--name".to_string()];
         let parsed = parse_args(&args);
         assert_eq!(parsed.diagnostics.len(), 1);
         assert_eq!(parsed.diagnostics[0].r#type, DiagnosticType::Error);
         assert_eq!(parsed.diagnostics[0].message, "--name requires a value");
 
         // Unknown single-dash option
-        let args = vec![
-            "-x".to_string(),
-        ];
+        let args = vec!["-x".to_string()];
         let parsed = parse_args(&args);
         assert_eq!(parsed.diagnostics.len(), 1);
         assert_eq!(parsed.diagnostics[0].r#type, DiagnosticType::Error);
         assert_eq!(parsed.diagnostics[0].message, "Unknown option: -x");
 
         // Invalid thinking level warning
-        let args = vec![
-            "--thinking".to_string(), "invalid_level".to_string(),
-        ];
+        let args = vec!["--thinking".to_string(), "invalid_level".to_string()];
         let parsed = parse_args(&args);
         assert_eq!(parsed.diagnostics.len(), 1);
         assert_eq!(parsed.diagnostics[0].r#type, DiagnosticType::Warning);
-        assert_eq!(parsed.diagnostics[0].message, "Invalid thinking level \"invalid_level\". Valid values: off, minimal, low, medium, high, xhigh, max");
+        assert_eq!(
+            parsed.diagnostics[0].message,
+            "Invalid thinking level \"invalid_level\". Valid values: off, minimal, low, medium, high, xhigh, max"
+        );
     }
 
     #[test]
@@ -1048,7 +1176,10 @@ mod tests {
         };
         let diag = validate_arg_combinations(&parsed);
         assert_eq!(diag.len(), 1);
-        assert_eq!(diag[0].message, "--session-id cannot be combined with --session");
+        assert_eq!(
+            diag[0].message,
+            "--session-id cannot be combined with --session"
+        );
     }
 
     #[test]
@@ -1067,7 +1198,9 @@ mod tests {
 
     #[test]
     fn test_mode_resolution() {
-        use crate::cli::{resolve_app_mode, to_print_output_mode, is_plain_runtime_metadata_command};
+        use crate::cli::{
+            is_plain_runtime_metadata_command, resolve_app_mode, to_print_output_mode,
+        };
 
         // resolve_app_mode
         let mut parsed = Args::default();
