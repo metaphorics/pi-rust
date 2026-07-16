@@ -17,6 +17,8 @@ pub mod resolve_config_value;
 pub mod session;
 pub mod system_prompt;
 pub mod wire_out;
+pub mod package_manager;
+pub mod package_manager_cli;
 
 pub use auth_storage::{AuthStorage, AuthStatus, AuthStorageError};
 pub use model_registry::{ModelRegistry, ResolvedRequestAuth, ResolveResult, ProviderConfigInput, ModelDefinition, ModelOverride, OverrideCost, DefinitionCost};
@@ -40,6 +42,17 @@ pub use migrations::{MigrationResult, run_migrations, run_migrations_with_agent_
 pub use resource_loader::{
     DefaultResourceLoader, DiscoveredResources, ResourceLoaderOptions, ResourcePath,
     ResourceSource, discover_extensions_in_dir,
+};
+pub use package_manager::{
+    CommandRunner, ConfiguredPackage, DefaultPackageManager, PackageManagerError, PackageScope,
+    PackageSource, PathMetadata, ProcessCommandRunner, ProgressAction, ProgressEvent, ProgressType,
+    ResolvedPaths, ResolvedResource, ResourceOrigin, ResourceType, apply_patterns, parse_source,
+};
+pub use package_manager_cli::{
+    InstallMethod, LatestRelease, PackageCommand, PackageCommandOptions, PackageCommandOutput,
+    ProcessSelfUpdater, SelfUpdateOutcome, SelfUpdater, UpdateTarget, detect_install_method,
+    get_package_command_help, get_package_command_usage, handle_package_command,
+    handle_package_command_with_self_updater, parse_package_command,
 };
 pub use session_manager::{
     NewSessionOptions, ResolvedSession, SessionContext, SessionError, SessionInfo, SessionManager,
