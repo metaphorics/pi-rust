@@ -1,13 +1,14 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::ExitStatus;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdout, Command};
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::wire::{
@@ -55,7 +56,7 @@ struct Inner {
     event_subscribers: Mutex<HashMap<u64, mpsc::UnboundedSender<Value>>>,
     exit_subscribers: Mutex<HashMap<u64, mpsc::UnboundedSender<RpcProcessError>>>,
     ui_handler: Mutex<Option<mpsc::UnboundedSender<Value>>>,
-    writer: mpsc::UnboundedSender<WriterMessage>,
+    writer: StdMutex<Option<mpsc::UnboundedSender<WriterMessage>>>,
     terminate: mpsc::UnboundedSender<()>,
     exit_notify: Notify,
 }
@@ -109,12 +110,12 @@ impl RpcProcessInstance {
             event_subscribers: Mutex::new(HashMap::new()),
             exit_subscribers: Mutex::new(HashMap::new()),
             ui_handler: Mutex::new(None),
-            writer: writer_tx,
+            writer: StdMutex::new(Some(writer_tx)),
             terminate: terminate_tx,
             exit_notify: Notify::new(),
         });
 
-        tokio::spawn(writer_loop(stdin, writer_rx, Arc::clone(&inner)));
+        let writer_task = tokio::spawn(writer_loop(stdin, writer_rx, Arc::clone(&inner)));
         tokio::spawn(stdout_loop(stdout, Arc::clone(&inner)));
         tokio::spawn(stderr_loop(stderr, Arc::clone(&inner)));
 
@@ -127,7 +128,7 @@ impl RpcProcessInstance {
                     child.wait().await
                 }
             };
-            finish_child(status, &wait_inner).await;
+            finish_child(status, &wait_inner, writer_task).await;
         });
 
         Ok(Self { inner })
@@ -155,16 +156,24 @@ impl RpcProcessInstance {
                 let error = self.not_running_error().await;
                 let _ = sender.send(Err(error));
             }
-        } else if self
-            .inner
-            .writer
-            .send(WriterMessage {
-                line,
-                request_id: Some(id.clone()),
-            })
-            .is_err()
-        {
-            reject_pending(&self.inner, &id, RpcProcessError::new("broken pipe")).await;
+        } else {
+            let sent = self
+                .inner
+                .writer
+                .lock()
+                .expect("writer lock poisoned")
+                .as_ref()
+                .is_some_and(|writer| {
+                    writer
+                        .send(WriterMessage {
+                            line,
+                            request_id: Some(id.clone()),
+                        })
+                        .is_ok()
+                });
+            if !sent {
+                reject_pending(&self.inner, &id, RpcProcessError::new("broken pipe")).await;
+            }
         }
 
         receiver
@@ -181,10 +190,18 @@ impl RpcProcessInstance {
         }
         let line =
             encode_line(response).map_err(|error| RpcProcessError::new(error.to_string()))?;
-        let _ = self.inner.writer.send(WriterMessage {
-            line,
-            request_id: None,
-        });
+        if let Some(writer) = self
+            .inner
+            .writer
+            .lock()
+            .expect("writer lock poisoned")
+            .as_ref()
+        {
+            let _ = writer.send(WriterMessage {
+                line,
+                request_id: None,
+            });
+        }
         Ok(())
     }
 
@@ -324,10 +341,15 @@ async fn stderr_text(inner: &Inner) -> String {
     String::from_utf8_lossy(&inner.stderr.lock().await).into_owned()
 }
 
-async fn finish_child(status: std::io::Result<ExitStatus>, inner: &Arc<Inner>) {
+async fn finish_child(
+    status: std::io::Result<ExitStatus>,
+    inner: &Arc<Inner>,
+    writer_task: JoinHandle<()>,
+) {
     if inner.exited.swap(true, Ordering::AcqRel) {
         return;
     }
+    inner.writer.lock().expect("writer lock poisoned").take();
     let stderr = stderr_text(inner).await;
     let error = match status {
         Ok(status) => {
@@ -339,6 +361,7 @@ async fn finish_child(status: std::io::Result<ExitStatus>, inner: &Arc<Inner>) {
         Err(error) => RpcProcessError::new(format!("RPC process error: {error}. Stderr: {stderr}")),
     };
     reject_all_pending(inner, error.clone()).await;
+    let _ = writer_task.await;
     let mut subscribers = inner.exit_subscribers.lock().await;
     for subscriber in subscribers.values() {
         let _ = subscriber.send(error.clone());
@@ -486,4 +509,38 @@ fn signal_name(signal: i32) -> String {
 ))]
 fn signal_name(signal: i32) -> String {
     format!("SIG{signal}")
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn dispose_releases_inner_after_writer_task_ends() {
+        let process = RpcProcessInstance::spawn(RpcProcessOptions {
+            cwd: std::env::temp_dir(),
+            command_override: Some((
+                PathBuf::from("python3"),
+                vec![
+                    "-u".into(),
+                    "-c".into(),
+                    "import time; time.sleep(60)".into(),
+                ],
+            )),
+        })
+        .unwrap();
+        let inner = Arc::downgrade(&process.inner);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async move {
+            process.dispose().await;
+            assert!(process.has_exited(), "dispose returned before child exit");
+            drop(process);
+
+            while inner.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("writer task did not terminate and release Inner after child teardown");
+    }
 }
