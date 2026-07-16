@@ -114,13 +114,12 @@ pub fn migrate_settings(mut settings: Map<String, Value>) -> Settings {
     // websockets boolean → transport enum only when the current key is absent.
     if !settings.contains_key("transport")
         && settings.get("websockets").is_some_and(Value::is_boolean)
+        && let Some(Value::Bool(websockets)) = settings.remove("websockets")
     {
-        if let Some(Value::Bool(websockets)) = settings.remove("websockets") {
-            settings.insert(
-                "transport".into(),
-                Value::String(if websockets { "websocket" } else { "sse" }.into()),
-            );
-        }
+        settings.insert(
+            "transport".into(),
+            Value::String(if websockets { "websocket" } else { "sse" }.into()),
+        );
     }
 
     // skills object → array + enableSkillCommands
