@@ -17,6 +17,11 @@ regex = "1"
 globset = "0.4"
 base64 = "0.22"
 ignore = "0.4"
+diff = "0.1"
+tempfile = "3"
+parking_lot = "0.12"
+serde = { workspace = true, features = ["derive"] }
+rustix = { workspace = true, features = ["fs", "process", "stdio", "termios", "system"] }
 
 [[bin]]
 name = "pi"
