@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::ffi::OsString;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
@@ -170,42 +169,35 @@ fn stable_path_key(path: &Path) -> PathBuf {
     } else {
         path.to_owned()
     };
-    let normalized = lexical_normalize(&absolute);
-    let mut existing = normalized.as_path();
-    let mut missing = Vec::<OsString>::new();
+    let mut resolved = PathBuf::new();
+    let mut missing_depth = 0_usize;
 
-    loop {
-        if let Ok(mut canonical) = fs::canonicalize(existing) {
-            for component in missing.iter().rev() {
-                canonical.push(component);
-            }
-            return canonical;
-        }
-        let Some(name) = existing.file_name() else {
-            return normalized;
-        };
-        missing.push(name.to_owned());
-        let Some(parent) = existing.parent() else {
-            return normalized;
-        };
-        existing = parent;
-    }
-}
-
-fn lexical_normalize(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
+    for component in absolute.components() {
         match component {
             Component::CurDir => {}
             Component::ParentDir => {
-                normalized.pop();
+                resolved.pop();
+                missing_depth = missing_depth.saturating_sub(1);
             }
-            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            Component::RootDir => normalized.push(component.as_os_str()),
-            Component::Normal(name) => normalized.push(name),
+            Component::Prefix(prefix) => resolved.push(prefix.as_os_str()),
+            Component::RootDir => resolved.push(component.as_os_str()),
+            Component::Normal(name) if missing_depth == 0 => {
+                let candidate = resolved.join(name);
+                match fs::canonicalize(&candidate) {
+                    Ok(canonical) => resolved = canonical,
+                    Err(_) => {
+                        resolved.push(name);
+                        missing_depth = 1;
+                    }
+                }
+            }
+            Component::Normal(name) => {
+                resolved.push(name);
+                missing_depth += 1;
+            }
         }
     }
-    normalized
+    resolved
 }
 
 fn remove_if_present(path: &Path) -> Result<()> {
@@ -345,6 +337,25 @@ mod tests {
         let after_creation = Storage::new(&dir.0);
 
         assert!(Arc::ptr_eq(&before_creation.lock, &after_creation.lock));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_parent_aliases_share_one_lock() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TestDir::new();
+        let base = dir.0.join("base");
+        let other = dir.0.join("other");
+        let child = other.join("child");
+        fs::create_dir_all(&base).unwrap();
+        fs::create_dir_all(&child).unwrap();
+        symlink(&child, base.join("link")).unwrap();
+
+        let through_symlink_parent = Storage::new(base.join("link").join(".."));
+        let direct = Storage::new(&other);
+
+        assert!(Arc::ptr_eq(&through_symlink_parent.lock, &direct.lock));
     }
 
     #[test]
