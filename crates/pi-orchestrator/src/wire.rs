@@ -69,14 +69,14 @@ impl TryFrom<Value> for RpcCommandEnvelope {
 #[derive(Clone, Debug, PartialEq)]
 pub struct RpcResponseEnvelope {
     pub id: Option<String>,
-    pub command: String,
-    pub success: bool,
+    pub command: Option<String>,
+    pub success: Option<bool>,
     pub raw: Value,
 }
 
 impl RpcResponseEnvelope {
     pub fn get_state(&self) -> Result<Option<GetStateData>> {
-        if !self.success || self.command != "get_state" {
+        if self.success != Some(true) || self.command.as_deref() != Some("get_state") {
             return Ok(None);
         }
         let Some(data) = self.raw.get("data") else {
@@ -93,12 +93,12 @@ impl TryFrom<Value> for RpcResponseEnvelope {
         let Value::Object(raw) = &value else {
             return Err(WireError::ExpectedObject);
         };
-        let id = optional_string(raw, "id")?.map(str::to_owned);
-        let command = required_string(raw, "command")?.to_owned();
-        let success = raw
-            .get("success")
-            .and_then(Value::as_bool)
-            .ok_or(WireError::InvalidBooleanField("success"))?;
+        let id = raw.get("id").and_then(Value::as_str).map(str::to_owned);
+        let command = raw
+            .get("command")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let success = raw.get("success").and_then(Value::as_bool);
         Ok(Self {
             id,
             command,
@@ -177,7 +177,7 @@ mod tests {
             panic!("expected response")
         };
         assert_eq!(response.id.as_deref(), Some("one"));
-        assert_eq!(response.command, "get_state");
+        assert_eq!(response.command.as_deref(), Some("get_state"));
 
         let ui =
             classify_child_line(r#"{"type":"extension_ui_request","id":"ui-1","method":"select"}"#)
@@ -190,6 +190,36 @@ mod tests {
         assert!(matches!(missing_type, ChildLine::Event(_)));
         let primitive = classify_child_line("42").unwrap();
         assert!(matches!(primitive, ChildLine::Event(Value::Number(_))));
+    }
+
+    #[test]
+    fn partial_and_malformed_response_fields_stay_responses() {
+        for line in [
+            r#"{"type":"response","id":"pending-1"}"#,
+            r#"{"type":"response","id":"pending-2","command":7,"success":"yes","extra":{"kept":true}}"#,
+        ] {
+            let expected_raw: Value = serde_json::from_str(line).unwrap();
+            let ChildLine::Response(response) = classify_child_line(line).unwrap() else {
+                panic!("expected response")
+            };
+
+            assert_eq!(response.id.as_deref(), expected_raw["id"].as_str());
+            assert_eq!(response.command, None);
+            assert_eq!(response.success, None);
+            assert_eq!(response.raw, expected_raw);
+        }
+    }
+
+    #[test]
+    fn malformed_non_correlation_id_does_not_reject_response() {
+        let line = r#"{"type":"response","id":42,"command":"get_state","success":true}"#;
+        let ChildLine::Response(response) = classify_child_line(line).unwrap() else {
+            panic!("expected response")
+        };
+
+        assert_eq!(response.id, None);
+        assert_eq!(response.command.as_deref(), Some("get_state"));
+        assert_eq!(response.success, Some(true));
     }
 
     #[test]
@@ -307,12 +337,8 @@ mod tests {
     }
 
     #[test]
-    fn malformed_envelope_fields_are_rejected() {
+    fn malformed_command_fields_are_rejected() {
         assert!(RpcCommandEnvelope::try_from(json!({ "type": 1 })).is_err());
         assert!(RpcCommandEnvelope::try_from(json!({ "type": "prompt", "id": 1 })).is_err());
-        assert!(
-            classify_child_line(r#"{"type":"response","command":"get_state","success":"yes"}"#)
-                .is_err()
-        );
     }
 }
