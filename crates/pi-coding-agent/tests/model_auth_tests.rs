@@ -52,7 +52,7 @@ async fn test_precedence_and_runtime_overrides() {
     let auth_path = temp_dir.path().join("auth.json");
 
     // Setup AuthStorage
-    let mut auth_storage = AuthStorage::new(auth_path.clone());
+    let auth_storage = AuthStorage::new(auth_path.clone());
 
     // 1. Initially no auth is configured
     unsafe {
@@ -190,7 +190,7 @@ async fn test_custom_model_decode_and_overrides() {
 
     fs::write(&models_json_path, models_json_content).unwrap();
 
-    let registry = ModelRegistry::create(auth_storage, models_json_path);
+    let registry = ModelRegistry::create(std::sync::Arc::new(auth_storage), models_json_path);
 
     // 1. Verify custom model is decoded correctly
     let custom_model = registry.find("custom-ollama", "llama3").expect("should find custom model");
@@ -219,7 +219,7 @@ async fn test_availability() {
     let auth_storage = AuthStorage::new(auth_path);
 
     // Read live state of available models initially
-    let registry = ModelRegistry::in_memory(auth_storage);
+    let registry = ModelRegistry::in_memory(std::sync::Arc::new(auth_storage));
     let initial_count = registry.get_available().await.len();
 
     // Configure auth for anthropic
@@ -231,6 +231,38 @@ async fn test_availability() {
     // Availability count must increase
     assert!(final_available.len() > initial_count);
     assert!(final_available.iter().any(|m| m.provider == "anthropic"));
+}
+#[tokio::test]
+async fn test_shared_auth_storage_runtime_override_visible_to_registry() {
+    let _lock = ENV_MUTEX.lock().await;
+    let _env_guard = EnvGuard::new(&["ANTHROPIC_API_KEY"]);
+    unsafe {
+        std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    let temp_dir = TempDir::new().unwrap();
+    let auth_path = temp_dir.path().join("auth.json");
+    let auth_storage = std::sync::Arc::new(AuthStorage::new(auth_path));
+
+    // Registry holds the SAME live instance, not a copy.
+    let registry = ModelRegistry::in_memory(auth_storage.clone());
+    let model = registry
+        .find("anthropic", "claude-opus-4-8")
+        .expect("builtin model")
+        .clone();
+    assert!(!registry.has_configured_auth(&model).await);
+
+    // A runtime override set through the shared handle is immediately
+    // visible to the registry (the --api-key flow).
+    auth_storage.set_runtime_api_key("anthropic".to_string(), "runtime-shared-key".to_string());
+    assert!(registry.has_configured_auth(&model).await);
+    assert_eq!(
+        registry.get_api_key_for_provider("anthropic").await,
+        Some("runtime-shared-key".to_string())
+    );
+
+    auth_storage.remove_runtime_api_key("anthropic");
+    assert!(!registry.has_configured_auth(&model).await);
 }
 
 #[tokio::test]
@@ -285,7 +317,7 @@ async fn test_model_resolution() {
     let auth_storage = AuthStorage::new(auth_path.clone());
 
     // Let's create an in-memory registry containing all built-in models
-    let registry = ModelRegistry::in_memory(auth_storage);
+    let registry = ModelRegistry::in_memory(std::sync::Arc::new(auth_storage));
 
     // 1. Resolve exact match
     let res = registry.resolve(Some("anthropic"), Some("claude-opus-4-8"), None).await;
@@ -365,7 +397,7 @@ async fn test_model_resolution() {
         }]),
     };
 
-    let mut registry_with_unicode = ModelRegistry::in_memory(AuthStorage::new(auth_path.clone()));
+    let mut registry_with_unicode = ModelRegistry::in_memory(std::sync::Arc::new(AuthStorage::new(auth_path.clone())));
     registry_with_unicode.register_provider("custom-korean".to_string(), custom_config).unwrap();
 
     let res_unicode = registry_with_unicode.resolve(Some("custom-korean"), Some("모델-id-🚀"), None).await;
@@ -398,7 +430,7 @@ async fn test_custom_model_rejections() {
     }"#;
 
     fs::write(&models_json_path, content_invalid_oauth).unwrap();
-    let registry = ModelRegistry::create(AuthStorage::new(auth_path.clone()), models_json_path.clone());
+    let registry = ModelRegistry::create(std::sync::Arc::new(AuthStorage::new(auth_path.clone())), models_json_path.clone());
     assert!(registry.get_error().is_some());
     assert!(registry.get_error().unwrap().contains("unknown variant `invalid_oauth_type`"));
 
@@ -423,7 +455,7 @@ async fn test_custom_model_rejections() {
     }"#;
 
     fs::write(&models_json_path, content_partial_cost).unwrap();
-    let registry2 = ModelRegistry::create(AuthStorage::new(auth_path.clone()), models_json_path.clone());
+    let registry2 = ModelRegistry::create(std::sync::Arc::new(AuthStorage::new(auth_path.clone())), models_json_path.clone());
     assert!(registry2.get_error().is_some());
     assert!(registry2.get_error().unwrap().contains("missing field `output`"));
 
@@ -444,7 +476,7 @@ async fn test_custom_model_rejections() {
     }"#;
 
     fs::write(&models_json_path, content_block_comment).unwrap();
-    let registry3 = ModelRegistry::create(AuthStorage::new(auth_path), models_json_path);
+    let registry3 = ModelRegistry::create(std::sync::Arc::new(AuthStorage::new(auth_path)), models_json_path);
     assert!(registry3.get_error().is_some());
 
 }
@@ -540,7 +572,7 @@ fn oauth_credentials_transform_builtin_catalogs_after_merge() {
     let models_path = temp_dir.path().join("models.json");
     fs::write(&models_path, r#"{"providers": {}}"#).unwrap();
 
-    let baseline = ModelRegistry::create(AuthStorage::new(auth_path.clone()), models_path.clone());
+    let baseline = ModelRegistry::create(std::sync::Arc::new(AuthStorage::new(auth_path.clone())), models_path.clone());
     let copilot_ids = baseline.get_all().iter()
         .filter(|model| model.provider == "github-copilot")
         .map(|model| model.id.clone()).collect::<Vec<_>>();
@@ -561,7 +593,7 @@ fn oauth_credentials_transform_builtin_catalogs_after_merge() {
         ("github-copilot", oauth_credential("copilot-token", i64::MAX, copilot_extra)),
     ]);
 
-    let registry = ModelRegistry::create(AuthStorage::new(auth_path), models_path);
+    let registry = ModelRegistry::create(std::sync::Arc::new(AuthStorage::new(auth_path)), models_path);
     let radius = registry.find("radius", "radius-dynamic").expect("Radius catalog model");
     assert_eq!(radius.api.as_ref(), "pi-messages");
     assert_eq!(radius.base_url, "https://radius.example/v1");
@@ -588,7 +620,7 @@ fn custom_radius_oauth_registers_before_catalog_mutation() {
         }]}})
     ))]);
 
-    let registry = ModelRegistry::create(AuthStorage::new(auth_path), models_path);
+    let registry = ModelRegistry::create(std::sync::Arc::new(AuthStorage::new(auth_path)), models_path);
     assert!(pi_ai::oauth::get_oauth_login_provider("radius-corp").is_some());
     let model = registry.find("radius-corp", "corp-model").expect("custom Radius catalog model");
     assert_eq!(model.base_url, "https://gateway.example/v1");
@@ -655,7 +687,7 @@ fn model_overrides_ignore_unsupported_transport_fields() {
 
     // Build baseline registry first to get the default model definition.
     let baseline_path = temp_dir.path().join("empty.json");
-    let baseline = ModelRegistry::create(AuthStorage::new(auth_path.clone()), baseline_path);
+    let baseline = ModelRegistry::create(std::sync::Arc::new(AuthStorage::new(auth_path.clone())), baseline_path);
     let original_model = baseline.find("openai", "gpt-4o").expect("should find default gpt-4o").clone();
 
     // Write a models.json containing unknown/unsupported fields in modelOverrides.
@@ -675,7 +707,7 @@ fn model_overrides_ignore_unsupported_transport_fields() {
     }"#;
     fs::write(&models_path, config_content).unwrap();
 
-    let registry = ModelRegistry::create(AuthStorage::new(auth_path), models_path);
+    let registry = ModelRegistry::create(std::sync::Arc::new(AuthStorage::new(auth_path)), models_path);
 
     // Validation must pass, get_error() must be None
     assert!(

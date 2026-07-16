@@ -6,6 +6,64 @@
 
 use std::path::PathBuf;
 
+/// Why a session is starting (oracle `SessionStartEvent.reason`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionStartReason {
+    Startup,
+    New,
+    Resume,
+    Fork,
+    Reload,
+}
+
+/// Why the current session is being replaced/shut down (oracle
+/// `SessionShutdownEvent.reason`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionShutdownReason {
+    New,
+    Resume,
+    Fork,
+    Reload,
+    Quit,
+}
+
+/// Fork anchor position (oracle `session_before_fork` position).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForkPosition {
+    Before,
+    At,
+}
+
+/// Session lifecycle events routed through the extension bridge (Phase 6
+/// forwards these to the sidecar; `NoopExtensionBridge` continues).
+#[derive(Clone, Debug)]
+pub enum SessionLifecycleEvent {
+    SessionStart {
+        reason: SessionStartReason,
+        previous_session_file: Option<PathBuf>,
+    },
+    SessionBeforeSwitch {
+        /// `"new" | "resume"` in the oracle event.
+        reason: SessionStartReason,
+        target_session_file: Option<PathBuf>,
+    },
+    SessionBeforeFork {
+        entry_id: String,
+        position: ForkPosition,
+    },
+    SessionShutdown {
+        reason: SessionShutdownReason,
+        target_session_file: Option<PathBuf>,
+    },
+}
+
+/// Outcome of a blocking lifecycle hook.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HookOutcome {
+    Continue,
+    Cancel,
+}
+
 /// Discovered extension source paths (not yet loaded).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DiscoveredExtensions {
@@ -24,6 +82,12 @@ pub trait ExtensionBridge: Send + Sync {
 
     /// Paths discovered by the resource loader (for diagnostics / spawn args).
     fn discovered_paths(&self) -> &[PathBuf];
+
+    /// Route a session lifecycle event through registered hooks. The default
+    /// (and `NoopExtensionBridge`) always continues.
+    fn emit_lifecycle(&self, _event: &SessionLifecycleEvent) -> HookOutcome {
+        HookOutcome::Continue
+    }
 }
 
 /// Placeholder bridge used until Phase 6.

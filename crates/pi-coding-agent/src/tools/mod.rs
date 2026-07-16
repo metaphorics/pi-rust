@@ -265,7 +265,7 @@ fn truncate_head(content: &str, max_lines: usize, max_bytes: usize) -> Truncatio
     }
 }
 
-fn truncate_tail(content: &str, max_lines: usize, max_bytes: usize) -> TruncationResult {
+pub(crate) fn truncate_tail(content: &str, max_lines: usize, max_bytes: usize) -> TruncationResult {
     let total_bytes = content.len();
     let lines = split_lines_for_counting(content);
     let total_lines = lines.len();
@@ -1221,8 +1221,140 @@ pub fn read_schema() -> Value {
     json!({"type":"object","properties":{"path":{"type":"string","description":"Path to the file to read (relative or absolute)"},"offset":{"type":"number","description":"Line number to start reading from (1-indexed)"},"limit":{"type":"number","description":"Maximum number of lines to read"}},"required":["path"]})
 }
 
+/// Options for the read tool (oracle `ReadToolOptions`, read.ts:58-63).
+#[derive(Clone, Debug)]
+pub struct ReadToolOptions {
+    /// Whether to auto-resize images to 2000x2000 max. Default: true.
+    pub auto_resize_images: bool,
+}
+
+impl Default for ReadToolOptions {
+    fn default() -> Self {
+        Self {
+            auto_resize_images: true,
+        }
+    }
+}
+
+/// Options for the bash tool (oracle `BashToolOptions`, bash.ts).
+#[derive(Clone, Debug, Default)]
+pub struct BashToolOptions {
+    /// Custom shell binary (settings `shellPath`).
+    pub shell_path: Option<String>,
+    /// Prefix prepended to every command (settings `shellCommandPrefix`).
+    pub command_prefix: Option<String>,
+}
+
+/// Per-tool options for [`builtin_tools_with_options`].
+#[derive(Clone, Debug, Default)]
+pub struct BuiltinToolOptions {
+    pub read: ReadToolOptions,
+    pub bash: BashToolOptions,
+}
+
+const IMAGE_MAX_DIMENSION: u32 = 2000;
+
+/// Oracle `processImage` failure string (image-process.ts).
+const IMAGE_OMITTED_RESIZE: &str =
+    "[Image omitted: could not be resized below the inline image size limit.]";
+
+/// Build image content for the read tool, honoring `autoResizeImages`.
+///
+/// Mirrors read.ts:247-263 + processImage semantics with the workspace image
+/// pipeline (`pi_tui::terminal_image`): oversized or bmp images re-encode to
+/// PNG at a 2000x2000 cap with the oracle dimension/conversion hints; images
+/// already within limits pass through untouched. The oracle's iterative
+/// byte-budget (4.5MB base64) JPEG fallback is not replicated.
+fn read_image_content(
+    data: Vec<u8>,
+    mime_type: &'static str,
+    auto_resize_images: bool,
+) -> Vec<Content> {
+    let needs_conversion = mime_type == "image/bmp";
+    if !auto_resize_images && !needs_conversion {
+        return vec![
+            Content::Text(TextContent {
+                text: format!("Read image file [{mime_type}]").into(),
+                text_signature: None,
+            }),
+            Content::Image(ImageContent {
+                data: BASE64.encode(data),
+                mime_type: mime_type.to_owned(),
+            }),
+        ];
+    }
+
+    let b64 = BASE64.encode(&data);
+    let original_dims = pi_tui::terminal_image::get_image_dimensions(&b64, mime_type);
+    let within_limits = original_dims
+        .map(|d| d.width_px <= IMAGE_MAX_DIMENSION && d.height_px <= IMAGE_MAX_DIMENSION);
+
+    if !needs_conversion && (!auto_resize_images || within_limits == Some(true)) {
+        return vec![
+            Content::Text(TextContent {
+                text: format!("Read image file [{mime_type}]").into(),
+                text_signature: None,
+            }),
+            Content::Image(ImageContent {
+                data: b64,
+                mime_type: mime_type.to_owned(),
+            }),
+        ];
+    }
+
+    let max = if auto_resize_images {
+        Some(IMAGE_MAX_DIMENSION)
+    } else {
+        None
+    };
+    match pi_tui::terminal_image::decode_and_resize_to_png_base64(&data, max, max) {
+        Some((png_b64, final_dims)) => {
+            let mut hints: Vec<String> = Vec::new();
+            if needs_conversion {
+                hints.push(format!("[Image converted from {mime_type} to image/png.]"));
+            }
+            if let Some(orig) = original_dims
+                && (orig.width_px != final_dims.width_px || orig.height_px != final_dims.height_px)
+            {
+                let scale = f64::from(orig.width_px) / f64::from(final_dims.width_px);
+                hints.push(format!(
+                    "[Image: original {}x{}, displayed at {}x{}. Multiply coordinates by {:.2} to map to original image.]",
+                    orig.width_px, orig.height_px, final_dims.width_px, final_dims.height_px, scale
+                ));
+            }
+            let mut text = "Read image file [image/png]".to_string();
+            if !hints.is_empty() {
+                text.push('\n');
+                text.push_str(&hints.join("\n"));
+            }
+            vec![
+                Content::Text(TextContent {
+                    text: text.into(),
+                    text_signature: None,
+                }),
+                Content::Image(ImageContent {
+                    data: png_b64,
+                    mime_type: "image/png".to_owned(),
+                }),
+            ]
+        }
+        None => vec![Content::Text(TextContent {
+            text: format!("Read image file [{mime_type}]\n{IMAGE_OMITTED_RESIZE}").into(),
+            text_signature: None,
+        })],
+    }
+}
+
 pub fn create_read_tool(cwd: impl Into<PathBuf>) -> ToolDefinition {
+    create_read_tool_with_options(cwd, ReadToolOptions::default())
+}
+
+pub fn create_read_tool_with_options(
+    cwd: impl Into<PathBuf>,
+    options: ReadToolOptions,
+) -> ToolDefinition {
     let cwd = cwd.into();
+    let auto_resize_images = options.auto_resize_images;
     ToolDefinition {
         name: "read".into(),
         label: "read".into(),
@@ -1251,16 +1383,7 @@ pub fn create_read_tool(cwd: impl Into<PathBuf>) -> ToolDefinition {
                 if let Some(mime_type) = image_mime(&target) {
                     let data = fs::read(&target).map_err(|error| error.to_string())?;
                     return Ok(AgentToolResult {
-                        content: vec![
-                            Content::Text(TextContent {
-                                text: format!("Read image file [{mime_type}]").into(),
-                                text_signature: None,
-                            }),
-                            Content::Image(ImageContent {
-                                data: BASE64.encode(data),
-                                mime_type: mime_type.to_owned(),
-                            }),
-                        ],
+                        content: read_image_content(data, mime_type, auto_resize_images),
                         details: Value::Object(Default::default()),
                         added_tool_names: None,
                         terminate: None,
@@ -1558,7 +1681,7 @@ pub fn bash_schema() -> Value {
     json!({"type":"object","properties":{"command":{"type":"string","description":"Bash command to execute"},"timeout":{"type":"number","description":"Timeout in seconds (optional, no default timeout)"}},"required":["command"]})
 }
 
-fn kill_process_tree(pid: u32) {
+pub(crate) fn kill_process_tree(pid: u32) {
     #[cfg(unix)]
     {
         use rustix::process::{Pid, Signal, kill_process_group};
@@ -1584,7 +1707,16 @@ enum StreamData {
 }
 
 pub fn create_bash_tool(cwd: impl Into<PathBuf>) -> ToolDefinition {
+    create_bash_tool_with_options(cwd, BashToolOptions::default())
+}
+
+pub fn create_bash_tool_with_options(
+    cwd: impl Into<PathBuf>,
+    options: BashToolOptions,
+) -> ToolDefinition {
     let cwd = cwd.into();
+    let shell_path = options.shell_path.clone();
+    let command_prefix = options.command_prefix.clone();
     ToolDefinition {
         name: "bash".into(),
         label: "bash".into(),
@@ -1595,8 +1727,15 @@ pub fn create_bash_tool(cwd: impl Into<PathBuf>) -> ToolDefinition {
         renderer: None,
         execute: Arc::new(move |_, args, cancellation_token, on_update| {
             let cwd = cwd.clone();
+            let shell_path = shell_path.clone();
+            let command_prefix = command_prefix.clone();
             Box::pin(async move {
                 let command = string_arg(&args, "command")?;
+                let resolved_command = match &command_prefix {
+                    Some(prefix) => format!("{prefix}\n{command}"),
+                    None => command.to_string(),
+                };
+                let command = resolved_command.as_str();
                 let timeout = args.get("timeout").and_then(Value::as_f64);
                 if timeout.is_some_and(|seconds| !seconds.is_finite() || seconds <= 0.0) {
                     return Err("Invalid timeout: must be a finite number of seconds".into());
@@ -1608,7 +1747,7 @@ pub fn create_bash_tool(cwd: impl Into<PathBuf>) -> ToolDefinition {
                     ));
                 }
 
-                let mut cmd = tokio::process::Command::new("bash");
+                let mut cmd = tokio::process::Command::new(shell_path.as_deref().unwrap_or("bash"));
                 cmd.arg("-c")
                     .arg(command)
                     .current_dir(&cwd)
@@ -2313,6 +2452,24 @@ pub fn builtin_tools(cwd: impl Into<PathBuf>) -> Vec<ToolDefinition> {
     ]
 }
 
+/// Like [`builtin_tools`] but with settings-derived per-tool options
+/// (oracle `createAllToolDefinitions(cwd, { read, bash })`).
+pub fn builtin_tools_with_options(
+    cwd: impl AsRef<Path>,
+    options: &BuiltinToolOptions,
+) -> Vec<ToolDefinition> {
+    let cwd = cwd.as_ref().to_path_buf();
+    vec![
+        create_read_tool_with_options(cwd.clone(), options.read.clone()),
+        create_bash_tool_with_options(cwd.clone(), options.bash.clone()),
+        create_edit_tool(cwd.clone()),
+        create_write_tool(cwd.clone()),
+        create_grep_tool(cwd.clone()),
+        create_find_tool(cwd.clone()),
+        create_ls_tool(cwd),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2436,11 +2593,8 @@ mod tests {
             "beta\n\n[2 more lines in file. Use offset=3 to continue.]"
         );
 
-        fs::write(
-            dir.join("picture.png"),
-            [137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82],
-        )
-        .expect("image fixture");
+        // Decodable 1x1 PNG (auto-resize path decodes images).
+        fs::write(dir.join("picture.png"), [137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 218, 99, 252, 207, 192, 80, 15, 0, 4, 133, 1, 128, 132, 169, 140, 33, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130]).expect("image fixture");
         let image = (create_read_tool(&dir).execute)(
             "test".into(),
             json!({"path":"picture.png"}),
@@ -2781,11 +2935,7 @@ mod tests {
 
         // 1. Extensionless valid PNG image
         let extensionless_path = dir.join("valid_image_no_ext");
-        fs::write(
-            &extensionless_path,
-            [137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82],
-        )
-        .expect("write extensionless image");
+        fs::write(&extensionless_path, [137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 218, 99, 252, 207, 192, 80, 15, 0, 4, 133, 1, 128, 132, 169, 140, 33, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130]).expect("write extensionless image");
 
         let read_tool = create_read_tool(&dir);
         let img_res = (read_tool.execute)(

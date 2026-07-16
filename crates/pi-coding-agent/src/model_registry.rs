@@ -181,12 +181,12 @@ pub struct ModelRegistry {
     registered_providers: HashMap<String, ProviderConfigInput>,
     radius_oauth_providers: HashSet<String>,
     load_error: Option<String>,
-    pub auth_storage: AuthStorage,
+    pub auth_storage: Arc<AuthStorage>,
     models_json_path: Option<PathBuf>,
 }
 
 impl ModelRegistry {
-    pub fn create(auth_storage: AuthStorage, models_json_path: PathBuf) -> Self {
+    pub fn create(auth_storage: Arc<AuthStorage>, models_json_path: PathBuf) -> Self {
         let mut registry = Self {
             models: Vec::new(),
             provider_request_configs: HashMap::new(),
@@ -202,7 +202,7 @@ impl ModelRegistry {
         registry
     }
 
-    pub fn in_memory(auth_storage: AuthStorage) -> Self {
+    pub fn in_memory(auth_storage: Arc<AuthStorage>) -> Self {
         let mut registry = Self {
             models: Vec::new(),
             provider_request_configs: HashMap::new(),

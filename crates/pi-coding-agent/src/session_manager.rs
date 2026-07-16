@@ -843,6 +843,117 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Extract a single conversation path into a NEW session (oracle
+    /// `createBranchedSession`, session-manager.ts:1334). Returns the new
+    /// session file path, or `None` when not persisting.
+    pub fn create_branched_session(&mut self, leaf_id: &str) -> Result<Option<PathBuf>> {
+        let previous_session_file = self.session_file.clone();
+        let path = self.get_branch(Some(leaf_id));
+        if path.is_empty() {
+            return Err(SessionError::msg(format!("Entry {leaf_id} not found")));
+        }
+
+        // Filter out label entries and re-chain the retained path.
+        let mut path_without_labels: Vec<SessionEntry> = Vec::new();
+        let mut path_parent_id: Option<String> = None;
+        for entry in path {
+            if matches!(entry, SessionEntry::Label { .. }) {
+                continue;
+            }
+            let mut entry = entry.clone();
+            entry.set_parent_id(NullOr::from_option(path_parent_id.clone()));
+            path_parent_id = entry.id().map(str::to_string);
+            path_without_labels.push(entry);
+        }
+
+        let new_session_id = create_session_id();
+        let timestamp = now_iso();
+        let file_timestamp = timestamp.replace([':', '.'], "-");
+        let new_session_file = self
+            .session_dir
+            .join(format!("{file_timestamp}_{new_session_id}.jsonl"));
+
+        let header = SessionHeader {
+            entry_type: SessionHeaderType::Session,
+            version: Some(CURRENT_SESSION_VERSION),
+            id: new_session_id.clone(),
+            timestamp,
+            cwd: self.cwd.to_string_lossy().into_owned(),
+            parent_session: if self.persist {
+                previous_session_file.map(|p| p.to_string_lossy().into_owned())
+            } else {
+                None
+            },
+            extra: serde_json::Map::new(),
+        };
+
+        // Collect labels attached to entries on the path.
+        let mut path_entry_ids: HashMap<String, SessionEntry> = path_without_labels
+            .iter()
+            .filter_map(|e| e.id().map(|id| (id.to_string(), e.clone())))
+            .collect();
+        let mut labels_to_write: Vec<(String, String, String)> = Vec::new();
+        for (target_id, label) in &self.labels_by_id {
+            if path_entry_ids.contains_key(target_id) {
+                let label_timestamp = self
+                    .label_timestamps_by_id
+                    .get(target_id)
+                    .cloned()
+                    .unwrap_or_else(now_iso);
+                labels_to_write.push((target_id.clone(), label.clone(), label_timestamp));
+            }
+        }
+
+        // Re-append label entries after the last path entry.
+        let mut parent_id = path_without_labels.last().and_then(|e| e.id().map(str::to_string));
+        let mut label_entries: Vec<SessionEntry> = Vec::new();
+        for (target_id, label, label_timestamp) in labels_to_write {
+            let id = generate_entry_id(&path_entry_ids);
+            let entry = SessionEntry::Label {
+                id: Some(id.clone()),
+                parent_id: NullOr::from_option(parent_id.clone()),
+                timestamp: label_timestamp,
+                target_id,
+                label: Some(label),
+            };
+            path_entry_ids.insert(id.clone(), entry.clone());
+            label_entries.push(entry);
+            parent_id = Some(id);
+        }
+
+        self.file_entries = std::iter::once(FileEntry::Header(header))
+            .chain(path_without_labels.into_iter().map(FileEntry::Entry))
+            .chain(label_entries.into_iter().map(FileEntry::Entry))
+            .collect();
+        self.session_id = new_session_id;
+
+        if self.persist {
+            self.session_file = Some(new_session_file.clone());
+            self.build_index();
+
+            // Only write the file now if it contains an assistant message;
+            // otherwise defer to persist_entry (newSession contract).
+            let has_assistant = self.file_entries.iter().any(|e| {
+                matches!(
+                    e.as_entry(),
+                    Some(SessionEntry::Message { message, .. })
+                        if message.get("role").and_then(|r| r.as_str()) == Some("assistant")
+                )
+            });
+            if has_assistant {
+                self.rewrite_file()?;
+                self.flushed = true;
+            } else {
+                self.flushed = false;
+            }
+            return Ok(Some(new_session_file));
+        }
+
+        // In-memory mode: replace current session with the path + labels.
+        self.build_index();
+        Ok(None)
+    }
+
     pub fn reset_leaf(&mut self) {
         self.leaf_id = None;
     }
@@ -1498,7 +1609,7 @@ fn timestamp_millis(timestamp: &str) -> i64 {
         .as_millisecond()
 }
 
-fn session_entry_to_context_messages(entry: &SessionEntry) -> Vec<Value> {
+pub(crate) fn session_entry_to_context_messages(entry: &SessionEntry) -> Vec<Value> {
     match entry {
         SessionEntry::Message { message, .. } => {
             let mut msg = message.clone();

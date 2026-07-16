@@ -597,11 +597,25 @@ impl SettingsManager {
             .get_str("steeringMode")
             .unwrap_or("one-at-a-time")
     }
+    /// Oracle `setSteeringMode` (settings-manager.ts:707).
+    pub fn set_steering_mode(&mut self, mode: impl Into<String>) {
+        self.global_settings
+            .insert("steeringMode", Value::String(mode.into()));
+        self.mark_modified("steeringMode", None);
+        self.save_global();
+    }
 
     pub fn get_follow_up_mode(&self) -> &str {
         self.settings
             .get_str("followUpMode")
             .unwrap_or("one-at-a-time")
+    }
+    /// Oracle `setFollowUpMode` (settings-manager.ts:717).
+    pub fn set_follow_up_mode(&mut self, mode: impl Into<String>) {
+        self.global_settings
+            .insert("followUpMode", Value::String(mode.into()));
+        self.mark_modified("followUpMode", None);
+        self.save_global();
     }
 
     pub fn get_theme(&self) -> Option<&str> {
@@ -623,6 +637,13 @@ impl SettingsManager {
     pub fn get_default_thinking_level(&self) -> Option<&str> {
         self.settings.get_str("defaultThinkingLevel")
     }
+    /// Oracle `setDefaultThinkingLevel` (settings-manager.ts:744).
+    pub fn set_default_thinking_level(&mut self, level: impl Into<String>) {
+        self.global_settings
+            .insert("defaultThinkingLevel", Value::String(level.into()));
+        self.mark_modified("defaultThinkingLevel", None);
+        self.save_global();
+    }
 
     pub fn get_transport(&self) -> &str {
         self.settings.get_str("transport").unwrap_or("auto")
@@ -634,6 +655,20 @@ impl SettingsManager {
             .and_then(|c| c.get("enabled"))
             .and_then(|v| v.as_bool())
             .unwrap_or(true)
+    }
+    /// Oracle `setCompactionEnabled` (settings-manager.ts:764).
+    pub fn set_compaction_enabled(&mut self, enabled: bool) {
+        let mut compaction = self
+            .global_settings
+            .get("compaction")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
+        compaction.insert("enabled".into(), Value::Bool(enabled));
+        self.global_settings
+            .insert("compaction", Value::Object(compaction));
+        self.mark_modified("compaction", Some("enabled"));
+        self.save_global();
     }
 
     pub fn get_compaction_reserve_tokens(&self) -> u64 {
@@ -658,6 +693,19 @@ impl SettingsManager {
             .and_then(|c| c.get("enabled"))
             .and_then(|v| v.as_bool())
             .unwrap_or(true)
+    }
+    /// Oracle `setRetryEnabled` (settings-manager.ts:804).
+    pub fn set_retry_enabled(&mut self, enabled: bool) {
+        let mut retry = self
+            .global_settings
+            .get("retry")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
+        retry.insert("enabled".into(), Value::Bool(enabled));
+        self.global_settings.insert("retry", Value::Object(retry));
+        self.mark_modified("retry", Some("enabled"));
+        self.save_global();
     }
 
     pub fn get_extensions(&self) -> Vec<String> {
@@ -975,6 +1023,57 @@ mod tests {
         assert_eq!(settings.get_str("steeringMode"), Some("one-at-a-time"));
         assert_eq!(settings.get_bool("websockets"), Some(true));
         assert_eq!(settings.get_str("transport"), Some("sse"));
+    }
+    #[test]
+    fn session_runtime_setters_persist_and_preserve_unknown_keys() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let agent_dir = temp.path().join("agent");
+        let cwd = temp.path().join("project");
+        std::fs::create_dir_all(&agent_dir).expect("agent dir");
+        // Pre-existing settings.json with unknown top-level and nested keys.
+        std::fs::write(
+            agent_dir.join("settings.json"),
+            r#"{
+  "someUnknownKey": {"keep": true},
+  "compaction": {"reserveTokens": 32768, "unknownNested": 1},
+  "retry": {"maxRetries": 7}
+}"#,
+        )
+        .expect("seed settings");
+
+        let mut manager = SettingsManager::create(&cwd, Some(agent_dir.clone()));
+        manager.set_steering_mode("all");
+        manager.set_follow_up_mode("all");
+        manager.set_default_thinking_level("high");
+        manager.set_compaction_enabled(false);
+        manager.set_retry_enabled(false);
+
+        // Effective view reflects the changes immediately.
+        assert_eq!(manager.get_steering_mode(), "all");
+        assert_eq!(manager.get_follow_up_mode(), "all");
+        assert_eq!(manager.get_default_thinking_level(), Some("high"));
+        assert!(!manager.get_compaction_enabled());
+        assert!(!manager.get_retry_enabled());
+
+        // A fresh manager re-reads the persisted file.
+        let reloaded = SettingsManager::create(&cwd, Some(agent_dir.clone()));
+        assert_eq!(reloaded.get_steering_mode(), "all");
+        assert_eq!(reloaded.get_follow_up_mode(), "all");
+        assert_eq!(reloaded.get_default_thinking_level(), Some("high"));
+        assert!(!reloaded.get_compaction_enabled());
+        assert!(!reloaded.get_retry_enabled());
+
+        // Unknown keys and untouched nested fields survive the writes.
+        let raw: Value = serde_json::from_str(
+            &std::fs::read_to_string(agent_dir.join("settings.json")).expect("read"),
+        )
+        .expect("json");
+        assert_eq!(raw["someUnknownKey"]["keep"], Value::Bool(true));
+        assert_eq!(raw["compaction"]["reserveTokens"], 32768);
+        assert_eq!(raw["compaction"]["unknownNested"], 1);
+        assert_eq!(raw["compaction"]["enabled"], Value::Bool(false));
+        assert_eq!(raw["retry"]["maxRetries"], 7);
+        assert_eq!(raw["retry"]["enabled"], Value::Bool(false));
     }
 
     #[test]

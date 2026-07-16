@@ -14,6 +14,9 @@ pub mod settings_manager;
 pub mod auth_storage;
 pub mod model_registry;
 pub mod resolve_config_value;
+pub mod session;
+pub mod system_prompt;
+pub mod wire_out;
 
 pub use auth_storage::{AuthStorage, AuthStatus, AuthStorageError};
 pub use model_registry::{ModelRegistry, ResolvedRequestAuth, ResolveResult, ProviderConfigInput, ModelDefinition, ModelOverride, OverrideCost, DefinitionCost};
@@ -29,7 +32,10 @@ pub use config::{
     env_session_dir_key, get_agent_dir, get_auth_path, get_default_session_dir_path,
     get_package_dir, get_sessions_dir, get_settings_path,
 };
-pub use extension_bridge::{DiscoveredExtensions, ExtensionBridge, NoopExtensionBridge};
+pub use extension_bridge::{
+    DiscoveredExtensions, ExtensionBridge, ForkPosition, HookOutcome, NoopExtensionBridge,
+    SessionLifecycleEvent, SessionShutdownReason, SessionStartReason,
+};
 pub use migrations::{MigrationResult, run_migrations, run_migrations_with_agent_dir};
 pub use resource_loader::{
     DefaultResourceLoader, DiscoveredResources, ResourceLoaderOptions, ResourcePath,
@@ -49,13 +55,26 @@ pub use settings_manager::{
     Settings, SettingsManager, SettingsScope, deep_merge_settings, migrate_settings,
     parse_settings_json, serialize_settings_json,
 };
-
-// Keep workspace deps linked while sibling modules land.
-#[allow(unused_imports)]
-use pi_agent as _;
-#[allow(unused_imports)]
-use pi_ext_protocol as _;
-#[allow(unused_imports)]
-use pi_tui as _;
+pub use wire_out::WireOut;
+pub use system_prompt::{
+    BuildSystemPromptOptions, ContextFile, Skill, build_system_prompt, format_skills_for_prompt,
+    get_docs_path, get_examples_path, get_readme_path, load_project_context_files,
+};
+pub use session::{
+    AgentSession, AgentSessionConfig, AgentSessionEvent, AgentSessionEventListener, BashResult,
+    CompactionReason, CompactionResult, ContextUsage, ModelCycleResult, NavigateTreeOptions,
+    NavigateTreeResult, PromptOptions, PromptTemplate, ScopedModel, SessionStats,
+    SessionToolDefinition, StreamingBehavior, ToolInfo, convert_to_llm,
+    format_no_api_key_found_message, format_no_model_selected_message,
+    format_no_models_available_message,
+};
+pub use session::runtime::{
+    AgentSessionRuntime, CreateRuntimeFactory, CreateRuntimeOptions, CreateRuntimeResult,
+    ReplaceResult,
+};
+pub use session::services::{
+    AgentSessionServices, CreateAgentSessionServicesOptions, DiagnosticLevel, RuntimeDiagnostic,
+    create_agent_session_services,
+};
 
 pub mod tools;
