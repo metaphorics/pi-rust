@@ -33,6 +33,31 @@ macro_rules! result_fixture {
     };
 }
 
+fn get_method_direction(method: &str) -> &'static str {
+    match method {
+        "lifecycle/init"
+        | "event/emit"
+        | "ui/terminal_input"
+        | "tool/execute"
+        | "provider/stream"
+        | "command/execute"
+        | "shortcut/invoke"
+        | "session/setup"
+        | "session/sync"
+        | "state/update" => "rust-to-sidecar",
+
+        "lifecycle/initialized"
+        | "action/sendUserMessage"
+        | "ui/getTheme"
+        | "ui/getAllThemes"
+        | "tool/update"
+        | "provider/register"
+        | "error/extension" => "sidecar-to-rust",
+
+        _ => panic!("unknown method: {}", method),
+    }
+}
+
 const METHOD_FIXTURES: &[MethodFixture] = &[
     fixture!("rust-to-sidecar-lifecycle.json", "rust-to-sidecar", "lifecycle"),
     fixture!("sidecar-to-rust-lifecycle.json", "sidecar-to-rust", "lifecycle"),
@@ -47,9 +72,9 @@ const METHOD_FIXTURES: &[MethodFixture] = &[
     fixture!("sidecar-to-rust-provider.json", "sidecar-to-rust", "provider"),
     fixture!("rust-to-sidecar-command.json", "rust-to-sidecar", "command"),
     fixture!("rust-to-sidecar-shortcut.json", "rust-to-sidecar", "shortcut"),
-    fixture!("rust-to-sidecar-session.json", "rust-to-sidecar", "session"),
-    fixture!("sidecar-to-rust-session.json", "sidecar-to-rust", "session"),
-    fixture!("sidecar-to-rust-state.json", "sidecar-to-rust", "state"),
+    fixture!("rust-to-sidecar-session-setup.json", "rust-to-sidecar", "session"),
+    fixture!("rust-to-sidecar-session-sync.json", "rust-to-sidecar", "session"),
+    fixture!("rust-to-sidecar-state.json", "rust-to-sidecar", "state"),
     fixture!("sidecar-to-rust-error.json", "sidecar-to-rust", "error"),
 ];
 
@@ -65,13 +90,34 @@ fn method_families_are_byte_exact_in_every_supported_direction() {
     let mut covered = BTreeSet::new();
 
     for fixture in METHOD_FIXTURES {
-        assert!(fixture.name.starts_with(fixture.direction));
         assert_byte_exact(fixture.name, fixture.bytes);
 
         let wire: Value = serde_json::from_slice(fixture.bytes).expect("fixture is JSON");
         let method = wire["method"].as_str().expect("method fixture has method");
-        assert_eq!(method.split_once('/').map(|(family, _)| family), Some(fixture.family));
-        covered.insert((fixture.direction, fixture.family));
+
+        let expected_direction = get_method_direction(method);
+
+        // Assert the filename prefix matches the actual method direction
+        assert!(
+            fixture.name.starts_with(expected_direction),
+            "fixture file name {} does not start with its expected direction prefix {}",
+            fixture.name,
+            expected_direction
+        );
+
+        // Assert the direction parameter in the fixture! macro matches the expected direction
+        assert_eq!(
+            fixture.direction,
+            expected_direction,
+            "direction parameter in fixture! macro for {} does not match expected {}",
+            fixture.name,
+            expected_direction
+        );
+
+        let (derived_family, _) = method.split_once('/').expect("method must contain a slash");
+        assert_eq!(derived_family, fixture.family, "family mismatch for method {}", method);
+
+        covered.insert((expected_direction, fixture.family));
     }
 
     let expected = BTreeSet::from([
@@ -83,16 +129,23 @@ fn method_families_are_byte_exact_in_every_supported_direction() {
         ("rust-to-sidecar", "command"),
         ("rust-to-sidecar", "shortcut"),
         ("rust-to-sidecar", "session"),
+        ("rust-to-sidecar", "state"),
         ("sidecar-to-rust", "lifecycle"),
         ("sidecar-to-rust", "action"),
         ("sidecar-to-rust", "ui"),
         ("sidecar-to-rust", "tool"),
         ("sidecar-to-rust", "provider"),
-        ("sidecar-to-rust", "session"),
-        ("sidecar-to-rust", "state"),
         ("sidecar-to-rust", "error"),
     ]);
     assert_eq!(covered, expected);
+
+    // Negative assertions to ensure no phantom sidecar-to-rust session/state cells exist
+    assert!(!covered.contains(&("sidecar-to-rust", "session")), "phantom sidecar-to-rust session cell found");
+    assert!(!covered.contains(&("sidecar-to-rust", "state")), "phantom sidecar-to-rust state cell found");
+
+    // Positive assertions to ensure actual rust-to-sidecar session/state cells are present
+    assert!(covered.contains(&("rust-to-sidecar", "session")), "rust-to-sidecar session cell missing");
+    assert!(covered.contains(&("rust-to-sidecar", "state")), "rust-to-sidecar state cell missing");
 }
 
 #[test]
