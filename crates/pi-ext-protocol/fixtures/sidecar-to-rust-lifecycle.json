@@ -1,0 +1,1 @@
+{"type":"ev","method":"lifecycle/initialized","params":{"registrations":{"tools":[],"commands":[],"shortcuts":[],"flags":[],"providers":[]},"subscribedEvents":["input","tool_call"],"errors":[]}}

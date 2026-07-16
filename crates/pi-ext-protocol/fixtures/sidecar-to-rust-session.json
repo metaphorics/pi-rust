@@ -1,0 +1,1 @@
+{"type":"ev","method":"session/sync","params":{"epoch":5,"sessionFile":"/sessions/current.jsonl","header":{"type":"session","version":3},"entries":[{"type":"message","id":"m1","message":{"role":"user","content":"hello"}}],"appended":[{"type":"label","id":"l1","parentId":"m1","label":"saved"}],"leafId":"l1","name":"Fixture"}}

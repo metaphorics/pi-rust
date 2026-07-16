@@ -1,0 +1,1 @@
+{"type":"ev","method":"error/extension","params":{"extensionPath":"/extensions/failing.ts","event":"before_agent_start","error":"fixture failure","stack":"Error: fixture failure\n    at failing.ts:1:1"}}

@@ -1,0 +1,1 @@
+{"type":"req","id":6,"method":"tool/execute","params":{"toolCallId":"call-1","name":"fixture","args":{"query":"needle","options":{"caseSensitive":true,"limit":3}}}}

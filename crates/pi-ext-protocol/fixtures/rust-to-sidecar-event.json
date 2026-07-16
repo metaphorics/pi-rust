@@ -1,0 +1,1 @@
+{"type":"req","id":2,"method":"event/emit","params":{"event":{"type":"project_trust","cwd":"/workspace"},"state":{"idle":false,"projectTrusted":true,"pendingMessages":true,"activeTools":[],"allTools":[],"commands":[],"thinkingLevel":"high","systemPrompt":"system","flagValues":{},"editorText":"","toolsExpanded":true,"theme":{"name":"light","json":{"name":"light"}}}}}
