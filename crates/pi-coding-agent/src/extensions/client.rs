@@ -687,11 +687,15 @@ async fn heartbeat_task(shared: Arc<Shared>, interval: Duration, max_misses: u32
     }
 }
 
+fn retain_exit_status(tx: &watch::Sender<Option<ExitStatus>>, status: ExitStatus) {
+    tx.send_replace(Some(status));
+}
+
 async fn monitor_task(mut child: tokio::process::Child, pid: Option<u32>, shared: Arc<Shared>) {
     tokio::select! {
         status = child.wait() => {
             if let Ok(status) = status {
-                let _ = shared.exit_tx.send(Some(status));
+                retain_exit_status(&shared.exit_tx, status);
                 shared.close_once(DeadReason::Exited(status.code()));
             } else {
                 shared.close_once(DeadReason::StdioClosed);
@@ -700,7 +704,7 @@ async fn monitor_task(mut child: tokio::process::Child, pid: Option<u32>, shared
         _ = shared.kill.notified() => {
             kill_process_tree(&mut child, pid);
             if let Ok(status) = child.wait().await {
-                let _ = shared.exit_tx.send(Some(status));
+                retain_exit_status(&shared.exit_tx, status);
             }
             shared.close_once(DeadReason::Killed);
         }
@@ -832,5 +836,20 @@ mod tests {
             _ => panic!("expected truncated tail"),
         }
         assert!(matches!(reader.next().await.unwrap(), ReadFrame::Eof));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exit_status_is_retained_without_a_live_receiver() {
+        let status = std::process::Command::new("sh")
+            .args(["-c", "exit 7"])
+            .status()
+            .expect("spawn test child");
+        let (tx, rx) = watch::channel(None);
+        drop(rx);
+
+        retain_exit_status(&tx, status);
+
+        assert_eq!(tx.borrow().as_ref().and_then(ExitStatus::code), Some(7));
     }
 }
