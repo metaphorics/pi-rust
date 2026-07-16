@@ -7,6 +7,7 @@ pub mod cli;
 pub mod source_info;
 pub mod extension_bridge;
 pub mod export_html;
+pub mod extensions;
 pub mod migrations;
 pub mod resource_loader;
 pub mod serde_util;
@@ -40,6 +41,11 @@ pub use extension_bridge::{
     DiscoveredExtensions, ExtensionBridge, ExtensionUiHost, ForkPosition, HookOutcome,
     NoopExtensionBridge, NotifyType, RegisteredCommand, SessionLifecycleEvent,
     SessionShutdownReason, SessionStartReason, UiDialogOptions, WidgetPlacement,
+};
+pub use extensions::{
+    BridgeState, BunEnvironment, ClientConfig, ClientError, DeadReason, DisabledReason,
+    ExtensionHost, ExtensionHostConfig, ExtensionPathError, HostError, Incoming, LauncherSource,
+    LoadOutcome, SidecarConnection, SidecarLauncher, SidecarTimeouts,
 };
 pub use export_html::{
     ExportHtmlOptions, RenderedToolResult, ToolHtmlRenderer, export_session_file_to_html,
