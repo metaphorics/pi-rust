@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 
 use pi_ai::auth::{Credential, CredentialStoreError, FileCredentialStore, CredentialStore, ResolveAuthError};
@@ -33,7 +33,7 @@ pub struct AuthStatus {
 pub struct AuthStorage {
     store: FileCredentialStore,
     path: PathBuf,
-    runtime_overrides: HashMap<String, String>,
+    runtime_overrides: RwLock<HashMap<String, String>>,
     errors: Mutex<Vec<String>>,
 }
 
@@ -42,19 +42,33 @@ impl AuthStorage {
         Self {
             store: FileCredentialStore::new(path.clone()),
             path,
-            runtime_overrides: HashMap::new(),
+            runtime_overrides: RwLock::new(HashMap::new()),
             errors: Mutex::new(Vec::new()),
         }
     }
 
     /// Set a runtime API key override.
-    pub fn set_runtime_api_key(&mut self, provider: String, api_key: String) {
-        self.runtime_overrides.insert(provider, api_key);
+    pub fn set_runtime_api_key(&self, provider: String, api_key: String) {
+        self.runtime_overrides
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(provider, api_key);
     }
 
     /// Remove a runtime API key override.
-    pub fn remove_runtime_api_key(&mut self, provider: &str) {
-        self.runtime_overrides.remove(provider);
+    pub fn remove_runtime_api_key(&self, provider: &str) {
+        self.runtime_overrides
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(provider);
+    }
+
+    fn runtime_override(&self, provider: &str) -> Option<String> {
+        self.runtime_overrides
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(provider)
+            .cloned()
     }
 
     /// Check if credentials exist for a provider in auth.json.
@@ -92,7 +106,7 @@ impl AuthStorage {
 
     /// Check if any form of auth is configured for a provider.
     pub async fn has_auth(&self, provider: &str) -> Result<bool, AuthStorageError> {
-        if self.runtime_overrides.contains_key(provider) {
+        if self.runtime_override(provider).is_some() {
             return Ok(true);
         }
         if self.has(provider).await? {
@@ -114,7 +128,7 @@ impl AuthStorage {
             });
         }
 
-        if self.runtime_overrides.contains_key(provider) {
+        if self.runtime_override(provider).is_some() {
             return Ok(AuthStatus {
                 configured: false,
                 source: Some("runtime".to_string()),
@@ -161,8 +175,8 @@ impl AuthStorage {
 
     /// Get API key for a provider.
     pub async fn get_api_key(&self, provider_id: &str, include_fallback: bool) -> Result<Option<String>, AuthStorageError> {
-        if let Some(key) = self.runtime_overrides.get(provider_id) {
-            return Ok(Some(key.clone()));
+        if let Some(key) = self.runtime_override(provider_id) {
+            return Ok(Some(key));
         }
 
         let ambient_key = if include_fallback {
