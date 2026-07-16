@@ -74,12 +74,7 @@ fn create_user_message(text: &str) -> AgentMessage {
 }
 
 fn tool_call(id: &str, name: &str, arguments: Value) -> Content {
-    let map = arguments
-        .as_object()
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .collect();
+    let map = arguments.as_object().cloned().unwrap_or_default();
     Content::ToolCall(ToolCall {
         id: id.into(),
         name: name.into(),

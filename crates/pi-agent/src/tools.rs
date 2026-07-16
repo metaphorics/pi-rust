@@ -26,16 +26,16 @@ pub fn prepare_tool_call_arguments(
     let Some(prepare) = tool.prepare_arguments.as_ref() else {
         return tool_call.clone();
     };
-    let original = Value::Object(tool_call.arguments.clone().into_iter().collect());
+    let original = Value::Object(tool_call.arguments.clone());
     let prepared = prepare(original.clone());
     if prepared == original {
         return tool_call.clone();
     }
     let mut call = tool_call.clone();
     call.arguments = match prepared {
-        Value::Object(map) => map.into_iter().collect(),
+        Value::Object(map) => map,
         other => {
-            let mut map = std::collections::HashMap::new();
+            let mut map = serde_json::Map::new();
             map.insert("_".into(), other);
             map
         }
@@ -47,7 +47,7 @@ pub fn validate_tool_arguments(
     tool: &ToolDefinition,
     tool_call: &ToolCall,
 ) -> Result<Value, String> {
-    let args = Value::Object(tool_call.arguments.clone().into_iter().collect());
+    let args = Value::Object(tool_call.arguments.clone());
     if let Err(errors) = validate_value(&args, &tool.parameters, "$") {
         let joined = errors
             .into_iter()

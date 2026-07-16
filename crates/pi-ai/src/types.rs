@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -224,7 +224,7 @@ pub struct ImageContent {
 pub struct ToolCall {
     pub id: String,
     pub name: String,
-    pub arguments: HashMap<String, Value>,
+    pub arguments: Map<String, Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thought_signature: Option<String>,
 }

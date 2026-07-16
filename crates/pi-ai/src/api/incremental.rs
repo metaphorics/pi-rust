@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::{
     json_parse::parse_streaming_json,
@@ -668,7 +668,7 @@ impl WireEventDecoder for PiDecoder {
                     Content::ToolCall(ToolCall {
                         id: event["id"].as_str().unwrap_or("").to_owned(),
                         name: event["toolName"].as_str().unwrap_or("").to_owned(),
-                        arguments: HashMap::new(),
+                        arguments: Map::new(),
                         thought_signature: None,
                     }),
                 );
@@ -686,10 +686,7 @@ impl WireEventDecoder for PiDecoder {
                 if let Some(Content::ToolCall(call)) = self.message.content.get_mut(index)
                     && let Some(arguments) = parse_streaming_json(json).as_object()
                 {
-                    call.arguments = arguments
-                        .iter()
-                        .map(|(key, value)| (key.clone(), value.clone()))
-                        .collect();
+                    call.arguments = arguments.clone();
                 }
                 events.push(AssistantMessageEvent::ToolcallDelta {
                     content_index: index,
@@ -743,6 +740,73 @@ impl WireEventDecoder for PiDecoder {
             Ok(Vec::new())
         } else {
             Err("pi-messages stream ended without a terminal event".into())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{Api, ModelCost, ModelInput};
+    use serde_json::json;
+
+    fn model() -> Model {
+        Model {
+            id: "test-model".into(),
+            name: "Test Model".into(),
+            api: Api::from("pi-messages"),
+            provider: "test-provider".into(),
+            base_url: "https://example.test".into(),
+            reasoning: false,
+            thinking_level_map: None,
+            input: vec![ModelInput::Text],
+            cost: ModelCost::default(),
+            context_window: 16_384,
+            max_tokens: 128,
+            headers: None,
+            compat: None,
+        }
+    }
+
+    #[test]
+    fn pi_event_partials_keep_tool_argument_order() {
+        let mut decoder = PiDecoder::new(&model());
+        decoder
+            .push_frame(
+                &json!({
+                    "type": "toolcall_start",
+                    "contentIndex": 0,
+                    "id": "call-ordered",
+                    "toolName": "ordered"
+                })
+                .to_string(),
+            )
+            .unwrap();
+
+        for (fragment, expected) in [
+            (r#"{"z":1,"#, r#"{"z":1}"#),
+            (r#""a":2,"#, r#"{"z":1,"a":2}"#),
+            (r#""m":3}"#, r#"{"z":1,"a":2,"m":3}"#),
+        ] {
+            let events = decoder
+                .push_frame(
+                    &json!({
+                        "type": "toolcall_delta",
+                        "contentIndex": 0,
+                        "delta": fragment
+                    })
+                    .to_string(),
+                )
+                .unwrap();
+            let AssistantMessageEvent::ToolcallDelta { partial, .. } =
+                events.last().expect("tool-call delta event")
+            else {
+                panic!("expected tool-call delta");
+            };
+            let Content::ToolCall(call) = &partial.content[0] else {
+                panic!("expected tool call");
+            };
+            assert_eq!(serde_json::to_string(&call.arguments).unwrap(), expected);
         }
     }
 }
