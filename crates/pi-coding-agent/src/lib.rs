@@ -3,6 +3,7 @@
 //! Port of packages/coding-agent.
 
 pub mod config;
+pub mod cli;
 pub mod extension_bridge;
 pub mod migrations;
 pub mod resource_loader;
@@ -11,6 +12,11 @@ pub mod session_manager;
 pub mod session_types;
 pub mod settings_manager;
 
+pub use cli::{
+    args, parse_args, get_help_text, validate_arg_combinations, Args, Mode, AppMode, ThinkingLevel, ListModels,
+    UnknownFlagValue, Diagnostic, DiagnosticType, ExtensionFlag, resolve_app_mode,
+    to_print_output_mode, is_plain_runtime_metadata_command,
+};
 pub use config::{
     APP_NAME, CONFIG_DIR_NAME, PACKAGE_NAME, encode_session_cwd, env_agent_dir_key,
     env_session_dir_key, get_agent_dir, get_auth_path, get_default_session_dir_path,
