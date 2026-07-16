@@ -5,6 +5,7 @@
 pub mod config;
 pub mod cli;
 pub mod extension_bridge;
+pub mod extensions;
 pub mod migrations;
 pub mod resource_loader;
 pub mod serde_util;
@@ -35,6 +36,11 @@ pub use config::{
 pub use extension_bridge::{
     DiscoveredExtensions, ExtensionBridge, ForkPosition, HookOutcome, NoopExtensionBridge,
     SessionLifecycleEvent, SessionShutdownReason, SessionStartReason,
+};
+pub use extensions::{
+    BridgeState, BunEnvironment, ClientConfig, ClientError, DeadReason, DisabledReason,
+    ExtensionHost, ExtensionHostConfig, ExtensionPathError, HostError, Incoming, LauncherSource,
+    LoadOutcome, SidecarConnection, SidecarLauncher, SidecarTimeouts,
 };
 pub use migrations::{MigrationResult, run_migrations, run_migrations_with_agent_dir};
 pub use resource_loader::{
