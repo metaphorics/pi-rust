@@ -1501,15 +1501,10 @@ fn collect_manifest_files(
     if source_entries.is_empty() {
         return Vec::new();
     }
-    let all = collect_resource_files(root, resource_type);
     let mut selected = HashSet::new();
     for entry in source_entries {
         if has_glob(entry) {
-            for path in &all {
-                if matches_patterns(path, &[entry.as_str()], root, false) {
-                    selected.insert(path.clone());
-                }
-            }
+            selected.extend(collect_glob_resource_files(root, resource_type, entry));
         } else {
             let path = root.join(entry);
             if path.is_dir() {
@@ -1525,6 +1520,178 @@ fn collect_manifest_files(
 }
 
 fn collect_resource_files(root: &Path, resource_type: ResourceType) -> Vec<PathBuf> {
+    match resource_type {
+        ResourceType::Extensions => collect_extension_entries(root),
+        ResourceType::Skills => collect_skill_entries(root),
+        ResourceType::Prompts | ResourceType::Themes => {
+            collect_recursive_resource_files(root, resource_type)
+        }
+    }
+}
+
+fn collect_extension_entries(root: &Path) -> Vec<PathBuf> {
+    if !root.exists() {
+        return Vec::new();
+    }
+    if root.is_file() {
+        return ResourceType::Extensions
+            .accepts(root)
+            .then(|| canonical_or(root.to_path_buf()))
+            .into_iter()
+            .collect();
+    }
+    if let Some(entries) = resolve_extension_entries(root) {
+        return entries;
+    }
+
+    let mut paths = Vec::new();
+    for entry in WalkBuilder::new(root)
+        .max_depth(Some(1))
+        .hidden(true)
+        .git_ignore(true)
+        .ignore(true)
+        .parents(false)
+        .require_git(false)
+        .follow_links(true)
+        .filter_entry(|entry| entry.file_name() != OsStr::new("node_modules"))
+        .build()
+        .filter_map(std::result::Result::ok)
+        .skip(1)
+    {
+        let path = entry.path();
+        if path.is_file() && ResourceType::Extensions.accepts(path) {
+            paths.push(canonical_or(path.to_path_buf()));
+        } else if path.is_dir()
+            && let Some(entries) = resolve_extension_entries(path)
+        {
+            paths.extend(entries);
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn resolve_extension_entries(root: &Path) -> Option<Vec<PathBuf>> {
+    if let Some(entries) = read_pi_manifest(root)
+        .as_ref()
+        .and_then(|manifest| string_array(manifest.get(ResourceType::Extensions.key())))
+    {
+        let resolved = entries
+            .into_iter()
+            .map(|entry| root.join(entry))
+            .filter(|path| path.exists())
+            .map(canonical_or)
+            .collect::<Vec<_>>();
+        if !resolved.is_empty() {
+            return Some(resolved);
+        }
+    }
+    for name in ["index.ts", "index.js"] {
+        let path = root.join(name);
+        if path.is_file() {
+            return Some(vec![canonical_or(path)]);
+        }
+    }
+    None
+}
+
+fn collect_skill_entries(root: &Path) -> Vec<PathBuf> {
+    if !root.exists() {
+        return Vec::new();
+    }
+    if root.is_file() {
+        return (root.file_name() == Some(OsStr::new("SKILL.md"))
+            || root.extension() == Some(OsStr::new("md")))
+        .then(|| canonical_or(root.to_path_buf()))
+        .into_iter()
+        .collect();
+    }
+
+    let canonical_root = canonical_or(root.to_path_buf());
+    let mut root_markdown = Vec::new();
+    let mut skill_paths = Vec::new();
+    for entry in WalkBuilder::new(root)
+        .hidden(true)
+        .git_ignore(true)
+        .ignore(true)
+        .parents(false)
+        .require_git(false)
+        .follow_links(true)
+        .filter_entry(|entry| entry.file_name() != OsStr::new("node_modules"))
+        .build()
+        .filter_map(std::result::Result::ok)
+        .skip(1)
+    {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let path = canonical_or(path.to_path_buf());
+        if entry.depth() == 1 && path.extension() == Some(OsStr::new("md")) {
+            root_markdown.push(path.clone());
+        }
+        if path.file_name() == Some(OsStr::new("SKILL.md")) {
+            skill_paths.push(path);
+        }
+    }
+
+    let root_skill = canonical_root.join("SKILL.md");
+    if skill_paths.contains(&root_skill) {
+        return vec![root_skill];
+    }
+    let visible_skills = skill_paths.iter().cloned().collect::<HashSet<_>>();
+    for path in skill_paths {
+        let shadowed = path
+            .parent()
+            .and_then(Path::parent)
+            .into_iter()
+            .flat_map(|ancestor| ancestor.ancestors())
+            .take_while(|ancestor| *ancestor != canonical_root)
+            .any(|ancestor| visible_skills.contains(&ancestor.join("SKILL.md")));
+        if !shadowed {
+            root_markdown.push(path);
+        }
+    }
+    root_markdown.sort();
+    root_markdown.dedup();
+    root_markdown
+}
+
+fn collect_glob_resource_files(
+    root: &Path,
+    resource_type: ResourceType,
+    pattern: &str,
+) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for entry in WalkBuilder::new(root)
+        .hidden(true)
+        .git_ignore(true)
+        .ignore(true)
+        .parents(false)
+        .require_git(false)
+        .follow_links(true)
+        .filter_entry(|entry| entry.file_name() != OsStr::new("node_modules"))
+        .build()
+        .filter_map(std::result::Result::ok)
+        .skip(1)
+    {
+        let path = entry.path();
+        if !matches_patterns(path, &[pattern], root, false) {
+            continue;
+        }
+        if path.is_dir() {
+            paths.extend(collect_resource_files(path, resource_type));
+        } else if path.is_file() && resource_type.accepts(path) {
+            paths.push(canonical_or(path.to_path_buf()));
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn collect_recursive_resource_files(root: &Path, resource_type: ResourceType) -> Vec<PathBuf> {
     if !root.exists() {
         return Vec::new();
     }
@@ -1541,6 +1708,9 @@ fn collect_resource_files(root: &Path, resource_type: ResourceType) -> Vec<PathB
         .git_ignore(true)
         .ignore(true)
         .parents(false)
+        .require_git(false)
+        .follow_links(true)
+        .filter_entry(|entry| entry.file_name() != OsStr::new("node_modules"))
         .build()
         .filter_map(std::result::Result::ok)
     {
@@ -1550,6 +1720,7 @@ fn collect_resource_files(root: &Path, resource_type: ResourceType) -> Vec<PathB
         }
     }
     paths.sort();
+    paths.dedup();
     paths
 }
 

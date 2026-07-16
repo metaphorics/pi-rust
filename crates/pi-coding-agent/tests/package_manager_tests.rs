@@ -389,6 +389,197 @@ fn falls_back_to_package_index_extension() {
 }
 
 #[test]
+fn convention_discovery_only_loads_extension_entries_and_skills() {
+    let (_temp, cwd, agent) = fixture();
+    let package = cwd.join("convention-package");
+    let extensions = package.join("extensions");
+    let skills = package.join("skills");
+    fs::create_dir_all(extensions.join("with-index")).unwrap();
+    fs::create_dir_all(extensions.join("with-manifest/src")).unwrap();
+    fs::create_dir_all(extensions.join("helper-directory/nested")).unwrap();
+    fs::create_dir_all(extensions.join("ignored-directory")).unwrap();
+    fs::create_dir_all(skills.join("nested-skill/deeper")).unwrap();
+    fs::create_dir_all(skills.join("container/child-skill")).unwrap();
+
+    fs::write(extensions.join("root.ts"), "export default () => {};").unwrap();
+    fs::write(extensions.join("root.js"), "export default () => {};").unwrap();
+    fs::write(
+        extensions.join(".gitignore"),
+        "ignored-root.ts\nignored-directory/\n",
+    )
+    .unwrap();
+    fs::write(
+        extensions.join("ignored-root.ts"),
+        "export default () => {};",
+    )
+    .unwrap();
+    fs::write(
+        extensions.join("ignored-directory/index.ts"),
+        "export default () => {};",
+    )
+    .unwrap();
+    fs::write(extensions.join("root.md"), "not an extension").unwrap();
+    fs::write(
+        extensions.join("with-index/index.ts"),
+        "export default () => {};",
+    )
+    .unwrap();
+    fs::write(
+        extensions.join("with-index/index.js"),
+        "export default () => {};",
+    )
+    .unwrap();
+    fs::write(
+        extensions.join("with-manifest/package.json"),
+        serde_json::to_vec(&json!({ "pi": { "extensions": ["src/entry.ts"] } })).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        extensions.join("with-manifest/src/entry.ts"),
+        "export default () => {};",
+    )
+    .unwrap();
+    fs::write(
+        extensions.join("with-manifest/index.ts"),
+        "export default () => {};",
+    )
+    .unwrap();
+    fs::write(
+        extensions.join("helper-directory/helper.ts"),
+        "export const helper = true;",
+    )
+    .unwrap();
+    fs::write(
+        extensions.join("helper-directory/nested/index.ts"),
+        "export default () => {};",
+    )
+    .unwrap();
+
+    fs::write(skills.join("root.md"), "root skill").unwrap();
+    fs::write(skills.join("helper.txt"), "not a skill").unwrap();
+    fs::write(
+        skills.join("nested-skill/SKILL.md"),
+        "---\nname: nested\n---\n",
+    )
+    .unwrap();
+    fs::write(
+        skills.join("nested-skill/helper.md"),
+        "not a separate skill",
+    )
+    .unwrap();
+    fs::write(
+        skills.join("nested-skill/deeper/SKILL.md"),
+        "---\nname: shadowed\n---\n",
+    )
+    .unwrap();
+    fs::write(
+        skills.join("container/child-skill/SKILL.md"),
+        "---\nname: child\n---\n",
+    )
+    .unwrap();
+
+    let mut settings = Settings::new();
+    settings.insert("packages", json!([package.to_string_lossy()]));
+    let mut manager = DefaultPackageManager::with_runner(
+        &cwd,
+        &agent,
+        SettingsManager::in_memory(settings, true),
+        RecordingRunner::default(),
+    );
+
+    let resources = manager.resolve().unwrap();
+    let extension_paths = resources
+        .extensions
+        .iter()
+        .map(|resource| {
+            resource
+                .path
+                .strip_prefix(&extensions)
+                .unwrap()
+                .to_path_buf()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        extension_paths,
+        vec![
+            PathBuf::from("root.js"),
+            PathBuf::from("root.ts"),
+            PathBuf::from("with-index/index.ts"),
+            PathBuf::from("with-manifest/src/entry.ts"),
+        ]
+    );
+    let skill_paths = resources
+        .skills
+        .iter()
+        .map(|resource| resource.path.strip_prefix(&skills).unwrap().to_path_buf())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        skill_paths,
+        vec![
+            PathBuf::from("container/child-skill/SKILL.md"),
+            PathBuf::from("nested-skill/SKILL.md"),
+            PathBuf::from("root.md"),
+        ]
+    );
+}
+
+#[test]
+fn skill_directory_with_skill_file_is_a_single_entry() {
+    let (_temp, cwd, agent) = fixture();
+    let package = cwd.join("root-skill-package");
+    let skills = package.join("skills");
+    fs::create_dir_all(skills.join("nested")).unwrap();
+    fs::write(skills.join("SKILL.md"), "---\nname: root\n---\n").unwrap();
+    fs::write(skills.join("helper.md"), "not a separate skill").unwrap();
+    fs::write(skills.join("nested/SKILL.md"), "---\nname: nested\n---\n").unwrap();
+
+    let mut settings = Settings::new();
+    settings.insert("packages", json!([package.to_string_lossy()]));
+    let mut manager = DefaultPackageManager::with_runner(
+        &cwd,
+        &agent,
+        SettingsManager::in_memory(settings, true),
+        RecordingRunner::default(),
+    );
+
+    let resources = manager.resolve().unwrap();
+    assert_eq!(resources.skills.len(), 1);
+    assert!(resources.skills[0].path.ends_with("skills/SKILL.md"));
+}
+
+#[test]
+fn ignored_parent_skill_does_not_suppress_nested_skill() {
+    let (_temp, cwd, agent) = fixture();
+    let package = cwd.join("ignored-parent-skill-package");
+    let skills = package.join("skills");
+    fs::create_dir_all(skills.join("parent/nested")).unwrap();
+    fs::write(skills.join(".gitignore"), "parent/SKILL.md\n").unwrap();
+    fs::write(skills.join("parent/SKILL.md"), "---\nname: ignored\n---\n").unwrap();
+    fs::write(
+        skills.join("parent/nested/SKILL.md"),
+        "---\nname: nested\n---\n",
+    )
+    .unwrap();
+
+    let mut settings = Settings::new();
+    settings.insert("packages", json!([package.to_string_lossy()]));
+    let mut manager = DefaultPackageManager::with_runner(
+        &cwd,
+        &agent,
+        SettingsManager::in_memory(settings, true),
+        RecordingRunner::default(),
+    );
+
+    let resources = manager.resolve().unwrap();
+    assert_eq!(resources.skills.len(), 1);
+    assert!(
+        resources.skills[0]
+            .path
+            .ends_with("skills/parent/nested/SKILL.md")
+    );
+}
+
+#[test]
 fn applies_pattern_precedence() {
     let root = PathBuf::from("/fixture");
     let paths = vec![root.join("a.ts"), root.join("b.ts")];
