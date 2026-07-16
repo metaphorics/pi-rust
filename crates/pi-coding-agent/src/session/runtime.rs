@@ -125,45 +125,53 @@ impl AgentSessionRuntime {
         self.bridge.clone()
     }
 
-    fn emit_before_switch(
+    async fn emit_before_switch(
         &self,
         reason: SessionStartReason,
         target_session_file: Option<PathBuf>,
     ) -> bool {
         matches!(
             self.bridge
-                .emit_lifecycle(&SessionLifecycleEvent::SessionBeforeSwitch {
+                .emit_lifecycle(SessionLifecycleEvent::SessionBeforeSwitch {
                     reason,
                     target_session_file,
-                }),
+                })
+                .await,
             HookOutcome::Cancel
         )
     }
 
-    fn emit_before_fork(&self, entry_id: &str, position: ForkPosition) -> bool {
+    async fn emit_before_fork(&self, entry_id: &str, position: ForkPosition) -> bool {
         matches!(
             self.bridge
-                .emit_lifecycle(&SessionLifecycleEvent::SessionBeforeFork {
+                .emit_lifecycle(SessionLifecycleEvent::SessionBeforeFork {
                     entry_id: entry_id.to_string(),
                     position,
-                }),
+                })
+                .await,
             HookOutcome::Cancel
         )
     }
 
     /// Oracle `teardownCurrent`: shutdown hooks, then dispose the session.
+    ///
+    /// Sync on purpose (`dispose` runs in signal handlers): `session_shutdown`
+    /// is a non-blocking event, and the [`ExtensionBridge`] contract requires
+    /// it to be enqueued before the returned future — dropping the future
+    /// loses nothing.
     fn teardown_current(
         &self,
         reason: SessionShutdownReason,
         target_session_file: Option<PathBuf>,
     ) {
         let session = self.session();
-        let _ = self
-            .bridge
-            .emit_lifecycle(&SessionLifecycleEvent::SessionShutdown {
-                reason,
-                target_session_file,
-            });
+        drop(
+            self.bridge
+                .emit_lifecycle(SessionLifecycleEvent::SessionShutdown {
+                    reason,
+                    target_session_file,
+                }),
+        );
         session.dispose();
     }
 
@@ -191,10 +199,10 @@ impl AgentSessionRuntime {
         session_path: &Path,
         cwd_override: Option<&str>,
     ) -> Result<ReplaceResult, String> {
-        if self.emit_before_switch(
-            SessionStartReason::Resume,
-            Some(session_path.to_path_buf()),
-        ) {
+        if self
+            .emit_before_switch(SessionStartReason::Resume, Some(session_path.to_path_buf()))
+            .await
+        {
             return Ok(ReplaceResult {
                 cancelled: true,
                 selected_text: None,
@@ -228,7 +236,7 @@ impl AgentSessionRuntime {
         &self,
         parent_session: Option<String>,
     ) -> Result<ReplaceResult, String> {
-        if self.emit_before_switch(SessionStartReason::New, None) {
+        if self.emit_before_switch(SessionStartReason::New, None).await {
             return Ok(ReplaceResult {
                 cancelled: true,
                 selected_text: None,
@@ -283,7 +291,7 @@ impl AgentSessionRuntime {
         entry_id: &str,
         position: ForkPosition,
     ) -> Result<ReplaceResult, String> {
-        if self.emit_before_fork(entry_id, position) {
+        if self.emit_before_fork(entry_id, position).await {
             return Ok(ReplaceResult {
                 cancelled: true,
                 selected_text: None,
@@ -421,6 +429,37 @@ impl AgentSessionRuntime {
             cancelled: false,
             selected_text,
         })
+    }
+
+    /// Recreate the runtime in place with reason `reload` (oracle
+    /// `ctx.reload()`): shutdown hooks fire to the OLD extension runtime,
+    /// `between` runs the extension-runtime reload, then the same session
+    /// manager moves into a fresh runtime and the rebind callback fires.
+    ///
+    /// If `between` fails the current session is already disposed; the
+    /// caller surfaces the error and the process continues extension-less.
+    pub async fn reload_session(
+        &self,
+        between: impl Future<Output = Result<(), String>> + Send,
+    ) -> Result<(), String> {
+        let session = self.session();
+        let previous_session_file = session.session_file();
+        self.teardown_current(SessionShutdownReason::Reload, previous_session_file.clone());
+        between.await?;
+        let session_manager = session.take_session_manager();
+        let agent_dir = self.services().agent_dir.clone();
+        let cwd = self.cwd();
+        let result = (self.create_runtime)(CreateRuntimeOptions {
+            cwd,
+            agent_dir,
+            session_manager,
+            session_start_reason: SessionStartReason::Reload,
+            previous_session_file,
+        })
+        .await?;
+        self.apply(result);
+        self.finish_session_replacement();
+        Ok(())
     }
 
     /// Shut down the runtime (oracle `dispose`).

@@ -21,8 +21,12 @@
 //! floods) can always drain. Without a consumer the init timeout still bounds
 //! the failure.
 
+pub mod actions;
+pub mod binding;
 pub mod client;
 pub mod detect;
+pub mod events;
+pub mod session_sync;
 pub mod spawn;
 pub mod state;
 
@@ -228,6 +232,50 @@ impl ExtensionHost {
     /// across respawns; take it before the first [`ensure_ready`](Self::ensure_ready).
     pub fn take_incoming(&self) -> Option<mpsc::Receiver<Incoming>> {
         self.incoming_rx.lock().take()
+    }
+
+    /// The live connection, if any (no spawn, no respawn).
+    pub async fn current_connection(&self) -> Option<Arc<SidecarConnection>> {
+        let mut inner = self.inner.lock().await;
+        self.refresh(&mut inner);
+        inner.connection.clone()
+    }
+
+    /// In-place extension reload (`ctx.reload()`): re-send `lifecycle/init`
+    /// on the LIVE connection. The sidecar re-discovers and re-loads
+    /// extensions (pi's runner replacement — no process restart) and emits a
+    /// fresh `lifecycle/initialized` before answering. Requires `Ready`.
+    pub async fn reinit(&self) -> Result<InitializedParams, HostError> {
+        let connection = {
+            let mut inner = self.inner.lock().await;
+            self.refresh(&mut inner);
+            match (&inner.state, &inner.connection) {
+                (BridgeState::Ready, Some(connection)) => Arc::clone(connection),
+                (BridgeState::NotNeeded, _) => return Err(HostError::NotNeeded),
+                (BridgeState::Disabled(reason), _) => {
+                    return Err(HostError::Disabled(reason.clone()));
+                }
+                (BridgeState::Dead(DeadReason::Shutdown) | BridgeState::Draining, _) => {
+                    return Err(HostError::ShutDown);
+                }
+                (BridgeState::Dead(reason), _) => {
+                    return Err(HostError::Failed(reason.clone()));
+                }
+                _ => {
+                    return Err(HostError::Failed(DeadReason::LoadFailed(
+                        "sidecar is not ready for reload".to_string(),
+                    )));
+                }
+            }
+        };
+        let mut params = (self.init)();
+        params.configured_paths = self.paths.iter().map(|p| path_string(p)).collect();
+        connection
+            .request_timeout(Request::LifecycleInit(Box::new(params)), self.timeouts.init)
+            .await?;
+        connection
+            .initialized()
+            .ok_or_else(|| HostError::Decode("reload without lifecycle/initialized".to_string()))
     }
 
     /// Current lifecycle state (a dead connection is folded in).

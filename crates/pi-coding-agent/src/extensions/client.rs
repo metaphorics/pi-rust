@@ -358,7 +358,7 @@ impl PendingReply {
     }
 
     /// Retire a timed-out request without letting cancellation exceed its deadline.
-    fn try_cancel(self) {
+    pub(super) fn try_cancel(self) {
         self.shared.pending.lock().map.remove(&self.id.get());
         if let Ok(bytes) = encode_frame(&Envelope::Cancel { id: self.id }) {
             let _ = self.shared.writer.try_send(bytes);

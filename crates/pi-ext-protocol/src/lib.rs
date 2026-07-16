@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 
-use pi_ai::{AssistantMessageEvent, Content, Context, Message, Model, ThinkingLevel, ToolResultMessage};
+use pi_ai::{AssistantMessageEvent, Content, Context, Message, Model, ModelThinkingLevel, ToolResultMessage};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -546,7 +546,7 @@ pub enum ExtensionEvent {
     ToolExecutionUpdate { tool_call_id: String, tool_name: String, args: Value, partial_result: Value },
     ToolExecutionEnd { tool_call_id: String, tool_name: String, result: Value, is_error: bool },
     ModelSelect { model: Box<Model>, #[serde(skip_serializing_if = "Option::is_none")] previous_model: Option<Box<Model>>, source: ModelSelectSource },
-    ThinkingLevelSelect { level: ThinkingLevel, previous_level: ThinkingLevel },
+    ThinkingLevelSelect { level: ModelThinkingLevel, previous_level: ModelThinkingLevel },
     UserBash { command: String, exclude_from_context: bool, cwd: String },
     Input { text: String, #[serde(skip_serializing_if = "Option::is_none")] images: Option<Vec<pi_ai::ImageContent>>, source: InputSource, #[serde(skip_serializing_if = "Option::is_none")] streaming_behavior: Option<StreamingBehavior> },
     ToolCall { tool_call_id: String, tool_name: String, input: Value },
@@ -644,7 +644,7 @@ pub struct StateBlock {
     pub active_tools: Vec<String>,
     pub all_tools: Vec<ToolInfo>,
     pub commands: Vec<CommandInfo>,
-    pub thinking_level: ThinkingLevel,
+    pub thinking_level: ModelThinkingLevel,
     #[serde(skip_serializing_if = "Option::is_none")] pub context_usage: Option<ContextUsageDto>,
     pub system_prompt: String,
     #[serde(skip_serializing_if = "Option::is_none")] pub system_prompt_options: Option<BuildSystemPromptOptions>,
@@ -660,7 +660,7 @@ pub struct StateBlock {
 pub struct StateUpdate {
     #[serde(skip_serializing_if = "Option::is_none")] pub model: Option<Model>,
     #[serde(skip_serializing_if = "Option::is_none")] pub idle: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")] pub thinking_level: Option<ThinkingLevel>,
+    #[serde(skip_serializing_if = "Option::is_none")] pub thinking_level: Option<ModelThinkingLevel>,
     #[serde(skip_serializing_if = "Option::is_none")] pub active_tools: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")] pub context_usage: Option<ContextUsageDto>,
     #[serde(skip_serializing_if = "Option::is_none")] pub system_prompt: Option<String>,
@@ -765,7 +765,7 @@ pub struct SetLabelParams { pub entry_id: String, #[serde(skip_serializing_if = 
 #[serde(rename_all = "camelCase")]
 pub struct SetActiveToolsParams { pub tool_names: Vec<String> }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SetThinkingLevelParams { pub level: ThinkingLevel }
+pub struct SetThinkingLevelParams { pub level: ModelThinkingLevel }
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct CompactParams { #[serde(skip_serializing_if = "Option::is_none")] pub options: Option<Value> }
 
@@ -979,7 +979,7 @@ mod tests {
         StateBlock {
             session_name: None, model: None, idle: true, project_trusted: true,
             pending_messages: false, active_tools: vec![], all_tools: vec![], commands: vec![],
-            thinking_level: ThinkingLevel::Minimal, context_usage: None, system_prompt: String::new(),
+            thinking_level: ModelThinkingLevel::Minimal, context_usage: None, system_prompt: String::new(),
             system_prompt_options: None, flag_values: BTreeMap::new(), editor_text: String::new(),
             tools_expanded: false, footer: None, theme: ThemeDto { name: "default".into(), json: json!({}) },
         }
@@ -1059,7 +1059,7 @@ mod tests {
             Notification::ActionSetLabel(SetLabelParams { entry_id: "e".into(), label: None }),
             Notification::ActionSetActiveTools(SetActiveToolsParams { tool_names: vec!["read".into()] }),
             Notification::ActionRefreshTools(Empty {}), Notification::ActionShutdown(Empty {}), Notification::ActionAbort(Empty {}),
-            Notification::ActionSetThinkingLevel(SetThinkingLevelParams { level: ThinkingLevel::High }),
+            Notification::ActionSetThinkingLevel(SetThinkingLevelParams { level: ModelThinkingLevel::High }),
             Notification::ActionCompact(CompactParams::default()),
             Notification::UiNotify(NotifyParams { message: "hi".into(), level: NotificationLevel::Info }),
             Notification::UiSetStatus(KeyValueParams { key: "x".into(), value: None }),
@@ -1119,7 +1119,7 @@ mod tests {
             ExtensionEvent::ToolExecutionUpdate { tool_call_id: "t".into(), tool_name: "x".into(), args: json!({}), partial_result: json!({}) },
             ExtensionEvent::ToolExecutionEnd { tool_call_id: "t".into(), tool_name: "x".into(), result: json!({}), is_error: false },
             ExtensionEvent::ModelSelect { model: Box::new(model()), previous_model: None, source: ModelSelectSource::Set },
-            ExtensionEvent::ThinkingLevelSelect { level: ThinkingLevel::High, previous_level: ThinkingLevel::Low },
+            ExtensionEvent::ThinkingLevelSelect { level: ModelThinkingLevel::High, previous_level: ModelThinkingLevel::Low },
             ExtensionEvent::UserBash { command: "true".into(), exclude_from_context: false, cwd: "/x".into() },
             ExtensionEvent::Input { text: "x".into(), images: None, source: InputSource::Rpc, streaming_behavior: None },
             ExtensionEvent::ToolCall { tool_call_id: "t".into(), tool_name: "x".into(), input: json!({"future":1}) },

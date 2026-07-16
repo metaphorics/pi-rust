@@ -1072,7 +1072,10 @@ impl ExtensionBridge for RecordingBridge {
     fn discovered_paths(&self) -> &[PathBuf] {
         &self.paths
     }
-    fn emit_lifecycle(&self, event: &SessionLifecycleEvent) -> HookOutcome {
+    fn emit_lifecycle(
+        &self,
+        event: SessionLifecycleEvent,
+    ) -> std::pin::Pin<Box<dyn Future<Output = HookOutcome> + Send + 'static>> {
         let tag = match event {
             SessionLifecycleEvent::SessionStart { .. } => "session_start",
             SessionLifecycleEvent::SessionBeforeSwitch { .. } => "session_before_switch",
@@ -1080,11 +1083,12 @@ impl ExtensionBridge for RecordingBridge {
             SessionLifecycleEvent::SessionShutdown { .. } => "session_shutdown",
         };
         self.log.lock().push(tag.to_string());
-        if self.cancel_next.swap(false, Ordering::SeqCst) {
+        let outcome = if self.cancel_next.swap(false, Ordering::SeqCst) {
             HookOutcome::Cancel
         } else {
             HookOutcome::Continue
-        }
+        };
+        Box::pin(std::future::ready(outcome))
     }
 }
 
