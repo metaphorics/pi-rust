@@ -1294,3 +1294,113 @@ async fn runtime_switch_new_and_fork_replace_sessions() {
 
     runtime.dispose();
 }
+
+// ============================================================================
+// 9. Causal regressions: turn-history refresh, settle order, atomic run claim
+// ============================================================================
+
+/// Stream fn capturing the LLM `Context` of every provider call, then
+/// replaying a script (error message when exhausted, like `scripted_stream_fn`).
+fn capturing_stream_fn(
+    script: Arc<Mutex<VecDeque<AssistantMessage>>>,
+    contexts: Arc<Mutex<Vec<pi_ai::Context>>>,
+) -> StreamFn {
+    Arc::new(move |model: Model, context, _options| {
+        let script = script.clone();
+        let contexts = contexts.clone();
+        Box::pin(async move {
+            contexts.lock().push(context);
+            let stream = pi_ai::create_assistant_message_event_stream();
+            let message = script.lock().pop_front().unwrap_or_else(|| {
+                let mut error = assistant_text_message(&model, "");
+                error.stop_reason = StopReason::Error;
+                error.error_message = Some("script exhausted".to_string());
+                error
+            });
+            stream.push(AssistantMessageEvent::Done {
+                reason: message.stop_reason,
+                message,
+            });
+            stream
+        })
+    })
+}
+
+fn context_roles(context: &pi_ai::Context) -> Vec<&'static str> {
+    context
+        .messages
+        .iter()
+        .map(|m| match m {
+            Message::User(_) => "user",
+            Message::Assistant(_) => "assistant",
+            _ => "toolResult",
+        })
+        .collect()
+}
+
+/// prepare_next_turn must preserve the turn's accumulated messages: the
+/// second provider call of a tool loop sees user + assistant(toolCall) +
+/// toolResult, not an empty history (agent-session.ts:483-489 spreads
+/// `turn.context`).
+#[tokio::test(flavor = "multi_thread")]
+async fn tool_loop_second_provider_call_receives_turn_history() {
+    let contexts: Arc<Mutex<Vec<pi_ai::Context>>> = Arc::new(Mutex::new(Vec::new()));
+    let fixture = {
+        let contexts = contexts.clone();
+        tokio::task::spawn_blocking(move || {
+            let script = Arc::new(Mutex::new(VecDeque::new()));
+            let mut options = FixtureOptions {
+                stream_fn: Some(capturing_stream_fn(script.clone(), contexts)),
+                ..Default::default()
+            };
+            options.custom_tools = vec![noop_tool("echo")];
+            let fixture = make_fixture(vec![], options);
+            // Call 1: assistant issues a tool call; call 2: plain text.
+            let mut tool_call_reply = assistant_text_message(&fixture.model, "calling echo");
+            tool_call_reply.content.push(Content::ToolCall(pi_ai::ToolCall {
+                id: "call-1".to_string(),
+                name: "echo".to_string(),
+                arguments: std::collections::HashMap::new(),
+                thought_signature: None,
+            }));
+            tool_call_reply.stop_reason = StopReason::ToolUse;
+            script.lock().push_back(tool_call_reply);
+            script
+                .lock()
+                .push_back(assistant_text_message(&fixture.model, "done"));
+            fixture
+        })
+        .await
+        .expect("fixture")
+    };
+    let session = fixture.session.clone();
+
+    session
+        .prompt("use the tool", PromptOptions::default())
+        .await
+        .expect("prompt");
+
+    let contexts = contexts.lock();
+    assert_eq!(contexts.len(), 2, "tool loop makes two provider calls");
+    assert_eq!(context_roles(&contexts[0]), vec!["user"]);
+    // Mutation guard: a prepare_next_turn that wipes messages makes this [].
+    assert_eq!(
+        context_roles(&contexts[1]),
+        vec!["user", "assistant", "toolResult"],
+        "assistant + tool result history must reach provider call 2"
+    );
+    let Message::Assistant(assistant) = &contexts[1].messages[1] else {
+        panic!("expected assistant message");
+    };
+    assert!(
+        assistant.content.iter().any(|c| matches!(
+            c,
+            Content::ToolCall(tc) if tc.id == "call-1"
+        )),
+        "call-2 history carries the original tool call"
+    );
+    assert_eq!(
+        session.get_last_assistant_text().as_deref(),
+        Some("done")
+    );
+}

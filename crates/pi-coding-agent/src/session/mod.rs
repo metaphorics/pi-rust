@@ -1178,7 +1178,7 @@ impl AgentSession {
         // reapply the session's system prompt / tools / model / thinking level
         // before each provider call.
         let prepare_inner = inner.clone();
-        config.prepare_next_turn = Some(Arc::new(move |_ctx| {
+        config.prepare_next_turn = Some(Arc::new(move |ctx| {
             let prepare_inner = prepare_inner.clone();
             Box::pin(async move {
                 let state = prepare_inner.state.lock();
@@ -1188,7 +1188,10 @@ impl AgentSession {
                             .system_prompt_override
                             .clone()
                             .unwrap_or_else(|| state.base_system_prompt.clone()),
-                        messages: Vec::new(), // replaced below by loop semantics
+                        // Oracle spreads `turn.context` (agent-session.ts:483-489):
+                        // the turn's accumulated messages are preserved verbatim;
+                        // only system prompt / tools / model / thinking refresh.
+                        messages: ctx.context.messages,
                         tools: active_tool_definitions(&state),
                     }),
                     model: state.model.clone(),
