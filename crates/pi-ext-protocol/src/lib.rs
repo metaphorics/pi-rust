@@ -155,6 +155,10 @@ pub enum Request {
     UiAutocomplete(AutocompleteParams),
     #[serde(rename = "ui/terminal_input")]
     UiTerminalInput(TerminalInputParams),
+    #[serde(rename = "ui/getAllThemes")]
+    UiGetAllThemes(Empty),
+    #[serde(rename = "ui/getTheme")]
+    UiGetTheme(NameParams),
     #[serde(rename = "tool/execute")]
     ToolExecute(ToolExecuteParams),
     #[serde(rename = "provider/stream")]
@@ -355,9 +359,14 @@ pub struct UserBashEventResult {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CancelledResult { pub cancelled: bool }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct TerminalInputResult { pub consumed: bool }
+pub struct TerminalInputResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub consume: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -417,6 +426,21 @@ pub enum ExtensionMode { Tui, Rpc, Json, Print }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ThemeDto { pub name: String, pub json: Value }
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThemeCatalogEntry {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct GetAllThemesResult(pub Vec<ThemeCatalogEntry>);
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct GetThemeResult(pub Option<ThemeDto>);
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -718,10 +742,13 @@ pub struct SwitchSessionParams { pub session_path: String, #[serde(skip_serializ
 pub struct SendMessageParams { pub message: Value, #[serde(skip_serializing_if = "Option::is_none")] pub trigger_turn: Option<bool>, #[serde(skip_serializing_if = "Option::is_none")] pub deliver_as: Option<Delivery> }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SendUserMessageParams { pub content: Value, #[serde(skip_serializing_if = "Option::is_none")] pub deliver_as: Option<Delivery> }
+pub struct SendUserMessageParams { pub content: Value, #[serde(skip_serializing_if = "Option::is_none")] pub deliver_as: Option<UserMessageDelivery> }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Delivery { Steer, FollowUp, NextTurn }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UserMessageDelivery { Steer, FollowUp }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppendEntryParams { pub custom_type: String, #[serde(skip_serializing_if = "Option::is_none")] pub data: Option<Value> }
@@ -1000,6 +1027,8 @@ mod tests {
             Request::UiRender(RenderParams { slot: "footer".into(), width: 80 }),
             Request::UiAutocomplete(AutocompleteParams { text: "/x".into(), cursor: 2, command_name: Some("x".into()) }),
             Request::UiTerminalInput(TerminalInputParams { data: "a".into() }),
+            Request::UiGetAllThemes(Empty {}),
+            Request::UiGetTheme(NameParams { name: "dark".into() }),
             Request::ToolExecute(ToolExecuteParams { tool_call_id: "t".into(), name: "x".into(), args: json!({"nested":[1,true]}) }),
             Request::ProviderStream(Box::new(ProviderStreamParams { stream_id: "s".into(), provider: "p".into(), model: model(), context: Context::default(), options: None })),
             Request::CommandExecute(CommandExecuteParams { name: "x".into(), args: "a".into() }),
@@ -1107,6 +1136,22 @@ mod tests {
     }
 
     #[test]
+    fn send_user_message_rejects_next_turn_delivery() {
+        let invalid = br#"{"type":"ev","method":"action/sendUserMessage","params":{"content":"later","deliverAs":"nextTurn"}}
+"#;
+        assert!(matches!(decode_frame(invalid), Err(FrameError::Malformed(_))));
+
+        let valid = Envelope::Event {
+            event: Notification::ActionSendMessage(SendMessageParams {
+                message: json!("later"),
+                trigger_turn: None,
+                deliver_as: Some(Delivery::NextTurn),
+            }),
+        };
+        assert_eq!(decode_frame(&encode_frame(&valid).unwrap()).unwrap(), valid);
+    }
+
+    #[test]
     fn rejects_unknown_version_malformed_and_oversize_frames() {
         let hello = HelloParams { protocol: 2, pi: PI_COMPAT_VERSION.into(), bun: "1".into() };
         assert!(matches!(hello.negotiate(), Err(VersionError::Unsupported { received: 2, supported: 1 })));
@@ -1149,6 +1194,21 @@ mod tests {
         let expected = SessionBeforeForkResult { cancel: Some(true), skip_conversation_restore: Some(false) };
         let result = ResponseResult::ok(&expected).unwrap();
         assert_eq!(result.decode_ok::<SessionBeforeForkResult>().unwrap(), Some(expected));
+
+        let terminal_input = TerminalInputResult { consume: Some(false), data: Some("rewritten".into()) };
+        let result = ResponseResult::ok(&terminal_input).unwrap();
+        assert_eq!(result.decode_ok::<TerminalInputResult>().unwrap(), Some(terminal_input));
+
+        let catalog = GetAllThemesResult(vec![
+            ThemeCatalogEntry { name: "dark".into(), path: Some("/themes/dark.json".into()) },
+            ThemeCatalogEntry { name: "builtin".into(), path: None },
+        ]);
+        let result = ResponseResult::ok(&catalog).unwrap();
+        assert_eq!(result.decode_ok::<GetAllThemesResult>().unwrap(), Some(catalog));
+
+        let theme = GetThemeResult(Some(ThemeDto { name: "dark".into(), json: json!({"name":"dark"}) }));
+        let result = ResponseResult::ok(&theme).unwrap();
+        assert_eq!(result.decode_ok::<GetThemeResult>().unwrap(), Some(theme));
     }
 
     #[test]
