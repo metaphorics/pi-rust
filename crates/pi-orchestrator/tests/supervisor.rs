@@ -3,13 +3,14 @@ mod support {
 }
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use parking_lot::Mutex;
 use pi_orchestrator::radius::{Presence, PresenceCoordinator, RadiusError};
-use pi_orchestrator::storage::Storage;
-use pi_orchestrator::supervisor::{NullPresence, SpawnOptions, Supervisor};
+use pi_orchestrator::storage::{Storage, StorageOp};
+use pi_orchestrator::supervisor::{NullPresence, SpawnOptions, Supervisor, SupervisorError};
 use pi_orchestrator::types::{InstanceRecord, InstanceStatus, MachineRecord};
 use pi_orchestrator::wire::RpcCommandEnvelope;
 use serde_json::{Value, json};
@@ -599,4 +600,197 @@ async fn shutdown_stops_every_live_instance() {
             "interleaved disconnects: {disconnects:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn stop_disposes_child_even_when_radius_disconnect_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let probe = Storage::new(dir.path());
+    let fake = FakePi::new();
+    let marker = fake.options().cwd.join("sigterm.marker");
+    let (presence, log) = TestPresence::with_hooks(
+        Box::new(|mut instance| {
+            instance.radius_pi_id = Some("radius-1".into());
+            Ok(instance)
+        }),
+        Box::new(|_| Err(RadiusError::MissingCredentials)),
+    );
+    let supervisor = Supervisor::new(Storage::new(dir.path()), presence);
+    let record = supervisor
+        .spawn_instance(spawn_options(&fake))
+        .await
+        .unwrap();
+
+    let error = supervisor.stop_instance(&record.id).await.unwrap_err();
+
+    // The disconnect failure is the primary error (removal succeeded), yet
+    // the child was still disposed and the finally semantics completed.
+    assert!(
+        matches!(error, SupervisorError::Radius(_)),
+        "expected the disconnect error, got: {error}"
+    );
+    assert!(
+        marker.exists(),
+        "disconnect failure skipped disposing the child"
+    );
+    assert_eq!(probe.load_instances().unwrap(), []);
+    assert!(supervisor.list_live_instances().is_empty());
+    assert!(
+        log.entries()
+            .contains(&format!("disconnect-start:{}", record.id)),
+        "disconnect was never attempted"
+    );
+}
+
+#[tokio::test]
+async fn spawn_leaves_no_phantom_when_the_initial_persist_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Storage::new(dir.path()).with_fault_injection(|op| match op {
+        StorageOp::UpsertInstance(_) => {
+            Err(std::io::Error::other("injected initial persist").into())
+        }
+        _ => Ok(()),
+    });
+    let supervisor = Supervisor::new(storage, Arc::new(NullPresence));
+
+    let error = supervisor
+        .spawn_instance(exiting_child_options(dir.path()))
+        .await
+        .unwrap_err();
+
+    // The persist failure surfaces unmasked: nothing was acquired yet.
+    assert_eq!(error.to_string(), "injected initial persist");
+    assert!(
+        supervisor.list_live_instances().is_empty(),
+        "failed initial persist left a phantom live entry"
+    );
+    assert_eq!(Storage::new(dir.path()).load_instances().unwrap(), []);
+}
+
+#[tokio::test]
+async fn failed_record_removal_keeps_stop_retryable() {
+    let dir = tempfile::tempdir().unwrap();
+    let probe = Storage::new(dir.path());
+    let fake = FakePi::new();
+    let marker = fake.options().cwd.join("sigterm.marker");
+    let failing = Arc::new(AtomicBool::new(true));
+    let storage_flag = Arc::clone(&failing);
+    let storage = Storage::new(dir.path()).with_fault_injection(move |op| match op {
+        StorageOp::RemoveInstance(_) if storage_flag.load(Ordering::SeqCst) => {
+            Err(std::io::Error::other("injected removal failure").into())
+        }
+        _ => Ok(()),
+    });
+    let presence_flag = Arc::clone(&failing);
+    let (presence, log) = TestPresence::with_hooks(
+        Box::new(|mut instance| {
+            instance.radius_pi_id = Some("radius-1".into());
+            Ok(instance)
+        }),
+        Box::new(move |_| {
+            if presence_flag.load(Ordering::SeqCst) {
+                Err(RadiusError::MissingCredentials)
+            } else {
+                Ok(())
+            }
+        }),
+    );
+    let supervisor = Supervisor::new(storage, presence);
+    let record = supervisor
+        .spawn_instance(spawn_options(&fake))
+        .await
+        .unwrap();
+
+    let error = supervisor.stop_instance(&record.id).await.unwrap_err();
+
+    // Removal failure is primary (oracle finally-throw supersedes); the
+    // disconnect failure is the masked, logged secondary.
+    assert_eq!(error.to_string(), "injected removal failure");
+    // Teardown still ran to the end: the child is gone.
+    assert!(marker.exists(), "failed stop leaked the child");
+    // Retryable, coherent state: live entry kept and both the live and the
+    // stored view still say `stopping` (the stop is incomplete), with the
+    // radius registration still held.
+    let lingering = supervisor.get_live_instance(&record.id).unwrap();
+    assert_eq!(lingering.status, InstanceStatus::Stopping);
+    let stored = probe.load_instances().unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].status, InstanceStatus::Stopping);
+
+    failing.store(false, Ordering::SeqCst);
+    let stopped = supervisor.stop_instance(&record.id).await.unwrap().unwrap();
+
+    assert_eq!(stopped.status, InstanceStatus::Stopped);
+    assert!(supervisor.list_live_instances().is_empty());
+    assert_eq!(probe.load_instances().unwrap(), []);
+    // The retry released the still-held radius registration: one failed and
+    // one successful disconnect.
+    let starts = log
+        .entries()
+        .iter()
+        .filter(|entry| entry.starts_with("disconnect-start:"))
+        .count();
+    assert_eq!(starts, 2, "retry did not re-attempt the radius disconnect");
+}
+
+#[tokio::test]
+async fn fail_spawn_tears_down_even_when_every_persist_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let probe = Storage::new(dir.path());
+    let fake = FakePi::new();
+    let marker = fake.options().cwd.join("sigterm.marker");
+    let upserts = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&upserts);
+    let storage = Storage::new(dir.path()).with_fault_injection(move |op| match op {
+        StorageOp::UpsertInstance(_) => {
+            let call = counter.fetch_add(1, Ordering::SeqCst) + 1;
+            // Calls: 1 initial persist, 2 session sync; storage then dies for
+            // 3 the radiusPiId persist (the spawn error) and, inside
+            // failSpawn, 4 the `error` persist and 5 the `stopped` persist.
+            if call >= 3 {
+                Err(std::io::Error::other(format!("injected #{call}")).into())
+            } else {
+                Ok(())
+            }
+        }
+        _ => Ok(()),
+    });
+    let (presence, log) = TestPresence::assigning("radius-1");
+    let supervisor = Supervisor::new(storage, presence);
+
+    let error = supervisor
+        .spawn_instance(spawn_options(&fake))
+        .await
+        .unwrap_err();
+
+    // Stacked failures: the last one wins (JS masking), so the `stopped`
+    // persist supersedes the `error` persist and the original spawn error.
+    assert_eq!(error.to_string(), "injected #5");
+    assert_eq!(
+        upserts.load(Ordering::SeqCst),
+        5,
+        "failSpawn skipped a persist"
+    );
+    // Teardown was not bypassed: the held radius registration was released
+    // and the child disposed despite every persist failing.
+    let stored = probe.load_instances().unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(
+        stored[0].status,
+        InstanceStatus::Starting,
+        "stored record should keep the last successfully persisted state"
+    );
+    assert!(
+        log.entries()
+            .contains(&format!("disconnect:{}:radius-1", stored[0].id)),
+        "failSpawn with failing persists skipped the radius disconnect"
+    );
+    assert!(
+        marker.exists(),
+        "failSpawn with failing persists leaked the child"
+    );
+    assert!(
+        supervisor.list_live_instances().is_empty(),
+        "live entry survived failSpawn"
+    );
 }

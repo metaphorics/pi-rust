@@ -143,11 +143,19 @@ impl Supervisor {
             radius_pi_id: None,
         };
         let live = Arc::new(LiveInstance::new(record.clone()));
+        let id = record.id.clone();
         self.inner
             .live
             .lock()
             .insert(record.id.clone(), Arc::clone(&live));
-        self.inner.storage.upsert_instance(record)?;
+        if let Err(error) = self.inner.storage.upsert_instance(record) {
+            // Nothing has been acquired yet (no child, no bindings, no
+            // Radius registration), so a failed initial persist only has to
+            // drop the just-inserted live entry: otherwise the map keeps a
+            // phantom `starting` instance that no stored record backs.
+            self.inner.live.lock().remove(&id);
+            return Err(error.into());
+        }
 
         match self.inner.try_spawn(&live, options).await {
             Ok(record) => Ok(record),
@@ -163,16 +171,27 @@ impl Supervisor {
 
         self.inner.set_status(&live, InstanceStatus::Stopping)?;
         let cleanup = self.inner.cleanup_acquired_resources(&live).await;
-        // Oracle finally block: mark stopped in memory (no upsert), drop the
-        // live entry, and remove the persisted record.
+        // Oracle finally block: mark stopped in memory (no upsert) and remove
+        // the persisted record. Deviation: the oracle drops the live entry
+        // before the removal, so a removal failure strands the stored record
+        // forever (a later stop sees no live instance and returns early).
+        // Here a failed removal keeps the live entry and both views stay
+        // `stopping` — a coherent incomplete stop that can be retried; the
+        // entry only becomes `stopped` and is dropped once the record is
+        // removed. The removal error is primary (oracle finally-throw
+        // supersedes the cleanup error); the masked cleanup error is logged.
+        if let Err(remove_error) = self.inner.storage.remove_instance(instance_id) {
+            if let Err(cleanup_error) = cleanup {
+                log::error!("Masked cleanup error while stopping {instance_id}: {cleanup_error}");
+            }
+            return Err(remove_error.into());
+        }
         {
             let mut record = live.record.lock();
             record.status = InstanceStatus::Stopped;
             record.last_seen_at = Some(now_iso_timestamp());
         }
         self.inner.live.lock().remove(instance_id);
-        let removed = self.inner.storage.remove_instance(instance_id);
-        removed?;
         cleanup?;
         Ok(Some(live.record.lock().clone()))
     }
@@ -309,27 +328,38 @@ impl Inner {
     }
 
     /// Oracle failSpawn: persist `error`, release resources, persist
-    /// `stopped`, drop the live entry, and propagate. A cleanup or persist
-    /// failure replaces the original error, exactly as the TS try/finally
-    /// does. The stored record intentionally survives as `stopped`.
+    /// `stopped`, drop the live entry, and propagate. Deviation: the oracle
+    /// aborts on the first persist failure, leaking the child; here teardown
+    /// always runs. The returned error keeps JS masking semantics — every
+    /// later failure supersedes an earlier one, so the `stopped` persist
+    /// failure (the oracle's finally-throw) wins over the cleanup error,
+    /// which wins over the `error` persist failure, which wins over the
+    /// original spawn error — and every masked error is logged. The stored
+    /// record intentionally survives as `stopped`.
     async fn fail_spawn(
         self: &Arc<Self>,
         live: &Arc<LiveInstance>,
         error: SupervisorError,
     ) -> SupervisorError {
-        if let Err(persist) = self.set_status(live, InstanceStatus::Error) {
-            return persist.into();
-        }
-        let cleanup = self.cleanup_acquired_resources(live).await;
-        if let Err(persist) = self.set_status(live, InstanceStatus::Stopped) {
-            return persist.into();
-        }
+        let error_persist = self.set_status(live, InstanceStatus::Error).err();
+        let cleanup = self.cleanup_acquired_resources(live).await.err();
+        let stopped_persist = self.set_status(live, InstanceStatus::Stopped).err();
         let id = live.record.lock().id.clone();
         self.live.lock().remove(&id);
-        match cleanup {
-            Err(cleanup_error) => cleanup_error,
-            Ok(()) => error,
+
+        let mut primary = error;
+        for superseding in [
+            error_persist.map(Into::into),
+            cleanup,
+            stopped_persist.map(Into::into),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            log::error!("Masked error while failing spawn of {id}: {primary}");
+            primary = superseding;
         }
+        primary
     }
 
     async fn bind_rpc_process(
@@ -454,25 +484,36 @@ impl Inner {
 
     /// Release everything spawn acquired: bindings, Radius registration
     /// (disconnected before the child is disposed), then the child itself.
-    /// The in-memory `radiusPiId` clear is deliberately not persisted,
-    /// matching the oracle.
+    /// A disconnect failure no longer skips disposing the child: the error
+    /// is held, the radius state is kept so a retry can disconnect again,
+    /// and the failure is returned after teardown. The in-memory
+    /// `radiusPiId` clear is deliberately not persisted, matching the
+    /// oracle.
     async fn cleanup_acquired_resources(self: &Arc<Self>, live: &Arc<LiveInstance>) -> Result<()> {
         let process = live.resources.lock().rpc_process.clone();
         live.clear_bindings(true).await;
         let has_radius = live.resources.lock().radius_pi_id.is_some();
+        let mut disconnect_error = None;
         if has_radius {
             let record = live.record.lock().clone();
-            self.presence.disconnect_pi(&record).await?;
-            live.resources.lock().radius_pi_id = None;
-            let mut record = live.record.lock();
-            record.radius_pi_id = None;
-            record.last_seen_at = Some(now_iso_timestamp());
+            match self.presence.disconnect_pi(&record).await {
+                Ok(()) => {
+                    live.resources.lock().radius_pi_id = None;
+                    let mut record = live.record.lock();
+                    record.radius_pi_id = None;
+                    record.last_seen_at = Some(now_iso_timestamp());
+                }
+                Err(error) => disconnect_error = Some(error),
+            }
         }
         if let Some(process) = process {
             live.resources.lock().rpc_process = None;
             process.dispose().await;
         }
-        Ok(())
+        match disconnect_error {
+            Some(error) => Err(error.into()),
+            None => Ok(()),
+        }
     }
 
     fn set_status(&self, live: &LiveInstance, status: InstanceStatus) -> Result<(), StorageError> {
