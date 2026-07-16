@@ -18,8 +18,6 @@ pub enum WireError {
     ExpectedObject,
     #[error("missing or invalid string field `{0}`")]
     InvalidStringField(&'static str),
-    #[error("missing or invalid boolean field `{0}`")]
-    InvalidBooleanField(&'static str),
 }
 
 pub type Result<T, E = WireError> = std::result::Result<T, E>;
