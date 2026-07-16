@@ -1419,12 +1419,14 @@ dependencies = [
  "pi-coding-agent",
  "rand 0.9.5",
  "reqwest",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror",
  "tokio",
  "url",
+ "uuid",
 ]
 
 [[package]]

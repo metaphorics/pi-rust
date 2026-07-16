@@ -20,11 +20,15 @@ pi-coding-agent = { path = "../pi-coding-agent" }
 rand = "0.9"
 # Rustls HTTP transport for optional Radius presence.
 reqwest.workspace = true
+# Process-group and signal handling for RPC children.
+rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-# Radius heartbeat tasks and cancellation.
+# Async process, IPC, heartbeat, and cancellation runtime.
 tokio.workspace = true
+# Request ids matching the oracle's randomUUID suffix.
+uuid = { version = "1", features = ["v4"] }
 # WHATWG-compatible URL resolution for Radius endpoints.
 url = "2"
 
