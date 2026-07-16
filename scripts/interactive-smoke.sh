@@ -16,11 +16,15 @@ cd "$WORKTREE"
 export TMPDIR="$WORKTREE/target/tmp"
 mkdir -p "$TMPDIR"
 
-# Clean up tmux session on exit
+# Clean up tmux sessions on exit
 SESSION=""
+SUS_SESSION=""
 cleanup() {
     if [ -n "${SESSION:-}" ]; then
         tmux kill-session -t "$SESSION" 2>/dev/null || true
+    fi
+    if [ -n "${SUS_SESSION:-}" ]; then
+        tmux kill-session -t "$SUS_SESSION" 2>/dev/null || true
     fi
 }
 trap cleanup EXIT
@@ -181,8 +185,78 @@ wait_for_not "Session Tree" 10 || fail "double-escape selector close"
 sleep 1.0
 pass "double-escape tree selector"
 
-# (9) /quit + Enter; poll until tmux has-session -t "$SESSION" fails
-echo "Step 9: Testing quit..."
+# (9) Ctrl+Z suspend: under a job-controlling shell the process must stop
+# (SIGTSTP to its own process group), resume on fg, and repaint with
+# working input. A dedicated session is used because a direct pane command
+# is an orphaned process group whose SIGTSTP is discarded by the kernel.
+echo "Step 9: Testing Ctrl+Z suspend/resume..."
+SUS_SESSION="pi_smoke_sus_$$"
+tmux new-session -d -s "$SUS_SESSION" -x 100 -y 30 bash || fail "suspend session start"
+tmux send-keys -t "$SUS_SESSION" -l "TMPDIR='$TMPDIR' '$WORKTREE/target/debug/examples/interactive_smoke'"
+tmux send-keys -t "$SUS_SESSION" Enter
+
+sus_wait() {
+    local regex="$1"; local timeout_s="$2"; local check=0
+    while [ "$check" -lt $((timeout_s * 5)) ]; do
+        if tmux capture-pane -pt "$SUS_SESSION" -S - | grep -qE "$regex"; then
+            return 0
+        fi
+        sleep 0.2; check=$((check + 1))
+    done
+    return 1
+}
+
+sus_wait "thinking off" 15 || fail "suspend: startup under shell"
+sleep 1.0
+SHELL_PID=$(tmux list-panes -t "$SUS_SESSION" -F '#{pane_pid}')
+SMOKE_PID=$(pgrep -P "$SHELL_PID" -f interactive_smoke | head -1)
+[ -n "$SMOKE_PID" ] || fail "suspend: smoke pid not found"
+
+tmux send-keys -t "$SUS_SESSION" C-z
+stop_poll=0
+while [ "$stop_poll" -lt 50 ]; do
+    state=$(ps -o stat= -p "$SMOKE_PID" 2>/dev/null || true)
+    case "$state" in *T*) break ;; esac
+    sleep 0.2
+    stop_poll=$((stop_poll + 1))
+done
+case "$(ps -o stat= -p "$SMOKE_PID" 2>/dev/null || true)" in
+    *T*) : ;;
+    *) fail "suspend: process did not stop on Ctrl+Z" ;;
+esac
+# The shell got the terminal back and reports the stopped job.
+sus_wait "Stopped|suspended" 5 || fail "suspend: shell did not report stopped job"
+
+# Resume with fg
+tmux send-keys -t "$SUS_SESSION" -l 'fg'
+tmux send-keys -t "$SUS_SESSION" Enter
+run_poll=0
+while [ "$run_poll" -lt 50 ]; do
+    state=$(ps -o stat= -p "$SMOKE_PID" 2>/dev/null || true)
+    case "$state" in *T*) sleep 0.2; run_poll=$((run_poll + 1)) ;; *) break ;; esac
+done
+case "$(ps -o stat= -p "$SMOKE_PID" 2>/dev/null || true)" in
+    *T*) fail "resume: process still stopped after fg" ;;
+esac
+# UI must repaint (footer marker in the CURRENT viewport) and accept input.
+resume_poll=0
+while [ "$resume_poll" -lt 50 ]; do
+    if tmux capture-pane -pt "$SUS_SESSION" | grep -qE "thinking off"; then break; fi
+    sleep 0.2
+    resume_poll=$((resume_poll + 1))
+done
+tmux capture-pane -pt "$SUS_SESSION" | grep -qE "thinking off" || fail "resume: UI did not repaint"
+tmux send-keys -t "$SUS_SESSION" -l 'resumed-input-check'
+sus_wait "resumed-input-check" 10 || fail "resume: input not accepted"
+tmux send-keys -t "$SUS_SESSION" -l '/quit'
+tmux send-keys -t "$SUS_SESSION" Enter
+sleep 1.0
+tmux kill-session -t "$SUS_SESSION" 2>/dev/null || true
+SUS_SESSION=""
+pass "suspend/resume"
+
+# (10) /quit + Enter; poll until tmux has-session -t "$SESSION" fails
+echo "Step 10: Testing quit..."
 tmux send-keys -t "$SESSION" -l '/quit'
 tmux send-keys -t "$SESSION" Enter
 

@@ -932,6 +932,21 @@ impl Tui {
         self.terminal.stop();
     }
 
+    /// Ctrl+Z suspend: show the cursor and hand the terminal back to the
+    /// shell without tearing down input plumbing (see `Terminal::suspend`).
+    pub fn suspend(&mut self) {
+        self.terminal.show_cursor();
+        self.terminal.suspend();
+    }
+
+    /// SIGCONT resume: re-enter raw mode and schedule a full repaint (the
+    /// shell overwrote the screen while suspended).
+    pub fn resume(&mut self) {
+        self.terminal.resume();
+        self.invalidate();
+        self.request_render(true);
+    }
+
     pub fn add_input_listener<F>(&mut self, f: F)
     where
         F: FnMut(&str) -> Option<InputListenerResult> + 'static,

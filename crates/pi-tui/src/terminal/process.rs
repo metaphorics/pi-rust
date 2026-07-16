@@ -835,6 +835,43 @@ impl Terminal for ProcessTerminal {
         Self::write_stdout(&format!("\x1b]0;{title}\x07"));
     }
 
+    /// Suspend teardown (oracle: `ui.stop()` before SIGTSTP): clear
+    /// progress, disable bracketed paste, pop Kitty protocol, restore
+    /// termios. The stdin reader thread, channels, and handlers stay
+    /// alive — `stop()`'s thread detach + a second `start()` would race
+    /// two readers on the same fd after resume.
+    fn suspend(&mut self) {
+        if self.progress_active {
+            Self::write_stdout(TERMINAL_PROGRESS_CLEAR_SEQUENCE);
+            self.progress_active = false;
+            self.progress_last_emit = None;
+        }
+        Self::write_stdout("\x1b[?2004l");
+        let should_disable_kitty = self.keyboard_protocol_pushed || self.kitty_protocol_active;
+        self.clear_keyboard_protocol_negotiation_buffer();
+        if should_disable_kitty {
+            Self::write_stdout("\x1b[<u");
+            self.keyboard_protocol_pushed = false;
+            self.kitty_protocol_active = false;
+            set_kitty_protocol_active(false);
+        }
+        self.disable_modify_other_keys();
+        self.restore_termios();
+    }
+
+    /// Resume after SIGCONT (oracle: `ui.start()` in the SIGCONT handler):
+    /// mirrors `start()` minus thread/handler setup. Self-SIGWINCH refreshes
+    /// dimensions lost while stopped (terminal.ts:152-156).
+    fn resume(&mut self) {
+        let _ = self.enable_raw_mode();
+        self.stdin_segmenter = Segmenter::default();
+        Self::write_stdout("\x1b[?2004h");
+        Self::signal_sigwinch_self();
+        self.keyboard_protocol_pushed = true;
+        self.clear_keyboard_protocol_negotiation_buffer();
+        Self::write_stdout(KITTY_KEYBOARD_PROTOCOL_QUERY);
+    }
+
     fn set_progress(&mut self, active: bool) {
         if active {
             Self::write_stdout(TERMINAL_PROGRESS_ACTIVE_SEQUENCE);

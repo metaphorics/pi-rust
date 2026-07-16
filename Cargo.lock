@@ -1414,6 +1414,7 @@ dependencies = [
  "globset",
  "ignore",
  "jiff",
+ "libc",
  "parking_lot",
  "pi-agent",
  "pi-ai",

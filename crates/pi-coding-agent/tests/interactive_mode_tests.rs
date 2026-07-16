@@ -750,6 +750,59 @@ async fn anthropic_subscription_warning_respects_setting_and_key_prefix() {
     );
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn ctrl_z_suspends_terminal_signals_and_resumes_with_full_repaint() {
+    use std::rc::Rc;
+
+    let test = make_runtime(TestRuntimeOptions::default()).await;
+    let (terminal, handle) = VtTerminal::new(80, 24);
+    let signal_log: Rc<std::cell::RefCell<Vec<&'static str>>> =
+        Rc::new(std::cell::RefCell::new(Vec::new()));
+    let suspend_signal = {
+        let signal_log = Rc::clone(&signal_log);
+        let handle = handle.clone();
+        Rc::new(move || {
+            // At signal time the terminal must already be suspended and not
+            // yet resumed (oracle: ui.stop() precedes SIGTSTP).
+            assert_eq!(handle.lifecycle(), vec!["suspend"]);
+            signal_log.borrow_mut().push("sigtstp");
+        })
+    };
+    let mut mode = InteractiveMode::new(
+        test.runtime.clone(),
+        terminal,
+        InteractiveModeOptions {
+            suspend_signal: Some(suspend_signal),
+            ..Default::default()
+        },
+    );
+    mode.init();
+    mode.pump();
+    let frames_before = handle.screen(pi_vt::VtScreen::sync_frames_completed);
+
+    // Ctrl+Z (0x1a) through the editor interceptor.
+    send(&mut mode, &handle, "\x1a");
+    mode.pump();
+
+    assert_eq!(
+        *signal_log.borrow(),
+        vec!["sigtstp"],
+        "SIGTSTP step must run"
+    );
+    assert_eq!(handle.lifecycle(), vec!["suspend", "resume"]);
+    let frames_after = handle.screen(pi_vt::VtScreen::sync_frames_completed);
+    assert!(
+        frames_after > frames_before,
+        "resume must repaint ({frames_before} -> {frames_after})"
+    );
+    // UI recovered: footer still present, input still works.
+    send(&mut mode, &handle, "after resume");
+    mode.pump();
+    let screen = handle.screen(pi_vt::VtScreen::serialize);
+    assert!(screen.contains("after resume"), "{screen}");
+    assert_no_flicker(&handle);
+}
+
 /// Fg color of the editor's bottom border (last full-width `─` row).
 fn editor_border_fg(handle: &VtHandle) -> pi_vt::Color {
     handle.screen(|screen| {

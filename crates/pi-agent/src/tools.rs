@@ -58,8 +58,7 @@ pub fn validate_tool_arguments(
             "Validation failed for tool \"{}\":\n{}\n\nReceived arguments:\n{}",
             tool_call.name,
             joined,
-            serde_json::to_string_pretty(&tool_call.arguments)
-                .unwrap_or_else(|_| "{}".into())
+            serde_json::to_string_pretty(&tool_call.arguments).unwrap_or_else(|_| "{}".into())
         ));
     }
     Ok(args)

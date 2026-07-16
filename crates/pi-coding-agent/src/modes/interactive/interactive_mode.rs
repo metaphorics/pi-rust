@@ -122,6 +122,10 @@ pub struct InteractiveModeOptions {
     pub handle_signals: bool,
     /// Time source for double-press windows (tests inject a fake clock).
     pub clock: Option<Rc<dyn Fn() -> Instant>>,
+    /// Process-stopping step of Ctrl+Z suspend (tests inject a recorder).
+    /// The default ignores SIGINT, sends SIGTSTP to the process group, and
+    /// restores SIGINT after SIGCONT resumes execution.
+    pub suspend_signal: Option<Rc<dyn Fn()>>,
 }
 
 // ============================================================================
@@ -337,6 +341,7 @@ enum AppAction {
     Interrupt,
     Clear,
     Exit,
+    Suspend,
     ThinkingCycle,
     ModelCycleForward,
     ModelCycleBackward,
@@ -354,6 +359,7 @@ enum AppAction {
 
 const INTERCEPTED_ACTIONS: &[(&str, AppAction)] = &[
     ("app.clear", AppAction::Clear),
+    ("app.suspend", AppAction::Suspend),
     ("app.thinking.cycle", AppAction::ThinkingCycle),
     ("app.model.cycleForward", AppAction::ModelCycleForward),
     ("app.model.cycleBackward", AppAction::ModelCycleBackward),
@@ -376,6 +382,28 @@ const ANTHROPIC_SUBSCRIPTION_AUTH_WARNING: &str = "Anthropic subscription auth i
 fn is_anthropic_subscription_auth_key(api_key: &str) -> bool {
     api_key.starts_with("sk-ant-oat")
 }
+
+/// Default Ctrl+Z process stop: ignore SIGINT while suspended (oracle
+/// :3646-3649 — Ctrl+C at the shell must not kill the backgrounded
+/// process), SIGTSTP the whole process group (oracle :3663-3664,
+/// `process.kill(0, "SIGTSTP")`), then restore the previous SIGINT
+/// disposition once SIGCONT resumes us.
+#[cfg(unix)]
+fn suspend_process_group() {
+    unsafe {
+        let mut ignore: libc::sigaction = std::mem::zeroed();
+        let mut previous: libc::sigaction = std::mem::zeroed();
+        ignore.sa_sigaction = libc::SIG_IGN;
+        libc::sigemptyset(&mut ignore.sa_mask);
+        libc::sigaction(libc::SIGINT, &ignore, &mut previous);
+        libc::kill(0, libc::SIGTSTP);
+        // Execution continues here after SIGCONT.
+        libc::sigaction(libc::SIGINT, &previous, std::ptr::null_mut());
+    }
+}
+
+#[cfg(not(unix))]
+fn suspend_process_group() {}
 
 /// Escape-handler override while a background task runs (oracle swaps
 /// `defaultEditor.onEscape` and restores it afterwards).
@@ -525,6 +553,8 @@ pub struct InteractiveMode {
     anthropic_subscription_warning_shown: bool,
     /// Monotonic time source (defaults to `Instant::now`).
     now: Rc<dyn Fn() -> Instant>,
+    /// Ctrl+Z process-stop step (see `InteractiveModeOptions::suspend_signal`).
+    suspend_signal: Rc<dyn Fn()>,
     is_bash_mode: bool,
     selector_open: bool,
     startup_messages: VecDeque<String>,
@@ -557,6 +587,10 @@ impl InteractiveMode {
             .clock
             .clone()
             .unwrap_or_else(|| Rc::new(Instant::now));
+        let suspend_signal: Rc<dyn Fn()> = options
+            .suspend_signal
+            .clone()
+            .unwrap_or_else(|| Rc::new(suspend_process_group));
         let session = runtime.session();
         let services = runtime.services();
 
@@ -767,6 +801,7 @@ impl InteractiveMode {
             last_escape_time: None,
             anthropic_subscription_warning_shown: false,
             now: clock,
+            suspend_signal,
             is_bash_mode: false,
             selector_open: false,
             compaction_queued: Vec::new(),
@@ -1287,6 +1322,7 @@ impl InteractiveMode {
             AppAction::Exit => {
                 self.exit = Some(ExitReason::Quit);
             }
+            AppAction::Suspend => self.handle_ctrl_z(),
             AppAction::ThinkingCycle => {
                 if self.session.cycle_thinking_level().is_some() {
                     self.footer.borrow_mut().invalidate();
@@ -1390,6 +1426,21 @@ impl InteractiveMode {
             self.editor.borrow_mut().set_text("");
             self.last_sigint_time = Some(now);
         }
+    }
+
+    /// Oracle `handleCtrlZ` (:3635-3670): restore the terminal, stop the
+    /// process group with SIGINT ignored, and on SIGCONT re-enter raw mode
+    /// and force a full repaint. `kill(0, SIGTSTP)` stops the calling
+    /// process before returning, so the code after the signal step runs
+    /// only once the process is continued (fg/SIGCONT).
+    fn handle_ctrl_z(&mut self) {
+        if cfg!(windows) {
+            self.show_status("Suspend to background is not supported on Windows");
+            return;
+        }
+        self.tui.suspend();
+        (self.suspend_signal)();
+        self.tui.resume();
     }
 
     /// Oracle `updateEditorBorderColor` (:3713-3721): bash mode wins, else

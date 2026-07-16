@@ -4,7 +4,7 @@ use std::{future::Future, pin::Pin, sync::Arc};
 
 use parking_lot::Mutex;
 use pi_ai::{
-    AssistantMessage, AssistantMessageEvent, AssistantMessageEventStream, Context, Content,
+    AssistantMessage, AssistantMessageEvent, AssistantMessageEventStream, Content, Context,
     ImageContent, Message, Model, TextContent, ThinkingLevel, ToolCall, ToolResultMessage,
     UserMessage,
 };
@@ -242,8 +242,7 @@ impl AgentToolResult {
 }
 
 /// Partial-result callback for streaming tool execution.
-pub type AgentToolUpdateCallback =
-    Arc<dyn Fn(AgentToolResult) + Send + Sync + 'static>;
+pub type AgentToolUpdateCallback = Arc<dyn Fn(AgentToolResult) + Send + Sync + 'static>;
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -396,29 +395,21 @@ pub type ConvertToLlmFn =
     Arc<dyn Fn(Vec<AgentMessage>) -> BoxFuture<'static, Vec<Message>> + Send + Sync>;
 
 pub type TransformContextFn = Arc<
-    dyn Fn(
-            Vec<AgentMessage>,
-            Option<CancellationToken>,
-        ) -> BoxFuture<'static, Vec<AgentMessage>>
+    dyn Fn(Vec<AgentMessage>, Option<CancellationToken>) -> BoxFuture<'static, Vec<AgentMessage>>
         + Send
         + Sync,
 >;
 
-pub type GetApiKeyFn =
-    Arc<dyn Fn(String) -> BoxFuture<'static, Option<String>> + Send + Sync>;
+pub type GetApiKeyFn = Arc<dyn Fn(String) -> BoxFuture<'static, Option<String>> + Send + Sync>;
 
-pub type ShouldStopAfterTurnFn = Arc<
-    dyn Fn(ShouldStopAfterTurnContext) -> BoxFuture<'static, bool> + Send + Sync,
->;
+pub type ShouldStopAfterTurnFn =
+    Arc<dyn Fn(ShouldStopAfterTurnContext) -> BoxFuture<'static, bool> + Send + Sync>;
 
 pub type PrepareNextTurnFn = Arc<
-    dyn Fn(PrepareNextTurnContext) -> BoxFuture<'static, Option<AgentLoopTurnUpdate>>
-        + Send
-        + Sync,
+    dyn Fn(PrepareNextTurnContext) -> BoxFuture<'static, Option<AgentLoopTurnUpdate>> + Send + Sync,
 >;
 
-pub type GetMessagesFn =
-    Arc<dyn Fn() -> BoxFuture<'static, Vec<AgentMessage>> + Send + Sync>;
+pub type GetMessagesFn = Arc<dyn Fn() -> BoxFuture<'static, Vec<AgentMessage>> + Send + Sync>;
 
 pub type BeforeToolCallFn = Arc<
     dyn Fn(
@@ -484,8 +475,7 @@ impl AgentLoopConfig {
 }
 
 /// Event sink used by the imperative run APIs.
-pub type AgentEventSink =
-    Arc<dyn Fn(AgentEvent) -> BoxFuture<'static, ()> + Send + Sync>;
+pub type AgentEventSink = Arc<dyn Fn(AgentEvent) -> BoxFuture<'static, ()> + Send + Sync>;
 
 /// Helper: identity convert that keeps standard LLM messages only.
 pub fn identity_convert_to_llm(messages: Vec<AgentMessage>) -> Vec<Message> {
@@ -496,9 +486,7 @@ pub fn identity_convert_to_llm(messages: Vec<AgentMessage>) -> Vec<Message> {
 }
 
 pub fn identity_convert_to_llm_fn() -> ConvertToLlmFn {
-    Arc::new(|messages| {
-        Box::pin(async move { identity_convert_to_llm(messages) })
-    })
+    Arc::new(|messages| Box::pin(async move { identity_convert_to_llm(messages) }))
 }
 
 /// Helper constructors for text content used by tools/tests.

@@ -29,7 +29,12 @@ pub fn app_keybinding_definitions() -> HashMap<&'static str, KeybindingDefinitio
     insert("app.interrupt", &["escape"], "Cancel or abort");
     insert("app.clear", &["ctrl+c"], "Clear editor");
     insert("app.exit", &["ctrl+d"], "Exit when editor is empty");
-    insert("app.suspend", &["ctrl+z"], "Suspend to background");
+    // Oracle: `process.platform === "win32" ? [] : "ctrl+z"`.
+    insert(
+        "app.suspend",
+        if cfg!(windows) { &[] } else { &["ctrl+z"] },
+        "Suspend to background",
+    );
     insert("app.thinking.cycle", &["shift+tab"], "Cycle thinking level");
     insert("app.model.cycleForward", &["ctrl+p"], "Cycle to next model");
     insert(

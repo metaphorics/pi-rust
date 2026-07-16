@@ -56,4 +56,13 @@ pub trait Terminal {
 
     fn set_title(&mut self, title: &str);
     fn set_progress(&mut self, active: bool);
+
+    /// Restore the terminal for a shell during Ctrl+Z suspend: leave raw
+    /// mode and pop protocol state while keeping input plumbing alive.
+    /// Default no-op for virtual terminals.
+    fn suspend(&mut self) {}
+
+    /// Re-enter raw mode and re-negotiate protocols after SIGCONT.
+    /// Default no-op for virtual terminals.
+    fn resume(&mut self) {}
 }

@@ -30,6 +30,7 @@ struct Shared {
     kitty: RefCell<bool>,
     stopped: RefCell<bool>,
     progress_calls: RefCell<Vec<bool>>,
+    lifecycle: RefCell<Vec<&'static str>>,
 }
 
 /// Test-side handle: inject input, resize, inspect the screen.
@@ -72,6 +73,11 @@ impl VtHandle {
     pub fn progress_calls(&self) -> Vec<bool> {
         self.shared.progress_calls.borrow().clone()
     }
+
+    /// Terminal lifecycle calls ("suspend" / "resume"), in order.
+    pub fn lifecycle(&self) -> Vec<&'static str> {
+        self.shared.lifecycle.borrow().clone()
+    }
 }
 
 /// pi-tui `Terminal` writing into a [`VtScreen`].
@@ -94,6 +100,7 @@ impl VtTerminal {
             kitty: RefCell::new(false),
             stopped: RefCell::new(false),
             progress_calls: RefCell::new(Vec::new()),
+            lifecycle: RefCell::new(Vec::new()),
         });
         (
             VtTerminal {
@@ -194,5 +201,13 @@ impl Terminal for VtTerminal {
 
     fn set_progress(&mut self, active: bool) {
         self.shared.progress_calls.borrow_mut().push(active);
+    }
+
+    fn suspend(&mut self) {
+        self.shared.lifecycle.borrow_mut().push("suspend");
+    }
+
+    fn resume(&mut self) {
+        self.shared.lifecycle.borrow_mut().push("resume");
     }
 }

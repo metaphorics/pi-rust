@@ -317,7 +317,11 @@ fn assert_event_payloads(api: &str, events: &[AssistantMessageEvent], expected: 
         .last()
         .and_then(AssistantMessageEvent::final_message)
         .unwrap_or_else(|| panic!("{api}: missing final message"));
-    assert_eq!(final_text(final_message), expected.final_text, "{api} finalText");
+    assert_eq!(
+        final_text(final_message),
+        expected.final_text,
+        "{api} finalText"
+    );
 
     if let Some(thinking) = &expected.thinking_text {
         assert_eq!(final_thinking(final_message), *thinking, "{api} thinking");
@@ -442,18 +446,21 @@ fn stream_parsers_match_golden_event_payloads() {
 fn bedrock_eventstream_roundtrip_from_jsonl_source() {
     let jsonl = fixture("stream_bedrock_converse_stream.jsonl");
     let binary = bedrock_converse_stream::encode_jsonl_as_eventstream(&jsonl).unwrap();
-    let from_binary =
-        parse_events("bedrock-converse-stream", &binary, &model("bedrock-converse-stream"));
-    let from_jsonl =
-        parse_events("bedrock-converse-stream", &jsonl, &model("bedrock-converse-stream"));
+    let from_binary = parse_events(
+        "bedrock-converse-stream",
+        &binary,
+        &model("bedrock-converse-stream"),
+    );
+    let from_jsonl = parse_events(
+        "bedrock-converse-stream",
+        &jsonl,
+        &model("bedrock-converse-stream"),
+    );
     assert_eq!(
         from_binary.iter().map(event_type).collect::<Vec<_>>(),
         from_jsonl.iter().map(event_type).collect::<Vec<_>>()
     );
-    assert_eq!(
-        text_deltas(&from_binary),
-        text_deltas(&from_jsonl)
-    );
+    assert_eq!(text_deltas(&from_binary), text_deltas(&from_jsonl));
 }
 
 #[derive(Clone)]
@@ -606,8 +613,9 @@ async fn every_builtin_dispatches_through_injected_http() {
         }
         assert_eq!(final_text(&final_message.unwrap()), "Hello", "{api_id}");
         assert!(
-            text_deltas(&collected).iter().any(|d| d.contains('H') || d == "Hello" || d == "Hi"
-                || !d.is_empty()),
+            text_deltas(&collected)
+                .iter()
+                .any(|d| d.contains('H') || d == "Hello" || d == "Hi" || !d.is_empty()),
             "{api_id} should emit text deltas"
         );
     }

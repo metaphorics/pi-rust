@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use futures_util::StreamExt;
 use pi_ai::{
-    AssistantMessage, AssistantMessageEvent, Context, Content, Message, Model, StopReason,
+    AssistantMessage, AssistantMessageEvent, Content, Context, Message, Model, StopReason,
     ToolResultMessage,
 };
 use serde_json::Value;
@@ -15,8 +15,8 @@ use crate::{
     types::{
         AfterToolCallContext, AgentContext, AgentEvent, AgentEventSink, AgentLoopConfig,
         AgentLoopTurnUpdate, AgentMessage, AgentThinkingLevel, AgentToolCall, AgentToolResult,
-        BeforeToolCallContext, PrepareNextTurnContext, ShouldStopAfterTurnContext, StreamCallOptions,
-        StreamFn, ToolDefinition, ToolExecutionMode, tool_calls_from_message,
+        BeforeToolCallContext, PrepareNextTurnContext, ShouldStopAfterTurnContext,
+        StreamCallOptions, StreamFn, ToolDefinition, ToolExecutionMode, tool_calls_from_message,
     },
 };
 
@@ -84,7 +84,11 @@ pub async fn run_agent_loop_continue(
     if context.messages.is_empty() {
         return Err(AgentLoopError::EmptyContext);
     }
-    if context.messages.last().is_some_and(|m| m.role() == "assistant") {
+    if context
+        .messages
+        .last()
+        .is_some_and(|m| m.role() == "assistant")
+    {
         return Err(AgentLoopError::ContinueFromAssistant);
     }
 
@@ -107,9 +111,7 @@ pub async fn run_agent_loop_continue(
 }
 
 /// Collecting event sink for tests and simple callers.
-pub fn collecting_sink(
-    events: Arc<parking_lot::Mutex<Vec<AgentEvent>>>,
-) -> AgentEventSink {
+pub fn collecting_sink(events: Arc<parking_lot::Mutex<Vec<AgentEvent>>>) -> AgentEventSink {
     Arc::new(move |event| {
         let events = events.clone();
         Box::pin(async move {
@@ -155,9 +157,14 @@ async fn run_loop(
                 }
             }
 
-            let message =
-                stream_assistant_response(current_context, &config, cancel.as_ref(), emit, stream_fn)
-                    .await;
+            let message = stream_assistant_response(
+                current_context,
+                &config,
+                cancel.as_ref(),
+                emit,
+                stream_fn,
+            )
+            .await;
             new_messages.push(AgentMessage::assistant(message.clone()));
 
             if stop_is_fatal(message.stop_reason) {
@@ -234,8 +241,7 @@ async fn run_loop(
                 }
             }
 
-            pending_messages =
-                get_optional_messages(config.get_steering_messages.as_ref()).await;
+            pending_messages = get_optional_messages(config.get_steering_messages.as_ref()).await;
         }
 
         let follow_ups = get_optional_messages(config.get_follow_up_messages.as_ref()).await;
@@ -271,9 +277,7 @@ fn apply_turn_update(
     }
 }
 
-async fn get_optional_messages(
-    getter: Option<&crate::types::GetMessagesFn>,
-) -> Vec<AgentMessage> {
+async fn get_optional_messages(getter: Option<&crate::types::GetMessagesFn>) -> Vec<AgentMessage> {
     match getter {
         Some(get) => get().await,
         None => Vec::new(),
@@ -530,8 +534,14 @@ async fn execute_tool_calls_sequential(
         })
         .await;
 
-        let preparation =
-            prepare_tool_call(current_context, assistant_message, tool_call, config, cancel).await;
+        let preparation = prepare_tool_call(
+            current_context,
+            assistant_message,
+            tool_call,
+            config,
+            cancel,
+        )
+        .await;
         let finalized = match preparation {
             Preparation::Immediate { result, is_error } => FinalizedToolCall {
                 tool_call: tool_call.clone(),
@@ -579,9 +589,7 @@ async fn execute_tool_calls_parallel(
 ) -> ExecutedToolCallBatch {
     enum Entry {
         Ready(FinalizedToolCall),
-        Pending {
-            prepared: PreparedToolCall,
-        },
+        Pending { prepared: PreparedToolCall },
     }
 
     let mut entries: Vec<Entry> = Vec::new();
@@ -594,8 +602,14 @@ async fn execute_tool_calls_parallel(
         })
         .await;
 
-        let preparation =
-            prepare_tool_call(current_context, assistant_message, tool_call, config, cancel).await;
+        let preparation = prepare_tool_call(
+            current_context,
+            assistant_message,
+            tool_call,
+            config,
+            cancel,
+        )
+        .await;
         match preparation {
             Preparation::Immediate { result, is_error } => {
                 let finalized = FinalizedToolCall {
@@ -662,8 +676,10 @@ async fn execute_tool_calls_parallel(
         ordered[index] = Some(finalized);
     }
 
-    let ordered_finalized: Vec<FinalizedToolCall> =
-        ordered.into_iter().map(|item| item.expect("finalized")).collect();
+    let ordered_finalized: Vec<FinalizedToolCall> = ordered
+        .into_iter()
+        .map(|item| item.expect("finalized"))
+        .collect();
 
     let mut messages = Vec::new();
     for finalized in &ordered_finalized {
@@ -770,8 +786,9 @@ async fn execute_prepared_tool_call(
     let accepting = Arc::new(std::sync::atomic::AtomicBool::new(true));
     // JoinHandles for each tool_execution_update emit — awaited after execute
     // settles (mirrors TS Promise.all(updateEvents) before tool_execution_end).
-    let update_handles =
-        Arc::new(parking_lot::Mutex::new(Vec::<tokio::task::JoinHandle<()>>::new()));
+    let update_handles = Arc::new(parking_lot::Mutex::new(
+        Vec::<tokio::task::JoinHandle<()>>::new(),
+    ));
 
     let on_update: crate::types::AgentToolUpdateCallback = {
         let accepting = accepting.clone();

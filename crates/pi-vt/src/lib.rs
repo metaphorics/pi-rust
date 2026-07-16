@@ -434,8 +434,7 @@ impl Perform for Screen {
                             if set && !self.alt_screen {
                                 self.alt_screen = true;
                                 self.saved_main_grid = Some(self.grid.clone());
-                                self.grid =
-                                    Grid::new(self.grid.cols, self.grid.rows);
+                                self.grid = Grid::new(self.grid.cols, self.grid.rows);
                                 self.cursor_row = 0;
                                 self.cursor_col = 0;
                             } else if !set && self.alt_screen {
@@ -559,7 +558,9 @@ impl VtScreen {
     /// All viewport rows as trimmed text.
     #[must_use]
     pub fn rows(&self) -> Vec<String> {
-        (0..self.screen.grid.rows).map(|r| self.row_text(r)).collect()
+        (0..self.screen.grid.rows)
+            .map(|r| self.row_text(r))
+            .collect()
     }
 
     /// Scrollback rows (oldest first) as trimmed text.
@@ -584,7 +585,9 @@ impl VtScreen {
     #[must_use]
     pub fn used_height(&self) -> usize {
         let rows = self.rows();
-        rows.iter().rposition(|r| !r.is_empty()).map_or(0, |i| i + 1)
+        rows.iter()
+            .rposition(|r| !r.is_empty())
+            .map_or(0, |i| i + 1)
     }
 
     /// Full screen as newline-joined trimmed rows, trailing blank rows dropped

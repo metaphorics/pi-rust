@@ -20,13 +20,10 @@ use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use serde_json::{Map, Value, json};
-use tokio::{
-    sync::mpsc,
-    time::Instant,
-};
+use tokio::{sync::mpsc, time::Instant};
 use tokio_tungstenite::{
     connect_async,
-    tungstenite::{client::IntoClientRequest, http::HeaderValue, Message},
+    tungstenite::{Message, client::IntoClientRequest, http::HeaderValue},
 };
 
 use crate::{
@@ -140,7 +137,9 @@ impl WebSocketConn for TungsteniteConn {
             match self.socket.next().await {
                 None => return Ok(None),
                 Some(Err(error)) => return Err(format!("websocket read: {error}")),
-                Some(Ok(Message::Text(text))) => return Ok(Some(WsMessage::Text(text.to_string()))),
+                Some(Ok(Message::Text(text))) => {
+                    return Ok(Some(WsMessage::Text(text.to_string())));
+                }
                 Some(Ok(Message::Binary(bytes))) => {
                     return Ok(Some(WsMessage::Binary(bytes.to_vec())));
                 }
@@ -378,10 +377,7 @@ pub fn is_session_ws_idle_expired(last_used: Instant, now: Instant) -> bool {
 
 /// Build a continuation body with `previous_response_id` + input delta when possible
 /// (oracle `buildCachedWebSocketRequestBody` / `getCachedWebSocketInputDelta`).
-pub fn build_cached_websocket_request_body(
-    body: &Value,
-    continuation: &WsContinuation,
-) -> Value {
+pub fn build_cached_websocket_request_body(body: &Value, continuation: &WsContinuation) -> Value {
     let Some(delta) = cached_input_delta(body, continuation) else {
         return body.clone();
     };
@@ -401,7 +397,8 @@ fn request_body_without_input(body: &Value) -> Value {
 }
 
 fn cached_input_delta(body: &Value, continuation: &WsContinuation) -> Option<Vec<Value>> {
-    if request_body_without_input(body) != request_body_without_input(&continuation.last_request_body)
+    if request_body_without_input(body)
+        != request_body_without_input(&continuation.last_request_body)
     {
         return None;
     }
@@ -539,10 +536,7 @@ fn content_from_response_output(output: &[Value]) -> Vec<Content> {
                 if let Some(parts) = item.get("content").and_then(Value::as_array) {
                     for part in parts {
                         if part.get("type").and_then(Value::as_str) == Some("output_text") {
-                            let text = part
-                                .get("text")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default();
+                            let text = part.get("text").and_then(Value::as_str).unwrap_or_default();
                             if text.is_empty() {
                                 continue;
                             }
@@ -626,9 +620,7 @@ async fn acquire_session_handle(
                 } else {
                     if let Some(entry) = guard.get_mut(session_id) {
                         entry.last_used = now;
-                        entry
-                            .busy
-                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                        entry.busy.store(true, std::sync::atomic::Ordering::SeqCst);
                     }
                     existing
                         .busy
@@ -1049,7 +1041,13 @@ pub fn stream(
     context: Context,
     options: StreamOptions,
 ) -> AssistantMessageEventStream {
-    stream_with_ws_connector(model, context, options, Arc::new(TungsteniteConnector), None)
+    stream_with_ws_connector(
+        model,
+        context,
+        options,
+        Arc::new(TungsteniteConnector),
+        None,
+    )
 }
 
 /// Injectable path used by tests: optional WS connector + optional SSE client.
@@ -1079,10 +1077,8 @@ pub fn stream_with_ws_connector(
                 .unwrap_or_else(|| format!("codex_{}", common::now_ms()));
             let ws_url = resolve_codex_websocket_url(&model.base_url);
             let ws_headers = build_websocket_headers(&model, &options, &request_id);
-            let use_cached_context = matches!(
-                transport,
-                Transport::WebsocketCached | Transport::Auto
-            );
+            let use_cached_context =
+                matches!(transport, Transport::WebsocketCached | Transport::Auto);
 
             let mut retried_connection_limit = false;
             loop {
@@ -1133,8 +1129,7 @@ pub fn stream_with_ws_connector(
             // SSE fallback with zstd compression.
             match sse_client {
                 Some(client) => {
-                    let mut sse_stream =
-                        stream_with_client(model, context, options, client);
+                    let mut sse_stream = stream_with_client(model, context, options, client);
                     while let Some(event) = sse_stream.next().await {
                         producer.push(event);
                     }
@@ -1387,7 +1382,12 @@ mod tests {
     /// Context that continues a prior turn: prior user + assistant reply + new user.
     /// Assistant text_signature matches completed_frame's message id so
     /// `responses_input` baseline equals lastInput + lastResponseItems.
-    fn continued_context(prior_user: &str, assistant_text: &str, response_id: &str, next_user: &str) -> Context {
+    fn continued_context(
+        prior_user: &str,
+        assistant_text: &str,
+        response_id: &str,
+        next_user: &str,
+    ) -> Context {
         let text_signature = serde_json::to_string(&crate::types::TextSignatureV1 {
             v: 1,
             id: format!("msg_{response_id}"),
@@ -1471,10 +1471,7 @@ mod tests {
             }
             let mut guard = self.shared.inbound.lock().await;
             let inbound = if guard.is_empty() {
-                vec![WsMessage::Text(completed_frame(
-                    &format!("resp-{n}"),
-                    "ok",
-                ))]
+                vec![WsMessage::Text(completed_frame(&format!("resp-{n}"), "ok"))]
             } else {
                 guard.remove(0)
             };
@@ -1503,9 +1500,7 @@ mod tests {
             }
             let close_on = self.shared.close_limit_on_conn.load(Ordering::SeqCst);
             if close_on == self.conn_index {
-                self.shared
-                    .close_limit_on_conn
-                    .store(0, Ordering::SeqCst);
+                self.shared.close_limit_on_conn.store(0, Ordering::SeqCst);
                 return Ok(Some(WsMessage::Close {
                     code: Some(1013),
                     reason: WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE.into(),
@@ -1563,8 +1558,7 @@ mod tests {
             self.hits.fetch_add(1, Ordering::SeqCst);
             let chunks = self.body.clone();
             Box::pin(async move {
-                let body: HttpByteStream =
-                    Box::pin(stream::iter(vec![Ok::<_, HttpError>(chunks)]));
+                let body: HttpByteStream = Box::pin(stream::iter(vec![Ok::<_, HttpError>(chunks)]));
                 Ok(body)
             })
         }

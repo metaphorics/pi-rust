@@ -33,6 +33,9 @@ parking_lot = "0.12"
 rustix = { workspace = true, features = ["fs", "process", "stdio", "termios", "system"] }
 syntect = { version = "5", default-features = false, features = ["default-syntaxes", "parsing", "regex-fancy"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 pi-vt = { path = "../pi-vt" }
 tempfile = "3"

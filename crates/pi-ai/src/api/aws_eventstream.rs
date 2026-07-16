@@ -57,9 +57,9 @@ impl EventStreamMessage {
             let payload = if self.payload.is_empty() {
                 serde_json::json!({"message": exception})
             } else {
-                serde_json::from_slice(&self.payload).unwrap_or_else(|_| {
-                    serde_json::json!({"message": String::from_utf8_lossy(&self.payload)})
-                })
+                serde_json::from_slice(&self.payload).unwrap_or_else(
+                    |_| serde_json::json!({"message": String::from_utf8_lossy(&self.payload)}),
+                )
             };
             return Ok(serde_json::json!({ exception: payload }).to_string());
         }
@@ -147,10 +147,7 @@ fn try_decode_one(buf: &[u8]) -> Result<Option<(EventStreamMessage, usize)>, Str
 
     let headers = decode_headers(&buf[PRELUDE_LEN..headers_end])?;
     let payload = buf[headers_end..payload_end].to_vec();
-    Ok(Some((
-        EventStreamMessage { headers, payload },
-        total_len,
-    )))
+    Ok(Some((EventStreamMessage { headers, payload }, total_len)))
 }
 
 fn decode_headers(mut bytes: &[u8]) -> Result<Vec<(String, EventStreamHeaderValue)>, String> {
@@ -372,7 +369,10 @@ mod tests {
         let mut decoder = EventStreamDecoder::default();
         let messages = decoder.push(&frame).unwrap();
         assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].header_str(":event-type"), Some("contentBlockDelta"));
+        assert_eq!(
+            messages[0].header_str(":event-type"),
+            Some("contentBlockDelta")
+        );
         let json = messages[0].bedrock_event_json().unwrap();
         assert!(json.contains("contentBlockDelta"));
         assert!(json.contains("\"Hi\""));
