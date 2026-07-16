@@ -39,9 +39,10 @@ pub fn expand_tilde_path(path: &str) -> PathBuf {
             return home.join(rest);
         }
     } else if path == "~"
-        && let Some(home) = dirs::home_dir() {
-            return home;
-        }
+        && let Some(home) = dirs::home_dir()
+    {
+        return home;
+    }
     PathBuf::from(path)
 }
 
@@ -73,19 +74,16 @@ pub fn resolve_path(path: &str, base: Option<&Path>) -> PathBuf {
 /// `~/.pi/agent` (or `PI_CODING_AGENT_DIR` / rebranded env).
 pub fn get_agent_dir() -> PathBuf {
     if let Ok(env_dir) = env::var(env_agent_dir_key())
-        && !env_dir.is_empty() {
-            return expand_tilde_path(&env_dir);
-        }
+        && !env_dir.is_empty()
+    {
+        return expand_tilde_path(&env_dir);
+    }
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
     home.join(CONFIG_DIR_NAME).join("agent")
 }
 
 /// Sessions root: `~/.pi/agent/sessions`.
 pub fn get_sessions_dir() -> PathBuf {
-    if let Ok(env_dir) = env::var(env_session_dir_key())
-        && !env_dir.is_empty() {
-            return expand_tilde_path(&env_dir);
-        }
     get_agent_dir().join("sessions")
 }
 
@@ -132,9 +130,10 @@ pub fn get_debug_log_path() -> PathBuf {
 /// Package asset root. Honors `PI_PACKAGE_DIR`; otherwise directory of current executable.
 pub fn get_package_dir() -> PathBuf {
     if let Ok(env_dir) = env::var("PI_PACKAGE_DIR")
-        && !env_dir.is_empty() {
-            return normalize_path(&env_dir);
-        }
+        && !env_dir.is_empty()
+    {
+        return normalize_path(&env_dir);
+    }
     env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
@@ -163,9 +162,7 @@ pub fn get_default_session_dir_path(cwd: &str, agent_dir: Option<&Path>) -> Path
         .unwrap_or_else(get_agent_dir);
     let resolved_cwd = resolve_path(cwd, None);
     let cwd_str = resolved_cwd.to_string_lossy();
-    agent
-        .join("sessions")
-        .join(encode_session_cwd(&cwd_str))
+    agent.join("sessions").join(encode_session_cwd(&cwd_str))
 }
 
 #[cfg(test)]
