@@ -14,6 +14,8 @@ pub mod settings_manager;
 pub mod auth_storage;
 pub mod model_registry;
 pub mod resolve_config_value;
+pub mod system_prompt;
+pub mod wire_out;
 
 pub use auth_storage::{AuthStorage, AuthStatus, AuthStorageError};
 pub use model_registry::{ModelRegistry, ResolvedRequestAuth, ResolveResult, ProviderConfigInput, ModelDefinition, ModelOverride, OverrideCost, DefinitionCost};
@@ -48,6 +50,11 @@ pub use session_types::{
 pub use settings_manager::{
     Settings, SettingsManager, SettingsScope, deep_merge_settings, migrate_settings,
     parse_settings_json, serialize_settings_json,
+};
+pub use wire_out::WireOut;
+pub use system_prompt::{
+    BuildSystemPromptOptions, ContextFile, Skill, build_system_prompt, format_skills_for_prompt,
+    get_docs_path, get_examples_path, get_readme_path, load_project_context_files,
 };
 
 // Keep workspace deps linked while sibling modules land.
