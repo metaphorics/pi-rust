@@ -11,6 +11,13 @@ pub mod serde_util;
 pub mod session_manager;
 pub mod session_types;
 pub mod settings_manager;
+pub mod auth_storage;
+pub mod model_registry;
+pub mod resolve_config_value;
+
+pub use auth_storage::{AuthStorage, AuthStatus, AuthStorageError};
+pub use model_registry::{ModelRegistry, ResolvedRequestAuth, ResolveResult, ProviderConfigInput, ModelDefinition, ModelOverride, OverrideCost, DefinitionCost};
+pub use resolve_config_value::clear_config_value_cache;
 
 pub use cli::{
     args, parse_args, get_help_text, validate_arg_combinations, Args, Mode, AppMode, ThinkingLevel, ListModels,
