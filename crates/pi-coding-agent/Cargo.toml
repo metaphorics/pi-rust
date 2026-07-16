@@ -15,6 +15,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror.workspace = true
 jiff.workspace = true
+reqwest.workspace = true
 # UUID v4/v7 for session ids (pi uses uuidv7 for session id, randomUUID for entry ids).
 uuid = { version = "1", features = ["v4", "v7"] }
 # Home directory for ~/.pi/agent resolution.
@@ -22,6 +23,8 @@ dirs = "6"
 tokio.workspace = true
 regex = "1"
 globset = "0.4"
+semver = "1"
+url = "2"
 base64 = "0.22"
 ignore = "0.4"
 diff = "0.1"
