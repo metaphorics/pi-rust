@@ -156,9 +156,21 @@ impl Container {
         &self.dirty_ranges
     }
 
+    /// Mark that a descendant changed without invalidating every child.
+    ///
+    /// Shared component owners use this after mutating a child through an
+    /// external `Rc<RefCell<_>>`; the next render then recomputes only the
+    /// container's aggregate dirty spans.
+    pub fn mark_changed(&mut self) {
+        self.last_status = RenderStatus::Changed;
+    }
+
     /// Render and return owned ANSI-ready metadata so callers can drop the
     /// line-slice borrow before reading dirty/status.
-    pub fn render_owned(&mut self, width: u16) -> (Vec<Line>, Vec<std::ops::Range<usize>>, RenderStatus) {
+    pub fn render_owned(
+        &mut self,
+        width: u16,
+    ) -> (Vec<Line>, Vec<std::ops::Range<usize>>, RenderStatus) {
         let lines = self.render(width).to_vec();
         let dirty = self.dirty_ranges.clone();
         let status = self.last_status;
@@ -214,10 +226,9 @@ impl Component for Container {
                     // Only record per-child dirty when geometry is still stable
                     // for this and all prior children; once a shift is known the
                     // suffix path below owns dirtiness.
-                    if first_shift.is_none()
-                        && count > 0 {
-                            dirty.push(start..start + count);
-                        }
+                    if first_shift.is_none() && count > 0 {
+                        dirty.push(start..start + count);
+                    }
                 }
                 RenderStatus::Unchanged => {
                     if geometry_shifted {

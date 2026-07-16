@@ -6,8 +6,9 @@ mod process;
 
 pub use process::{
     DESIRED_KITTY_KEYBOARD_PROTOCOL_FLAGS, KITTY_KEYBOARD_PROTOCOL_QUERY,
-    KeyboardProtocolNegotiationSequence, ProcessTerminal, is_apple_terminal_session,
-    normalize_apple_terminal_input, parse_keyboard_protocol_negotiation_sequence,
+    KeyboardProtocolNegotiationSequence, ProcessTerminal, TERMINAL_BACKGROUND_COLOR_QUERY,
+    is_apple_terminal_session, normalize_apple_terminal_input,
+    parse_keyboard_protocol_negotiation_sequence, parse_terminal_background_color_response,
 };
 
 /// Minimal terminal interface for TUI (mirrors TS `Terminal`).
