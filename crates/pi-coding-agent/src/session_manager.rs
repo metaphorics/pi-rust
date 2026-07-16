@@ -84,14 +84,8 @@ pub struct SessionModelRef {
 /// Validate session id characters (oracle `assertValidSessionId`).
 pub fn assert_valid_session_id(id: &str) -> Result<()> {
     let re_ok = !id.is_empty()
-        && id
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphanumeric())
-        && id
-            .chars()
-            .last()
-            .is_some_and(|c| c.is_ascii_alphanumeric())
+        && id.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && id.chars().last().is_some_and(|c| c.is_ascii_alphanumeric())
         && id
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.');
@@ -238,10 +232,11 @@ fn migrate_v2_to_v3(entries: &mut [FileEntry]) -> bool {
             FileEntry::Entry(SessionEntry::Message { message, .. }) => {
                 if let Some(role) = message.get("role").and_then(|v| v.as_str())
                     && role == "hookMessage"
-                        && let Some(obj) = message.as_object_mut() {
-                            obj.insert("role".into(), Value::String("custom".into()));
-                            changed = true;
-                        }
+                    && let Some(obj) = message.as_object_mut()
+                {
+                    obj.insert("role".into(), Value::String("custom".into()));
+                    changed = true;
+                }
             }
             _ => {}
         }
@@ -587,8 +582,7 @@ impl SessionManager {
             } = e
             {
                 if let Some(l) = label {
-                    self.labels_by_id
-                        .insert(target_id.clone(), l.clone());
+                    self.labels_by_id.insert(target_id.clone(), l.clone());
                     self.label_timestamps_by_id
                         .insert(target_id.clone(), timestamp.clone());
                 } else {
@@ -687,7 +681,10 @@ impl SessionManager {
         })
     }
 
-    pub fn append_thinking_level_change(&mut self, thinking_level: impl Into<String>) -> Result<String> {
+    pub fn append_thinking_level_change(
+        &mut self,
+        thinking_level: impl Into<String>,
+    ) -> Result<String> {
         let (id, parent_id, timestamp) = self.make_base_ids();
         self.append_entry(SessionEntry::ThinkingLevelChange {
             id: Some(id),
@@ -750,11 +747,7 @@ impl SessionManager {
     }
 
     pub fn append_session_info(&mut self, name: impl Into<String>) -> Result<String> {
-        let sanitized = name
-            .into()
-            .replace(['\r', '\n'], " ")
-            .trim()
-            .to_string();
+        let sanitized = name.into().replace(['\r', '\n'], " ").trim().to_string();
         let (id, parent_id, timestamp) = self.make_base_ids();
         self.append_entry(SessionEntry::SessionInfo {
             id: Some(id),
@@ -790,9 +783,7 @@ impl SessionManager {
     ) -> Result<String> {
         let target_id = target_id.into();
         if !self.by_id.contains_key(&target_id) {
-            return Err(SessionError::msg(format!(
-                "Entry {target_id} not found"
-            )));
+            return Err(SessionError::msg(format!("Entry {target_id} not found")));
         }
         let (id, parent_id, timestamp) = self.make_base_ids();
         let entry_id = self.append_entry(SessionEntry::Label {
@@ -820,9 +811,10 @@ impl SessionManager {
         from_hook: Option<bool>,
     ) -> Result<String> {
         if let Some(ref id) = branch_from_id
-            && !self.by_id.contains_key(id) {
-                return Err(SessionError::msg(format!("Entry {id} not found")));
-            }
+            && !self.by_id.contains_key(id)
+        {
+            return Err(SessionError::msg(format!("Entry {id} not found")));
+        }
         self.leaf_id = branch_from_id.clone();
         let (id, _, timestamp) = self.make_base_ids();
         let from_id = branch_from_id.clone().unwrap_or_else(|| "root".into());
@@ -864,7 +856,8 @@ impl SessionManager {
     }
 
     pub fn uses_default_session_dir(&self) -> bool {
-        let default = get_default_session_dir_path(&self.cwd.to_string_lossy(), Some(&get_agent_dir()));
+        let default =
+            get_default_session_dir_path(&self.cwd.to_string_lossy(), Some(&get_agent_dir()));
         self.session_dir == default
     }
 
@@ -915,9 +908,7 @@ impl SessionManager {
 
     pub fn get_branch(&self, from_id: Option<&str>) -> Vec<SessionEntry> {
         let mut path = Vec::new();
-        let mut current = from_id
-            .map(str::to_string)
-            .or_else(|| self.leaf_id.clone());
+        let mut current = from_id.map(str::to_string).or_else(|| self.leaf_id.clone());
         while let Some(id) = current {
             let Some(entry) = self.by_id.get(&id) else {
                 break;
@@ -930,11 +921,19 @@ impl SessionManager {
     }
 
     pub fn build_context_entries(&self) -> Vec<SessionEntry> {
-        build_context_entries(&self.get_entries(), self.leaf_id.as_deref(), Some(&self.by_id))
+        build_context_entries(
+            &self.get_entries(),
+            self.leaf_id.as_deref(),
+            Some(&self.by_id),
+        )
     }
 
     pub fn build_session_context(&self) -> SessionContext {
-        build_session_context(&self.get_entries(), self.leaf_id.as_deref(), Some(&self.by_id))
+        build_session_context(
+            &self.get_entries(),
+            self.leaf_id.as_deref(),
+            Some(&self.by_id),
+        )
     }
 
     pub fn get_tree(&self) -> Vec<SessionTreeNode> {
@@ -1082,17 +1081,28 @@ pub fn build_context_entries(
     context
 }
 
+fn timestamp_millis(timestamp: &str) -> i64 {
+    timestamp
+        .parse::<jiff::Timestamp>()
+        .expect("session entry timestamps are valid ISO-8601")
+        .as_millisecond()
+}
+
 fn session_entry_to_context_messages(entry: &SessionEntry) -> Vec<Value> {
     match entry {
         SessionEntry::Message { message, .. } => {
             let mut msg = message.clone();
             if let Some(role) = msg.get("role").and_then(|r| r.as_str())
                 && matches!(role, "user" | "assistant" | "toolResult")
-                    && msg.get("content").map(|c| c.is_null()).unwrap_or(true)
-                    && !msg.get("content").map(|c| c.is_array() || c.is_string()).unwrap_or(false)
-                    && let Some(obj) = msg.as_object_mut() {
-                        obj.insert("content".into(), Value::Array(vec![]));
-                    }
+                && msg.get("content").map(|c| c.is_null()).unwrap_or(true)
+                && !msg
+                    .get("content")
+                    .map(|c| c.is_array() || c.is_string())
+                    .unwrap_or(false)
+                && let Some(obj) = msg.as_object_mut()
+            {
+                obj.insert("content".into(), Value::Array(vec![]));
+            }
             vec![msg]
         }
         SessionEntry::CustomMessage {
@@ -1111,7 +1121,7 @@ fn session_entry_to_context_messages(entry: &SessionEntry) -> Vec<Value> {
             if let Some(d) = details {
                 obj.insert("details".into(), d.clone());
             }
-            obj.insert("timestamp".into(), Value::String(timestamp.clone()));
+            obj.insert("timestamp".into(), Value::from(timestamp_millis(timestamp)));
             vec![Value::Object(obj)]
         }
         SessionEntry::BranchSummary {
@@ -1124,7 +1134,7 @@ fn session_entry_to_context_messages(entry: &SessionEntry) -> Vec<Value> {
             obj.insert("role".into(), Value::String("branchSummary".into()));
             obj.insert("summary".into(), Value::String(summary.clone()));
             obj.insert("fromId".into(), Value::String(from_id.clone()));
-            obj.insert("timestamp".into(), Value::String(timestamp.clone()));
+            obj.insert("timestamp".into(), Value::from(timestamp_millis(timestamp)));
             vec![Value::Object(obj)]
         }
         SessionEntry::Compaction {
@@ -1137,7 +1147,7 @@ fn session_entry_to_context_messages(entry: &SessionEntry) -> Vec<Value> {
             obj.insert("role".into(), Value::String("compactionSummary".into()));
             obj.insert("summary".into(), Value::String(summary.clone()));
             obj.insert("tokensBefore".into(), Value::from(*tokens_before));
-            obj.insert("timestamp".into(), Value::String(timestamp.clone()));
+            obj.insert("timestamp".into(), Value::from(timestamp_millis(timestamp)));
             vec![Value::Object(obj)]
         }
         _ => Vec::new(),
@@ -1155,7 +1165,9 @@ pub fn build_session_context(
     let mut model = None;
     for entry in &path {
         match entry {
-            SessionEntry::ThinkingLevelChange { thinking_level: t, .. } => {
+            SessionEntry::ThinkingLevelChange {
+                thinking_level: t, ..
+            } => {
                 thinking_level = t.clone();
             }
             SessionEntry::ModelChange {
@@ -1171,12 +1183,13 @@ pub fn build_session_context(
                     && let (Some(provider), Some(model_id)) = (
                         message.get("provider").and_then(|v| v.as_str()),
                         message.get("model").and_then(|v| v.as_str()),
-                    ) {
-                        model = Some(SessionModelRef {
-                            provider: provider.to_string(),
-                            model_id: model_id.to_string(),
-                        });
-                    }
+                    )
+                {
+                    model = Some(SessionModelRef {
+                        provider: provider.to_string(),
+                        model_id: model_id.to_string(),
+                    });
+                }
             }
             _ => {}
         }
@@ -1203,7 +1216,9 @@ mod tests {
         assert!(sm.get_header().is_some());
         assert_eq!(sm.get_header().unwrap().version, Some(3));
         let uid = sm
-            .append_message(json!({"role":"user","content":[{"type":"text","text":"hi"}],"timestamp":1}))
+            .append_message(
+                json!({"role":"user","content":[{"type":"text","text":"hi"}],"timestamp":1}),
+            )
             .unwrap();
         let _ = sm
             .append_message(json!({"role":"assistant","content":[{"type":"text","text":"yo"}],"api":"anthropic-messages","provider":"anthropic","model":"x","usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":2,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":2}))
@@ -1219,10 +1234,14 @@ mod tests {
     #[test]
     fn session_file_name_pattern() {
         let dir = tempfile::tempdir().unwrap();
-        let sm = SessionManager::create(dir.path(), Some(dir.path().to_path_buf()), Some(NewSessionOptions {
-            id: Some("created-session-id".into()),
-            parent_session: None,
-        }))
+        let sm = SessionManager::create(
+            dir.path(),
+            Some(dir.path().to_path_buf()),
+            Some(NewSessionOptions {
+                id: Some("created-session-id".into()),
+                parent_session: None,
+            }),
+        )
         .unwrap();
         let file = sm.get_session_file().unwrap();
         let name = file.file_name().unwrap().to_string_lossy();

@@ -15,10 +15,7 @@ fn assert_line_roundtrip(line: &str) {
     let entry: FileEntry =
         parse_session_entry_line(line).unwrap_or_else(|| panic!("parse failed: {line}"));
     let out = serialize_file_entry_line(&entry).expect("serialize");
-    assert_eq!(
-        out, line,
-        "byte mismatch\n left: {out}\nright: {line}"
-    );
+    assert_eq!(out, line, "byte mismatch\n left: {out}\nright: {line}");
 }
 
 #[test]
@@ -55,6 +52,8 @@ fn session_pi_written_full_file_roundtrip() {
 #[test]
 fn session_v3_all_kinds_roundtrip_byte_identical() {
     let source = include_str!("fixtures/session_v3_all_kinds.jsonl");
+    // Custom lines mirror the object-literal insertion order in pi's
+    // appendCustomEntry and appendCustomMessageEntry implementations.
     for line in source.lines().filter(|l| !l.trim().is_empty()) {
         assert_line_roundtrip(line);
     }
@@ -94,10 +93,20 @@ fn settings_sample_roundtrip_byte_identical() {
 
 #[test]
 fn auth_sample_roundtrip_byte_identical() {
-    // Auth files are opaque ordered maps at this layer (pi-ai owns typed credentials).
     let source = include_str!("fixtures/auth_sample.json");
-    let value: Value = serde_json::from_str(source).unwrap();
-    let out = serde_json::to_string_pretty(&value).unwrap();
+    let raw: Value = serde_json::from_str(source).expect("parse auth document");
+    let typed = raw
+        .as_object()
+        .expect("auth document is an object")
+        .iter()
+        .map(|(provider, value)| {
+            let credential: pi_ai::auth::Credential =
+                serde_json::from_value(value.clone()).expect("parse typed credential");
+            let value = serde_json::to_value(credential).expect("serialize typed credential");
+            (provider.clone(), value)
+        })
+        .collect();
+    let out = serde_json::to_string_pretty(&Value::Object(typed)).expect("serialize auth");
     assert_eq!(out, source);
 }
 

@@ -27,7 +27,11 @@ pub struct SessionHeader {
     pub id: String,
     pub timestamp: String,
     pub cwd: String,
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "parentSession")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "parentSession"
+    )]
     pub parent_session: Option<String>,
     /// Legacy / extension header fields (provider, modelId, thinkingLevel, branchedFrom, …).
     /// Flattened so unknown keys round-trip with order preserved (serde_json Map).
@@ -146,7 +150,11 @@ pub struct CompactionEntry {
     pub timestamp: String,
     pub summary: String,
     /// v2+/v3 field.
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "firstKeptEntryId")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "firstKeptEntryId"
+    )]
     pub first_kept_entry_id: Option<String>,
     /// v1 field (index into file entries). Migrated to firstKeptEntryId on load.
     #[serde(
@@ -365,7 +373,11 @@ pub enum SessionEntry {
         parent_id: NullOr<String>,
         timestamp: String,
         summary: String,
-        #[serde(default, skip_serializing_if = "Option::is_none", rename = "firstKeptEntryId")]
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            rename = "firstKeptEntryId"
+        )]
         first_kept_entry_id: Option<String>,
         #[serde(
             default,
@@ -402,23 +414,10 @@ pub enum SessionEntry {
     },
     #[serde(rename = "custom")]
     Custom {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        id: Option<String>,
-        #[serde(
-            default,
-            skip_serializing_if = "is_absent",
-            serialize_with = "serialize_null_or",
-            rename = "parentId"
-        )]
-        parent_id: NullOr<String>,
-        timestamp: String,
         #[serde(rename = "customType")]
         custom_type: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         data: Option<Value>,
-    },
-    #[serde(rename = "custom_message")]
-    CustomMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
         #[serde(
@@ -429,12 +428,25 @@ pub enum SessionEntry {
         )]
         parent_id: NullOr<String>,
         timestamp: String,
+    },
+    #[serde(rename = "custom_message")]
+    CustomMessage {
         #[serde(rename = "customType")]
         custom_type: String,
         content: Value,
+        display: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         details: Option<Value>,
-        display: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(
+            default,
+            skip_serializing_if = "is_absent",
+            serialize_with = "serialize_null_or",
+            rename = "parentId"
+        )]
+        parent_id: NullOr<String>,
+        timestamp: String,
     },
     #[serde(rename = "label")]
     Label {
