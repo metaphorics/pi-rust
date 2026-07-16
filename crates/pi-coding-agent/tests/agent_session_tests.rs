@@ -1360,7 +1360,7 @@ async fn tool_loop_second_provider_call_receives_turn_history() {
             tool_call_reply.content.push(Content::ToolCall(pi_ai::ToolCall {
                 id: "call-1".to_string(),
                 name: "echo".to_string(),
-                arguments: std::collections::HashMap::new(),
+                arguments: serde_json::Map::new(),
                 thought_signature: None,
             }));
             tool_call_reply.stop_reason = StopReason::ToolUse;

@@ -5,7 +5,7 @@ use std::{
 };
 
 use futures_util::StreamExt;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::{
     event_stream::AssistantMessageEventStream,
@@ -144,7 +144,7 @@ impl EventBuilder {
         self.message.content.push(Content::ToolCall(ToolCall {
             id: id.to_owned(),
             name: name.to_owned(),
-            arguments: HashMap::new(),
+            arguments: Map::new(),
             thought_signature: None,
         }));
         self.tool_indexes.insert(key.to_owned(), index);
@@ -167,7 +167,7 @@ impl EventBuilder {
         if let (Content::ToolCall(call), Some(args)) =
             (&mut self.message.content[index], parsed.as_object())
         {
-            call.arguments = args.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            call.arguments = args.clone();
         }
         self.events.push(AssistantMessageEvent::ToolcallDelta {
             content_index: index,

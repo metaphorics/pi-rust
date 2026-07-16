@@ -36,7 +36,7 @@ use pi_ai::{
     },
 };
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/api");
 const API_CASES: [(&str, &str); 10] = [
@@ -128,7 +128,7 @@ fn tool_cycle_context() -> Context {
                     Content::ToolCall(ToolCall {
                         id: "call-original|fc_item".into(),
                         name: "get_weather".into(),
-                        arguments: HashMap::from([("city".into(), json!("Paris"))]),
+                        arguments: Map::from_iter([("city".into(), json!("Paris"))]),
                         thought_signature: None,
                     }),
                 ],
@@ -622,4 +622,88 @@ fn codex_zstd_header_when_compressing() {
         "websocket connect: failed",
         false
     ));
+}
+
+#[test]
+fn incremental_tool_arguments_keep_wire_order() {
+    const ORDERED_ARGS: &str = r#"{"z":1,"a":2,"m":3}"#;
+
+    let mut builder = api::EventBuilder::new(&model("openai-completions"));
+    builder.drain_events();
+    builder.tool_call_start("0", "call-ordered", "ordered");
+    builder.drain_events();
+
+    let mut partial = None;
+    for (fragment, expected) in [
+        (r#"{"z":1,"#, r#"{"z":1}"#),
+        (r#""a":2,"#, r#"{"z":1,"a":2}"#),
+        (r#""m":3}"#, ORDERED_ARGS),
+    ] {
+        builder.tool_call_delta("0", fragment);
+        let events = builder.drain_events();
+        let AssistantMessageEvent::ToolcallDelta {
+            partial: event_partial,
+            ..
+        } = events.last().expect("tool-call delta event")
+        else {
+            panic!("expected tool-call delta");
+        };
+        let Content::ToolCall(call) = &event_partial.content[0] else {
+            panic!("expected tool call");
+        };
+        assert_eq!(serde_json::to_string(&call.arguments).unwrap(), expected);
+        partial = Some(event_partial.clone());
+    }
+
+    let context = Context {
+        system_prompt: None,
+        messages: vec![Message::Assistant(partial.expect("final partial"))],
+        tools: Vec::new(),
+    };
+    let options = options();
+
+    let openai =
+        openai_completions::build_request_body(&model("openai-completions"), &context, &options);
+    assert_eq!(
+        openai
+            .pointer("/messages/0/tool_calls/0/function/arguments")
+            .and_then(Value::as_str),
+        Some(ORDERED_ARGS)
+    );
+
+    let anthropic =
+        anthropic_messages::build_request_body(&model("anthropic-messages"), &context, &options);
+    assert_eq!(
+        serde_json::to_string(&anthropic["messages"][0]["content"][0]["input"]).unwrap(),
+        ORDERED_ARGS
+    );
+
+    let responses =
+        openai_responses::build_request_body(&model("openai-responses"), &context, &options);
+    assert_eq!(
+        responses
+            .pointer("/input/0/arguments")
+            .and_then(Value::as_str),
+        Some(ORDERED_ARGS)
+    );
+
+    let google = google_generative_ai::build_request_body(
+        &model("google-generative-ai"),
+        &context,
+        &options,
+    );
+    assert_eq!(
+        serde_json::to_string(&google["contents"][0]["parts"][0]["functionCall"]["args"]).unwrap(),
+        ORDERED_ARGS
+    );
+
+    let bedrock = bedrock_converse_stream::build_request_body(
+        &model("bedrock-converse-stream"),
+        &context,
+        &options,
+    );
+    assert_eq!(
+        serde_json::to_string(&bedrock["messages"][0]["content"][0]["toolUse"]["input"]).unwrap(),
+        ORDERED_ARGS
+    );
 }

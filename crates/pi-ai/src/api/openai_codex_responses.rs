@@ -584,7 +584,7 @@ fn content_from_response_output(output: &[Value]) -> Vec<Content> {
                 let arguments = item
                     .get("arguments")
                     .and_then(Value::as_str)
-                    .and_then(|raw| serde_json::from_str::<HashMap<String, Value>>(raw).ok())
+                    .and_then(|raw| serde_json::from_str::<Map<String, Value>>(raw).ok())
                     .unwrap_or_default();
                 content.push(Content::ToolCall(ToolCall {
                     id,

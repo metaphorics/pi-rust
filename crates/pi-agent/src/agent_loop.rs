@@ -450,7 +450,7 @@ async fn fail_tool_calls_from_truncated_message(
         emit(AgentEvent::ToolExecutionStart {
             tool_call_id: tool_call.id.clone(),
             tool_name: tool_call.name.clone(),
-            args: Value::Object(tool_call.arguments.clone().into_iter().collect()),
+            args: Value::Object(tool_call.arguments.clone()),
         })
         .await;
         let finalized = FinalizedToolCall {
@@ -526,7 +526,7 @@ async fn execute_tool_calls_sequential(
         emit(AgentEvent::ToolExecutionStart {
             tool_call_id: tool_call.id.clone(),
             tool_name: tool_call.name.clone(),
-            args: Value::Object(tool_call.arguments.clone().into_iter().collect()),
+            args: Value::Object(tool_call.arguments.clone()),
         })
         .await;
 
@@ -590,7 +590,7 @@ async fn execute_tool_calls_parallel(
         emit(AgentEvent::ToolExecutionStart {
             tool_call_id: tool_call.id.clone(),
             tool_name: tool_call.name.clone(),
-            args: Value::Object(tool_call.arguments.clone().into_iter().collect()),
+            args: Value::Object(tool_call.arguments.clone()),
         })
         .await;
 
@@ -778,7 +778,7 @@ async fn execute_prepared_tool_call(
         let emit = emit.clone();
         let tool_call_id = prepared.tool_call.id.clone();
         let tool_name = prepared.tool_call.name.clone();
-        let args = Value::Object(prepared.tool_call.arguments.clone().into_iter().collect());
+        let args = Value::Object(prepared.tool_call.arguments.clone());
         let update_handles = update_handles.clone();
         Arc::new(move |partial_result: AgentToolResult| {
             if !accepting.load(std::sync::atomic::Ordering::Acquire) {
