@@ -68,7 +68,11 @@ fn shared_adapter_skips_unchanged_inner_render_and_reacts_to_invalidation() {
 fn swap_slot_renders_a_replaced_occupant_at_the_same_width() {
     let handle = SlotHandle::new(Box::new(Text::with_text("editor")));
     let mut slot = SwapSlot::new(handle.clone());
-    assert!(slot.render(80).iter().any(|line| line.plain_text().contains("editor")));
+    assert!(
+        slot.render(80)
+            .iter()
+            .any(|line| line.plain_text().contains("editor"))
+    );
 
     handle.replace(Box::new(Text::with_text("selector")));
     assert!(

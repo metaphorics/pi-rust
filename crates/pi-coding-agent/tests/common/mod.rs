@@ -195,6 +195,8 @@ pub struct TestRuntimeOptions {
     pub prompt_templates: Vec<PromptTemplate>,
     /// Extension bridge override (defaults to `NoopExtensionBridge`).
     pub bridge: Option<Arc<dyn ExtensionBridge>>,
+    /// Pre-seeded `<agent-dir>/settings.json` content.
+    pub global_settings: Option<serde_json::Value>,
 }
 
 pub struct TestRuntime {
@@ -218,6 +220,13 @@ pub async fn make_runtime(options: TestRuntimeOptions) -> TestRuntime {
     std::fs::create_dir_all(&cwd).expect("cwd");
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&agent_dir).expect("agent dir");
+    if let Some(settings) = &options.global_settings {
+        std::fs::write(
+            agent_dir.join("settings.json"),
+            serde_json::to_string_pretty(settings).expect("settings json"),
+        )
+        .expect("seed settings.json");
+    }
 
     let auth = Arc::new(AuthStorage::new(agent_dir.join("auth.json")));
     if options.with_auth {

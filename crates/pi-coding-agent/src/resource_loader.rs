@@ -339,15 +339,15 @@ pub fn discover_extensions_in_dir(dir: &Path) -> Vec<PathBuf> {
         let is_dir = file_type.as_ref().is_some_and(|t| t.is_dir());
         // treat symlink as either
         let is_symlink = file_type.as_ref().is_some_and(|t| t.is_symlink());
-        if (is_file || is_symlink) && is_extension_file(&name)
-            && path.is_file() {
-                discovered.push(path);
-                continue;
-            }
+        if (is_file || is_symlink) && is_extension_file(&name) && path.is_file() {
+            discovered.push(path);
+            continue;
+        }
         if (is_dir || is_symlink)
-            && let Some(entries) = resolve_extension_entries(&path) {
-                discovered.extend(entries);
-            }
+            && let Some(entries) = resolve_extension_entries(&path)
+        {
+            discovered.extend(entries);
+        }
     }
     discovered
 }
@@ -357,29 +357,30 @@ pub fn resolve_extension_entries(dir: &Path) -> Option<Vec<PathBuf>> {
     let package_json = dir.join("package.json");
     if package_json.exists()
         && let Ok(text) = fs::read_to_string(&package_json)
-            && let Ok(value) = serde_json::from_str::<serde_json::Value>(&text)
-                && let Some(pi) = value.get("pi") {
-                    // pi.extensions array
-                    if let Some(arr) = pi
-                        .get("extensions")
-                        .and_then(|e| e.as_array())
-                        .or_else(|| pi.as_array())
-                    {
-                        let mut out = Vec::new();
-                        for item in arr {
-                            if let Some(s) = item.as_str() {
-                                let p = dir.join(s);
-                                if p.exists() {
-                                    out.push(p);
-                                }
-                            }
-                        }
-                        if !out.is_empty() {
-                            return Some(out);
-                        }
+        && let Ok(value) = serde_json::from_str::<serde_json::Value>(&text)
+        && let Some(pi) = value.get("pi")
+    {
+        // pi.extensions array
+        if let Some(arr) = pi
+            .get("extensions")
+            .and_then(|e| e.as_array())
+            .or_else(|| pi.as_array())
+        {
+            let mut out = Vec::new();
+            for item in arr {
+                if let Some(s) = item.as_str() {
+                    let p = dir.join(s);
+                    if p.exists() {
+                        out.push(p);
                     }
-                    // pi as object with extensions field already handled; if pi is true-ish empty, fall through
                 }
+            }
+            if !out.is_empty() {
+                return Some(out);
+            }
+        }
+        // pi as object with extensions field already handled; if pi is true-ish empty, fall through
+    }
     for index in ["index.ts", "index.js"] {
         let p = dir.join(index);
         if p.exists() {

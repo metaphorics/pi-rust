@@ -29,6 +29,7 @@ struct Shared {
     size: RefCell<(u16, u16)>,
     kitty: RefCell<bool>,
     stopped: RefCell<bool>,
+    progress_calls: RefCell<Vec<bool>>,
 }
 
 /// Test-side handle: inject input, resize, inspect the screen.
@@ -66,6 +67,11 @@ impl VtHandle {
     pub fn stopped(&self) -> bool {
         *self.shared.stopped.borrow()
     }
+
+    /// OSC 9;4 progress toggles the Tui issued, in order.
+    pub fn progress_calls(&self) -> Vec<bool> {
+        self.shared.progress_calls.borrow().clone()
+    }
 }
 
 /// pi-tui `Terminal` writing into a [`VtScreen`].
@@ -87,6 +93,7 @@ impl VtTerminal {
             size: RefCell::new((cols, rows)),
             kitty: RefCell::new(false),
             stopped: RefCell::new(false),
+            progress_calls: RefCell::new(Vec::new()),
         });
         (
             VtTerminal {
@@ -185,5 +192,7 @@ impl Terminal for VtTerminal {
         self.feed(&format!("\x1b]0;{title}\x07"));
     }
 
-    fn set_progress(&mut self, _active: bool) {}
+    fn set_progress(&mut self, active: bool) {
+        self.shared.progress_calls.borrow_mut().push(active);
+    }
 }

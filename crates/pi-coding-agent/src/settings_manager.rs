@@ -972,6 +972,15 @@ impl SettingsManager {
         self.settings.get_bool("quietStartup").unwrap_or(false)
     }
 
+    /// Oracle `getShowTerminalProgress`: `terminal.showTerminalProgress ?? false`.
+    pub fn get_show_terminal_progress(&self) -> bool {
+        self.settings
+            .get("terminal")
+            .and_then(|t| t.get("showTerminalProgress"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    }
+
     pub fn http_proxy(&self) -> Option<&str> {
         self.settings.get_str("httpProxy")
     }

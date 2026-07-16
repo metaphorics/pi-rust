@@ -961,7 +961,9 @@ impl InteractiveMode {
 
     /// Oracle `stop()` (:6002-6019) ordering.
     fn stop(&mut self) {
-        self.tui.terminal_mut().set_progress(false);
+        if self.show_terminal_progress_enabled() {
+            self.tui.terminal_mut().set_progress(false);
+        }
         self.clear_status_indicator(None);
         // Theme auto-sync off: drop the change listener.
         THEME_CHANGE_FLAG.with(|f| *f.borrow_mut() = None);
@@ -1573,12 +1575,25 @@ impl InteractiveMode {
     // Session event handler (oracle handleEvent :2829-3126)
     // ========================================================================
 
+    /// Oracle `settingsManager.getShowTerminalProgress()` gate for the OSC
+    /// 9;4 progress calls (interactive-mode.ts:2839,3027,3046,3060,6003).
+    fn show_terminal_progress_enabled(&self) -> bool {
+        self.runtime
+            .services()
+            .settings_manager
+            .lock()
+            .get_show_terminal_progress()
+    }
+
     fn handle_event(&mut self, event: AgentSessionEvent) {
         self.footer.borrow_mut().invalidate();
 
         match event {
             AgentSessionEvent::AgentStart => {
                 self.pending_tools.clear();
+                if self.show_terminal_progress_enabled() {
+                    self.tui.terminal_mut().set_progress(true);
+                }
                 if self.escape_override == Some(EscapeOverride::AbortRetry) {
                     self.escape_override = None;
                 }
@@ -1761,6 +1776,9 @@ impl InteractiveMode {
                 }
             }
             AgentSessionEvent::AgentEnd { .. } => {
+                if self.show_terminal_progress_enabled() {
+                    self.tui.terminal_mut().set_progress(false);
+                }
                 self.clear_status_indicator(Some(StatusIndicatorKind::Working));
                 if let Some((index, _)) = self.streaming_component.take() {
                     self.chat.borrow_mut().remove_child_at(index);
@@ -1771,6 +1789,9 @@ impl InteractiveMode {
             AgentSessionEvent::AgentSettled => {}
             AgentSessionEvent::TurnStart | AgentSessionEvent::TurnEnd { .. } => {}
             AgentSessionEvent::CompactionStart { reason } => {
+                if self.show_terminal_progress_enabled() {
+                    self.tui.terminal_mut().set_progress(true);
+                }
                 self.escape_override = Some(EscapeOverride::AbortCompaction);
                 self.show_status_indicator(StatusIndicator::compaction(match reason {
                     CompactionReason::Manual => CompactionStatusReason::Manual,
@@ -1786,6 +1807,9 @@ impl InteractiveMode {
                 will_retry,
                 error_message,
             } => {
+                if self.show_terminal_progress_enabled() {
+                    self.tui.terminal_mut().set_progress(false);
+                }
                 if self.escape_override == Some(EscapeOverride::AbortCompaction) {
                     self.escape_override = None;
                 }

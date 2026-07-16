@@ -461,6 +461,75 @@ async fn escape_aborts_a_mid_stream_run_and_clears_working_status() {
     assert!(!screen.contains("Working..."));
     assert_no_flicker(&handle);
 }
+#[tokio::test(flavor = "current_thread")]
+async fn terminal_progress_setting_drives_osc_9_4_around_agent_runs() {
+    // Enabled: agent_start → set_progress(true), agent_end → set_progress(false).
+    let test = make_runtime(TestRuntimeOptions {
+        with_auth: true,
+        script: vec![],
+        global_settings: Some(serde_json::json!({
+            "terminal": { "showTerminalProgress": true }
+        })),
+        ..Default::default()
+    })
+    .await;
+    let response = assistant_text_message(&test.model, "progress reply");
+    drop(test);
+    let test = make_runtime(TestRuntimeOptions {
+        with_auth: true,
+        script: vec![response.clone()],
+        global_settings: Some(serde_json::json!({
+            "terminal": { "showTerminalProgress": true }
+        })),
+        ..Default::default()
+    })
+    .await;
+    let (terminal, handle) = VtTerminal::new(80, 24);
+    let mut mode = InteractiveMode::new(
+        test.runtime.clone(),
+        terminal,
+        InteractiveModeOptions::default(),
+    );
+    mode.init();
+    assert!(handle.progress_calls().is_empty(), "no progress before run");
+
+    send(&mut mode, &handle, "go");
+    send(&mut mode, &handle, "\r");
+    pump_until(&mut mode, &handle, Duration::from_secs(2), |screen| {
+        screen.contains("progress reply")
+    })
+    .await;
+    pump_until(&mut mode, &handle, Duration::from_secs(2), |_| {
+        handle.progress_calls() == vec![true, false]
+    })
+    .await;
+
+    // Disabled (default): the same run issues no OSC 9;4 traffic at all.
+    let test = make_runtime(TestRuntimeOptions {
+        with_auth: true,
+        script: vec![response],
+        ..Default::default()
+    })
+    .await;
+    let (terminal, handle) = VtTerminal::new(80, 24);
+    let mut mode = InteractiveMode::new(
+        test.runtime.clone(),
+        terminal,
+        InteractiveModeOptions::default(),
+    );
+    mode.init();
+    send(&mut mode, &handle, "go");
+    send(&mut mode, &handle, "\r");
+    pump_until(&mut mode, &handle, Duration::from_secs(2), |screen| {
+        screen.contains("progress reply")
+    })
+    .await;
+    assert!(
+        handle.progress_calls().is_empty(),
+        "progress emitted with setting off: {:?}",
+        handle.progress_calls()
+    );
+}
 
 #[test]
 fn submit_dispatch_preserves_oracle_precedence() {

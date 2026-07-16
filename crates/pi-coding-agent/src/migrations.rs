@@ -30,52 +30,54 @@ pub fn migrate_auth_to_auth_json(agent_dir: &Path) -> Vec<String> {
 
     if oauth_path.exists()
         && let Ok(text) = fs::read_to_string(&oauth_path)
-            && let Ok(Value::Object(oauth)) = serde_json::from_str::<Value>(&text) {
-                for (provider, cred) in oauth {
-                    if let Value::Object(mut c) = cred {
-                        c.insert("type".into(), Value::String("oauth".into()));
-                        // ensure type is first-ish: rebuild
-                        let mut ordered = Map::new();
-                        ordered.insert("type".into(), Value::String("oauth".into()));
-                        for (k, v) in c {
-                            if k != "type" {
-                                ordered.insert(k, v);
-                            }
-                        }
-                        migrated.insert(provider.clone(), Value::Object(ordered));
-                        providers.push(provider);
+        && let Ok(Value::Object(oauth)) = serde_json::from_str::<Value>(&text)
+    {
+        for (provider, cred) in oauth {
+            if let Value::Object(mut c) = cred {
+                c.insert("type".into(), Value::String("oauth".into()));
+                // ensure type is first-ish: rebuild
+                let mut ordered = Map::new();
+                ordered.insert("type".into(), Value::String("oauth".into()));
+                for (k, v) in c {
+                    if k != "type" {
+                        ordered.insert(k, v);
                     }
                 }
-                let _ = fs::rename(&oauth_path, format!("{}.migrated", oauth_path.display()));
+                migrated.insert(provider.clone(), Value::Object(ordered));
+                providers.push(provider);
             }
+        }
+        let _ = fs::rename(&oauth_path, format!("{}.migrated", oauth_path.display()));
+    }
 
     if settings_path.exists()
         && let Ok(text) = fs::read_to_string(&settings_path)
-            && let Ok(Value::Object(mut settings)) = serde_json::from_str::<Value>(&text)
-                && let Some(Value::Object(api_keys)) = settings.remove("apiKeys") {
-                    for (provider, key) in api_keys {
-                        if migrated.contains_key(&provider) {
-                            continue;
-                        }
-                        if let Value::String(k) = key {
-                            let mut obj = Map::new();
-                            obj.insert("type".into(), Value::String("api_key".into()));
-                            obj.insert("key".into(), Value::String(k));
-                            migrated.insert(provider.clone(), Value::Object(obj));
-                            providers.push(provider);
-                        }
-                    }
-                    let pretty = serde_json::to_string_pretty(&Value::Object(settings))
-                        .unwrap_or_else(|_| "{}".into());
-                    let _ = fs::write(&settings_path, pretty);
-                }
+        && let Ok(Value::Object(mut settings)) = serde_json::from_str::<Value>(&text)
+        && let Some(Value::Object(api_keys)) = settings.remove("apiKeys")
+    {
+        for (provider, key) in api_keys {
+            if migrated.contains_key(&provider) {
+                continue;
+            }
+            if let Value::String(k) = key {
+                let mut obj = Map::new();
+                obj.insert("type".into(), Value::String("api_key".into()));
+                obj.insert("key".into(), Value::String(k));
+                migrated.insert(provider.clone(), Value::Object(obj));
+                providers.push(provider);
+            }
+        }
+        let pretty =
+            serde_json::to_string_pretty(&Value::Object(settings)).unwrap_or_else(|_| "{}".into());
+        let _ = fs::write(&settings_path, pretty);
+    }
 
     if !migrated.is_empty() {
         if let Some(parent) = auth_path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        let pretty = serde_json::to_string_pretty(&Value::Object(migrated))
-            .unwrap_or_else(|_| "{}".into());
+        let pretty =
+            serde_json::to_string_pretty(&Value::Object(migrated)).unwrap_or_else(|_| "{}".into());
         let _ = fs::write(&auth_path, pretty);
         #[cfg(unix)]
         {
@@ -167,21 +169,22 @@ fn check_deprecated_extension_dirs(base_dir: &Path, label: &str) -> Vec<String> 
     }
     let tools_dir = base_dir.join("tools");
     if tools_dir.exists()
-        && let Ok(rd) = fs::read_dir(&tools_dir) {
-            let custom: Vec<_> = rd
-                .flatten()
-                .filter(|e| {
-                    let name = e.file_name().to_string_lossy().to_ascii_lowercase();
-                    !matches!(name.as_str(), "fd" | "rg" | "fd.exe" | "rg.exe")
-                        && !name.starts_with('.')
-                })
-                .collect();
-            if !custom.is_empty() {
-                warnings.push(format!(
+        && let Ok(rd) = fs::read_dir(&tools_dir)
+    {
+        let custom: Vec<_> = rd
+            .flatten()
+            .filter(|e| {
+                let name = e.file_name().to_string_lossy().to_ascii_lowercase();
+                !matches!(name.as_str(), "fd" | "rg" | "fd.exe" | "rg.exe")
+                    && !name.starts_with('.')
+            })
+            .collect();
+        if !custom.is_empty() {
+            warnings.push(format!(
                     "{label} tools/ directory contains custom tools. Custom tools have been merged into extensions."
                 ));
-            }
         }
+    }
     warnings
 }
 

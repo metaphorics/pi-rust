@@ -620,7 +620,12 @@ impl<R: CommandRunner> DefaultPackageManager<R> {
                 );
                 continue;
             }
-            let is_package = self.collect_package_resources(&installed, filter.as_ref(), &metadata, &mut result)?;
+            let is_package = self.collect_package_resources(
+                &installed,
+                filter.as_ref(),
+                &metadata,
+                &mut result,
+            )?;
             if matches!(parsed_source, PackageSource::Local { .. })
                 && installed.is_dir()
                 && !is_package
@@ -730,9 +735,7 @@ impl<R: CommandRunner> DefaultPackageManager<R> {
                 Some(filter) if filter.patterns(resource_type).is_some() => {
                     let patterns = filter.patterns(resource_type).unwrap_or_default();
                     if patterns.is_empty() {
-                        all.into_iter()
-                            .map(|path| (path, false))
-                            .collect()
+                        all.into_iter().map(|path| (path, false)).collect()
                     } else {
                         let enabled = apply_patterns(&all, patterns, root);
                         all.into_iter()
@@ -743,10 +746,7 @@ impl<R: CommandRunner> DefaultPackageManager<R> {
                             .collect()
                     }
                 }
-                _ => all
-                    .into_iter()
-                    .map(|path| (path, true))
-                    .collect(),
+                _ => all.into_iter().map(|path| (path, true)).collect(),
             };
             for (path, enabled) in states {
                 add_resolved(
@@ -1762,7 +1762,6 @@ fn is_override(entry: &str) -> bool {
 fn has_glob(entry: &str) -> bool {
     entry.contains(['*', '?', '[', '{'])
 }
-
 
 fn add_resolved(
     output: &mut ResolvedPaths,

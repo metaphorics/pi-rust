@@ -912,7 +912,9 @@ impl SessionManager {
         }
 
         // Re-append label entries after the last path entry.
-        let mut parent_id = path_without_labels.last().and_then(|e| e.id().map(str::to_string));
+        let mut parent_id = path_without_labels
+            .last()
+            .and_then(|e| e.id().map(str::to_string));
         let mut label_entries: Vec<SessionEntry> = Vec::new();
         for (target_id, label, label_timestamp) in labels_to_write {
             let id = generate_entry_id(&path_entry_ids);
