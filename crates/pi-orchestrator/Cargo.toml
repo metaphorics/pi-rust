@@ -8,9 +8,12 @@ description = "pi orchestrator: supervisor spawning pi --mode rpc"
 [dependencies]
 dirs = "6"
 jiff.workspace = true
+rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
+uuid = { version = "1", features = ["v4"] }
 
 [[bin]]
 name = "pi-orchestrator"

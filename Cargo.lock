@@ -1396,9 +1396,12 @@ version = "0.1.0"
 dependencies = [
  "dirs",
  "jiff",
+ "rustix",
  "serde",
  "serde_json",
  "thiserror",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
