@@ -5,4 +5,6 @@
 //! writes stdout except [`crate::wire_out::WireOut`]; diagnostics go to
 //! stderr.
 
+pub mod json;
+pub mod print;
 pub mod rpc;
