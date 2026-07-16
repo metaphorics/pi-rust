@@ -1843,6 +1843,8 @@ invalid-line-format
     #[test]
     fn test_list_sessions_from_dir_read_dir_failure_returns_empty() {
         let parent = tempfile::tempdir().unwrap();
+
+        // 1. Missing directory case (exists=false, tests !dir.exists() branch)
         let missing = parent.path().join("missing");
         assert!(!missing.exists());
         let list = SessionManager::list_all(Some(missing.clone()), None).unwrap();
@@ -1855,35 +1857,18 @@ invalid-line-format
         let resolved = resolve_session_path("any-id", cwd, Some(missing)).unwrap();
         assert!(matches!(resolved, ResolvedSession::NotFound(_)));
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
+        // 2. Existing regular file case (exists=true, read_dir reliably errors on all platforms)
+        let file_path = parent.path().join("regular_file.txt");
+        fs::write(&file_path, b"dummy session content").unwrap();
+        assert!(file_path.exists());
 
-            struct RestorePerms(PathBuf);
-            impl Drop for RestorePerms {
-                fn drop(&mut self) {
-                    let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700));
-                }
-            }
+        let list = SessionManager::list_all(Some(file_path.clone()), None).unwrap();
+        assert!(list.is_empty());
 
-            let dir = tempfile::tempdir().unwrap();
-            let unreadable = dir.path().join("no-read");
-            fs::create_dir(&unreadable).unwrap();
-            let mut perms = fs::metadata(&unreadable).unwrap().permissions();
-            perms.set_mode(0o000);
-            fs::set_permissions(&unreadable, perms).unwrap();
-            let _restore = RestorePerms(unreadable.clone());
+        let list = SessionManager::list(cwd, Some(file_path.clone()), None).unwrap();
+        assert!(list.is_empty());
 
-            if fs::read_dir(&unreadable).is_err() {
-                let list_all =
-                    SessionManager::list_all(Some(unreadable.clone()), None).unwrap();
-                assert!(list_all.is_empty());
-                let list = SessionManager::list(cwd, Some(unreadable.clone()), None).unwrap();
-                assert!(list.is_empty());
-                let resolved =
-                    resolve_session_path("any-id", cwd, Some(unreadable)).unwrap();
-                assert!(matches!(resolved, ResolvedSession::NotFound(_)));
-            }
-        }
+        let resolved = resolve_session_path("any-id", cwd, Some(file_path)).unwrap();
+        assert!(matches!(resolved, ResolvedSession::NotFound(_)));
     }
 }
