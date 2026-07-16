@@ -3,3 +3,4 @@
 pub mod config;
 pub mod storage;
 pub mod types;
+pub mod wire;
