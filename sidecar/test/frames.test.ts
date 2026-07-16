@@ -107,6 +107,26 @@ describe("footer and status", () => {
     const frames = framesOf(bridge, "footer");
     expect(frames[0]?.lines[0]).toContain("footer:status-live");
   });
+
+  test("setStatus after the initial flush re-renders the bridged footer leaf", async () => {
+    const bridge = await bootWithUi();
+    await bridge.peer.request("command/execute", { name: "show-footer", args: "" });
+    await flushMicrotasks();
+    // Initial frame flushed with the boot-time status.
+    const initial = framesOf(bridge, "footer");
+    expect(initial.length).toBe(1);
+    expect(initial[0]?.lines[0]).toContain("footer:status-live");
+
+    // A later status mutation alone (oracle: setExtensionStatus + render
+    // request) must dirty the footer leaf and ship a fresh frame.
+    await bridge.peer.request("command/execute", { name: "set-status", args: "status-later" });
+    await flushMicrotasks();
+    const frames = framesOf(bridge, "footer");
+    expect(frames.length).toBe(2);
+    expect(frames[1]?.lines[0]).toContain("footer:status-later");
+    expect(frames[1]?.version).toBe(2);
+    expect(bridge.notificationsOf("ui/setStatus")).toContainEqual({ key: "fixture", value: "status-later" });
+  });
 });
 
 describe("dialogs", () => {

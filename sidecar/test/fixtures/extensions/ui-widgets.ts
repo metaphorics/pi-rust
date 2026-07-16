@@ -86,6 +86,12 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("set-status", {
+		handler: async (args, ctx) => {
+			ctx.ui.setStatus("fixture", args);
+		},
+	});
+
 	pi.registerCommand("ask-select", {
 		handler: async (args, ctx) => {
 			const choice = await ctx.ui.select("Pick one", ["alpha", "beta"], {

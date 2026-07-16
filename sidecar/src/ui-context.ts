@@ -151,6 +151,10 @@ export function createUi(runtime: SidecarRuntime): CreatedUi {
     },
     setStatus(key, text) {
       footerData.setExtensionStatus(key, text);
+      // Oracle: interactive-mode setExtensionStatus() requests a render
+      // after the provider mutation; the bridged footer leaf must repaint
+      // too (markDirty no-ops until a footer is registered).
+      bridge.markDirty("footer");
       peer.notify("ui/setStatus", text !== undefined ? { key, value: text } : { key });
     },
     setWorkingMessage(message) {
