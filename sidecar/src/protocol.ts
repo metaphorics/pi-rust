@@ -153,6 +153,11 @@ export const NOTIFICATION_METHODS = [
   "state/update",
   "error/extension",
 ] as const;
+
+export interface ThemeCatalogEntry {
+  name: string;
+  path?: string;
+}
 export type NotificationMethod = (typeof NOTIFICATION_METHODS)[number];
 
 const REQUEST_METHOD_SET: ReadonlySet<string> = new Set(REQUEST_METHODS);

@@ -23,12 +23,16 @@ export { KeybindingsManager } from "../node_modules/@earendil-works/pi-coding-ag
 export type { KeybindingsConfig } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/keybindings.js";
 export {
   getAvailableThemesWithPaths,
+  getEditorTheme,
   getThemeByName,
   loadThemeFromPath,
   setThemeInstance,
   theme as activeTheme,
 } from "../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/theme/theme.js";
+export { FooterDataProvider } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/footer-data-provider.js";
 export type {
+  EditorFactory,
   MessageEndEvent,
   ReplacedSessionContext,
+  ToolRenderContext,
 } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/extensions/types.js";

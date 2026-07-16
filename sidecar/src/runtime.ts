@@ -65,6 +65,7 @@ export interface SidecarRuntime {
   peer: RpcPeer;
   providers: Map<string, RegisteredProvider>;
   keybindingsConfig: KeybindingsConfig;
+  keybindings: KeybindingsManager;
   eventBus: EventBusController;
   mode: InitParamsDto["mode"];
   hasUi: boolean;
@@ -79,8 +80,8 @@ export interface SidecarRuntime {
 export interface BootOptions {
   init: InitParamsDto;
   peer: RpcPeer;
-  /** UI context factory (C4). When absent the runner keeps its no-op UI. */
-  uiContext?: (runtime: SidecarRuntime) => ExtensionUIContext;
+  /** UI context factory (C4). When absent/declining the runner keeps its no-op UI. */
+  uiContext?: (runtime: SidecarRuntime) => ExtensionUIContext | undefined;
 }
 
 /**
@@ -343,6 +344,7 @@ export async function bootRuntime(options: BootOptions): Promise<SidecarRuntime>
     peer,
     providers,
     keybindingsConfig,
+    keybindings,
     eventBus,
     mode: init.mode,
     hasUi: init.hasUi,

@@ -14,7 +14,11 @@ export async function startSidecar(): Promise<void> {
   const sink = installStdioGuard();
 
   // Dynamic on purpose: see the module comment (guard-before-evaluation).
-  const [{ attachHost }, { RpcPeer }] = await Promise.all([import("./host.ts"), import("./rpc.ts")]);
+  const [{ attachHost }, { RpcPeer }, { createUi }] = await Promise.all([
+    import("./host.ts"),
+    import("./rpc.ts"),
+    import("./ui-context.ts"),
+  ]);
 
   const peer = new RpcPeer({
     write: protocolWrite,
@@ -29,6 +33,7 @@ export async function startSidecar(): Promise<void> {
     onShutdown: () => {
       process.exit(0);
     },
+    createUi: (runtime) => (runtime.hasUi ? createUi(runtime) : undefined),
   });
 
   process.stdin.on("data", (chunk: Buffer) => {

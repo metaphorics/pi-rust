@@ -10,6 +10,7 @@ import { join } from "node:path";
 
 import { attachHost } from "../src/host.ts";
 import type { SidecarHost } from "../src/host.ts";
+import { createUi } from "../src/ui-context.ts";
 import type {
   InitParamsDto,
   InitializedParamsDto,
@@ -167,7 +168,11 @@ export function createTestBridge(): RustSide {
     });
   }
 
-  const host = attachHost({ peer: sidecarPeer, bunVersion: "test" });
+  const host = attachHost({
+    peer: sidecarPeer,
+    bunVersion: "test",
+    createUi: (runtime) => (runtime.hasUi ? createUi(runtime) : undefined),
+  });
 
   return {
     peer: rustPeer,

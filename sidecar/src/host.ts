@@ -51,9 +51,10 @@ function asObject(value: JsonValue): JsonObject {
 }
 
 /**
- * UI bridge seam implemented by the headless UI layer (frames.ts). The host
- * delegates UI-family inbound traffic here; without a bridge those requests
- * fail and notifications are ignored (print/json modes).
+ * UI bridge seam implemented by the headless UI layer (ui-context.ts /
+ * frames.ts). The host delegates UI-family inbound traffic here; without a
+ * bridge those requests fail and notifications are ignored (print/json
+ * modes). Tool-record hooks feed the tool renderer slots.
  */
 export interface UiBridge {
   render(slot: string, width: number): string[];
@@ -61,6 +62,9 @@ export interface UiBridge {
   dispose(slot: string): void;
   terminalInput(data: string): Promise<TerminalInputResultDto>;
   autocomplete(text: string, cursor: number, commandName?: string): Promise<JsonValue>;
+  recordToolCall(toolCallId: string, toolName: string, args: unknown): void;
+  recordToolUpdate(toolCallId: string, partial: unknown): void;
+  recordToolResult(toolCallId: string, result: unknown, isError: boolean): void;
 }
 
 export interface SidecarHost {
@@ -76,8 +80,8 @@ export interface HostOptions {
   bunVersion?: string;
   /** Called after lifecycle/shutdown is acknowledged. */
   onShutdown?: () => void;
-  /** UI layer factory, invoked at boot (C4 wires this). */
-  createUi?: (runtime: SidecarRuntime) => { context: ExtensionUIContext; bridge: UiBridge };
+  /** UI layer factory, invoked at boot (C4 wires this). May decline (no UI mode). */
+  createUi?: (runtime: SidecarRuntime) => { context: ExtensionUIContext; bridge: UiBridge } | undefined;
 }
 
 export function attachHost(options: HostOptions): SidecarHost {
@@ -123,8 +127,8 @@ export function attachHost(options: HostOptions): SidecarHost {
           ? undefined
           : (booted) => {
               const ui = createUi(booted);
-              host.uiBridge = ui.bridge;
-              return ui.context;
+              host.uiBridge = ui?.bridge;
+              return ui?.context;
             },
     });
     host.runtime = runtime;
@@ -187,10 +191,23 @@ export function attachHost(options: HostOptions): SidecarHost {
     if (registered === undefined) {
       throw new Error(`extension tool not found: ${name}`);
     }
+    host.uiBridge?.recordToolCall(toolCallId, name, args);
     const agentTool = wrapRegisteredTool(registered, runtime.runner);
-    const result = await agentTool.execute(toolCallId, fromWire(args), signal, (partial) => {
-      peer.notify("tool/update", { toolCallId, partial: toWire(partial) });
-    });
+    let result;
+    try {
+      result = await agentTool.execute(toolCallId, fromWire(args), signal, (partial) => {
+        host.uiBridge?.recordToolUpdate(toolCallId, partial);
+        peer.notify("tool/update", { toolCallId, partial: toWire(partial) });
+      });
+    } catch (error) {
+      host.uiBridge?.recordToolResult(
+        toolCallId,
+        { content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }], details: {} },
+        true,
+      );
+      throw error;
+    }
+    host.uiBridge?.recordToolResult(toolCallId, result, false);
     // Declared wire shape only ({content, details?, isError}); tool failure
     // is a thrown error -> err frame. addedToolNames/terminate have no wire
     // slot in protocol v1 (recorded as a gap in the task report).
