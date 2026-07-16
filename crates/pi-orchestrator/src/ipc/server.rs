@@ -232,7 +232,11 @@ async fn serve_connection(
 
     // Buffer events while the stream is opened. Forwarding starts only after
     // rpc_ready is queued, so rpc_ready is always the first stream message.
+    // `stream_tx` keeps per-command error lines on the same lane as handler
+    // responses: both funnel through the event forwarder, so a command's
+    // response can never be overtaken by a later command's error line.
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<String>();
+    let stream_tx = event_tx.clone();
     let Some(mut rpc_stream) = handler
         .open_rpc_stream(&instance_id, RpcEventSink::new(event_tx))
         .await
@@ -272,11 +276,11 @@ async fn serve_connection(
         match serde_json::from_str::<Value>(trimmed) {
             Ok(request) => {
                 if let Err(error) = rpc_stream.handle_request(request).await {
-                    send_response(&write_tx, &OrchestratorResponse::error(error));
+                    send_response(&stream_tx, &OrchestratorResponse::error(error));
                 }
             }
             Err(error) => {
-                send_response(&write_tx, &OrchestratorResponse::error(error.to_string()));
+                send_response(&stream_tx, &OrchestratorResponse::error(error.to_string()));
             }
         }
     };
