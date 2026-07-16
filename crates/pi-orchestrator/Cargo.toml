@@ -12,6 +12,10 @@ dirs = "6"
 # Node-compatible hostname for Radius registration payloads.
 hostname = "0.4"
 jiff.workspace = true
+# Lifecycle diagnostics (console.error analog) without stderr writes in library code.
+log = "0.4"
+# Poison-free synchronous guards for supervisor state.
+parking_lot = "0.12"
 # Radius OAuth credential storage.
 pi-ai = { path = "../pi-ai" }
 # Shared ~/.pi/agent/auth.json path resolution.
@@ -32,7 +36,15 @@ uuid = { version = "1", features = ["v4"] }
 # WHATWG-compatible URL resolution for Radius endpoints.
 url = "2"
 
+[features]
+# Storage fault-injection seam for this crate's own lifecycle tests; never
+# enabled by production builds (the self dev-dependency below turns it on
+# for test targets only).
+test-fault-injection = []
+
 [dev-dependencies]
+# Enables the storage fault-injection seam for integration tests only.
+pi-orchestrator = { path = ".", features = ["test-fault-injection"] }
 # Isolated auth and persistence fixtures.
 tempfile = "3"
 # Paused-time heartbeat tests.

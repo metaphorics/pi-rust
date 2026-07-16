@@ -28,7 +28,6 @@ pub struct RadiusRegistration {
     pub expires_in_ms: u64,
 }
 
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InstanceRecord {

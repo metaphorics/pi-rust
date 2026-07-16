@@ -1,9 +1,10 @@
-//! Persistence and wire foundations for the pi orchestrator.
+//! Persistence, wire, and lifecycle foundations for the pi orchestrator.
 
 pub mod config;
-pub mod radius;
 pub mod ipc;
+pub mod radius;
 pub mod rpc_process;
 pub mod storage;
+pub mod supervisor;
 pub mod types;
 pub mod wire;

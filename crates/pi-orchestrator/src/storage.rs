@@ -19,6 +19,20 @@ pub enum StorageError {
 
 pub type Result<T, E = StorageError> = std::result::Result<T, E>;
 
+/// A mutating instance operation, identified so a
+/// [`Storage::with_fault_injection`] hook can target one exact call.
+#[cfg(feature = "test-fault-injection")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StorageOp<'a> {
+    /// `upsert_instance` for the given instance id.
+    UpsertInstance(&'a str),
+    /// `remove_instance` for the given instance id.
+    RemoveInstance(&'a str),
+}
+
+#[cfg(feature = "test-fault-injection")]
+type FaultHook = dyn for<'a> Fn(StorageOp<'a>) -> Result<()> + Send + Sync;
+
 /// JSON persistence for orchestrator state.
 ///
 /// All instances targeting the same directory share one lock so a read-modify-write
@@ -26,6 +40,8 @@ pub type Result<T, E = StorageError> = std::result::Result<T, E>;
 pub struct Storage {
     orchestrator_dir: PathBuf,
     lock: Arc<Mutex<()>>,
+    #[cfg(feature = "test-fault-injection")]
+    fault: Option<Arc<FaultHook>>,
 }
 
 impl Storage {
@@ -39,6 +55,31 @@ impl Storage {
         Self {
             orchestrator_dir,
             lock,
+            #[cfg(feature = "test-fault-injection")]
+            fault: None,
+        }
+    }
+
+    /// Test seam: `hook` runs at the start of every instance mutation and an
+    /// `Err` fails that call before any file I/O, so lifecycle tests can
+    /// break one exact persist or removal. Compiled only under the
+    /// `test-fault-injection` feature, which this crate's own tests enable
+    /// via the self dev-dependency; production builds carry no hook field,
+    /// no check, and no branch.
+    #[cfg(feature = "test-fault-injection")]
+    pub fn with_fault_injection(
+        mut self,
+        hook: impl for<'a> Fn(StorageOp<'a>) -> Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        self.fault = Some(Arc::new(hook));
+        self
+    }
+
+    #[cfg(feature = "test-fault-injection")]
+    fn check_fault(&self, op: StorageOp<'_>) -> Result<()> {
+        match &self.fault {
+            Some(hook) => hook(op),
+            None => Ok(()),
         }
     }
 
@@ -80,6 +121,8 @@ impl Storage {
     }
 
     pub fn upsert_instance(&self, instance: InstanceRecord) -> Result<()> {
+        #[cfg(feature = "test-fault-injection")]
+        self.check_fault(StorageOp::UpsertInstance(&instance.id))?;
         let _guard = self.acquire()?;
         let mut instances = self.load_instances_unlocked()?;
         if let Some(existing) = instances
@@ -94,6 +137,8 @@ impl Storage {
     }
 
     pub fn remove_instance(&self, instance_id: &str) -> Result<()> {
+        #[cfg(feature = "test-fault-injection")]
+        self.check_fault(StorageOp::RemoveInstance(instance_id))?;
         let _guard = self.acquire()?;
         let mut instances = self.load_instances_unlocked()?;
         instances.retain(|instance| instance.id != instance_id);
@@ -313,10 +358,7 @@ mod tests {
         assert!(Arc::ptr_eq(&first.lock, &second.lock));
         let barrier = Arc::new(std::sync::Barrier::new(3));
         let mut workers = Vec::new();
-        for (id, storage) in [
-            ("concurrent-one", first),
-            ("concurrent-two", second),
-        ] {
+        for (id, storage) in [("concurrent-one", first), ("concurrent-two", second)] {
             let barrier = Arc::clone(&barrier);
             workers.push(std::thread::spawn(move || {
                 barrier.wait();
