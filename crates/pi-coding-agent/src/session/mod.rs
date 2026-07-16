@@ -114,6 +114,24 @@ pub enum StreamingBehavior {
     FollowUp,
 }
 
+/// `"steer" | "followUp" | "nextTurn"` (sendCustomMessage `deliverAs`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CustomMessageDelivery {
+    Steer,
+    FollowUp,
+    NextTurn,
+}
+
+/// Options for [`AgentSession::send_custom_message`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SendCustomMessageOptions {
+    /// If true and not streaming, triggers a new LLM turn.
+    pub trigger_turn: bool,
+    /// Delivery mode: steer (default while streaming), followUp, or nextTurn.
+    pub deliver_as: Option<CustomMessageDelivery>,
+}
+
 /// Options for [`AgentSession::prompt`].
 #[derive(Default)]
 pub struct PromptOptions {
@@ -152,6 +170,8 @@ pub struct PromptTemplate {
     pub argument_hint: Option<String>,
     pub content: String,
     pub file_path: PathBuf,
+    /// Provenance (oracle `PromptTemplate.sourceInfo`), set by the loader.
+    pub source_info: crate::source_info::SourceInfo,
 }
 
 /// Tool definition plus the prompt metadata pi layers on top of `AgentTool`.
@@ -286,6 +306,9 @@ struct SessionState {
     follow_up_mode: QueueMode,
     steering_texts: Vec<String>,
     follow_up_texts: Vec<String>,
+    // Custom messages queued for the next user prompt (oracle
+    // `_pendingNextTurnMessages`, "asides").
+    pending_next_turn: Vec<AgentMessage>,
     // Deferred bashExecution messages recorded mid-run.
     pending_bash: Vec<Value>,
     // Run lifecycle.
@@ -515,6 +538,7 @@ impl AgentSession {
             follow_up_mode,
             steering_texts: Vec::new(),
             follow_up_texts: Vec::new(),
+            pending_next_turn: Vec::new(),
             pending_bash: Vec::new(),
             run_active: false,
             run_cancel: None,
@@ -672,6 +696,10 @@ impl AgentSession {
 
     pub fn prompt_templates(&self) -> Vec<PromptTemplate> {
         self.inner.state.lock().prompt_templates.clone()
+    }
+
+    pub fn skills(&self) -> Vec<Skill> {
+        self.inner.state.lock().skills.clone()
     }
 
     /// Run a closure with the session manager (read-only access patterns).
@@ -858,10 +886,17 @@ impl AgentSession {
         for image in options.images {
             content.push(Content::Image(image));
         }
-        let messages = vec![AgentMessage::user(UserMessage {
+        let mut messages = vec![AgentMessage::user(UserMessage {
             content: UserContent::Blocks(content),
             timestamp: now_ms(),
         })];
+
+        // Inject pending "nextTurn" custom messages as context alongside the
+        // user message (agent-session.ts:1177-1181).
+        {
+            let mut state = self.inner.state.lock();
+            messages.append(&mut state.pending_next_turn);
+        }
 
         // No extensions: always reset to base prompt (agent-session.ts:1200).
         {
@@ -885,6 +920,99 @@ impl AgentSession {
         let mut expanded = self.expand_skill_command(text);
         expanded = self.expand_prompt_template(&expanded);
         self.queue_follow_up(expanded, images);
+    }
+
+    /// Send a custom (extension-defined) message to the agent (oracle
+    /// `sendCustomMessage`, agent-session.ts:1388).
+    ///
+    /// Delivery: `nextTurn` queues the message as context for the next user
+    /// prompt; while streaming it queues via steer (default) or followUp;
+    /// when idle it either triggers a turn (`trigger_turn`) or appends to
+    /// state/session without a turn.
+    pub async fn send_custom_message(
+        &self,
+        custom_type: &str,
+        content: Option<Value>,
+        display: bool,
+        details: Option<Value>,
+        options: SendCustomMessageOptions,
+    ) {
+        // Untyped extensions can pass null/missing content; normalize at
+        // ingestion (agent-session.ts:1396).
+        let content = match content {
+            Some(Value::Null) | None => Value::Array(Vec::new()),
+            Some(value) => value,
+        };
+
+        let mut value = serde_json::Map::new();
+        value.insert("role".into(), Value::String("custom".into()));
+        value.insert("customType".into(), Value::String(custom_type.into()));
+        value.insert("content".into(), content.clone());
+        value.insert("display".into(), Value::Bool(display));
+        if let Some(details) = &details {
+            value.insert("details".into(), details.clone());
+        }
+        value.insert("timestamp".into(), Value::Number(now_ms().into()));
+        let app_message = AgentMessage::Custom(Value::Object(value));
+
+        if options.deliver_as == Some(CustomMessageDelivery::NextTurn) {
+            self.inner.state.lock().pending_next_turn.push(app_message);
+            return;
+        }
+
+        // Streaming check and run claim in ONE lock acquisition (active-run
+        // invariant, same discipline as prompt_inner).
+        enum Action {
+            Queued,
+            Run(RunGuard),
+            Append,
+        }
+        let action = {
+            let mut state = self.inner.state.lock();
+            if state.run_active {
+                // Oracle queues on the agent-level typed queues only; the
+                // display texts and queue_update event are for text prompts.
+                if options.deliver_as == Some(CustomMessageDelivery::FollowUp) {
+                    state.follow_up_queue.push(app_message.clone());
+                } else {
+                    state.steering_queue.push(app_message.clone());
+                }
+                Action::Queued
+            } else if options.trigger_turn {
+                state.run_active = true;
+                let _ = self.inner.active_tx.send(true);
+                Action::Run(RunGuard {
+                    inner: self.inner.clone(),
+                })
+            } else {
+                Action::Append
+            }
+        };
+
+        match action {
+            Action::Queued => {}
+            Action::Run(run_claim) => {
+                self.run_agent_prompt(vec![app_message], run_claim).await;
+            }
+            Action::Append => {
+                {
+                    let mut state = self.inner.state.lock();
+                    state.messages.push(app_message.clone());
+                    let _ = state.session_manager.append_custom_message_entry(
+                        custom_type,
+                        content,
+                        display,
+                        details,
+                    );
+                }
+                self.inner.emit(&AgentSessionEvent::MessageStart {
+                    message: app_message.clone(),
+                });
+                self.inner.emit(&AgentSessionEvent::MessageEnd {
+                    message: app_message,
+                });
+            }
+        }
     }
 
     fn queue_steer(&self, text: String, images: Vec<ImageContent>) {

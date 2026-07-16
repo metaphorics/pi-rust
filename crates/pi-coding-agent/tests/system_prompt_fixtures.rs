@@ -26,6 +26,7 @@ fn sample_skill() -> Skill {
         description: "A demo skill for fixtures".into(),
         file_path: PathBuf::from("/tmp/skills/demo-skill/SKILL.md"),
         base_dir: PathBuf::from("/tmp/skills/demo-skill"),
+        source_info: Default::default(),
         disable_model_invocation: false,
     }
 }

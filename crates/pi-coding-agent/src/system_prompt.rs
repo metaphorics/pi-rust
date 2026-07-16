@@ -6,19 +6,23 @@
 
 use crate::config::get_package_dir;
 use crate::resource_loader::load_project_context_file_paths;
+use crate::source_info::SourceInfo;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Skill metadata used when formatting the skills section of the system prompt.
 ///
-/// Port of the fields from `skills.ts` `Skill` that `formatSkillsForPrompt` needs.
+/// Port of the fields from `skills.ts` `Skill` that `formatSkillsForPrompt`
+/// and the RPC `get_commands` wire surface need.
 #[derive(Clone, Debug)]
 pub struct Skill {
     pub name: String,
     pub description: String,
     pub file_path: PathBuf,
     pub base_dir: PathBuf,
+    /// Provenance (oracle `Skill.sourceInfo`), set by the loading layer.
+    pub source_info: SourceInfo,
     /// When true, the skill is hidden from the model-facing skills list.
     pub disable_model_invocation: bool,
 }
@@ -30,6 +34,7 @@ impl Default for Skill {
             description: String::new(),
             file_path: PathBuf::new(),
             base_dir: PathBuf::new(),
+            source_info: SourceInfo::default(),
             disable_model_invocation: false,
         }
     }
@@ -343,6 +348,7 @@ mod tests {
             description: "y".into(),
             file_path: PathBuf::from("/s/SKILL.md"),
             base_dir: PathBuf::from("/s"),
+            source_info: Default::default(),
             disable_model_invocation: true,
         }];
         assert_eq!(format_skills_for_prompt(&skills), "");
