@@ -72,10 +72,6 @@ pub struct ModelOverride {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub api: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub base_url: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking_level_map: Option<pi_ai::types::ThinkingLevelMap>,
@@ -1420,20 +1416,6 @@ fn validate_config(config: &ModelsConfig) -> Result<(), String> {
         let models = provider_config.models.as_deref().unwrap_or(&[]);
         let has_model_overrides = provider_config.model_overrides.as_ref().map(|mo| !mo.is_empty()).unwrap_or(false);
 
-        if let Some(model_overrides) = &provider_config.model_overrides {
-            for (model_id, model_override) in model_overrides {
-                if model_override.api.is_some() {
-                    return Err(format!(
-                        "Provider {provider_name}, modelOverride {model_id}: unsupported field \"api\"."
-                    ));
-                }
-                if model_override.base_url.is_some() {
-                    return Err(format!(
-                        "Provider {provider_name}, modelOverride {model_id}: unsupported field \"baseUrl\"."
-                    ));
-                }
-            }
-        }
 
         if provider_config.oauth.is_some() && provider_config.base_url.is_none() {
             return Err(format!("Provider {}: \"baseUrl\" is required when \"oauth\" is set.", provider_name));

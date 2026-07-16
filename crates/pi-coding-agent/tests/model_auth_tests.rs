@@ -648,16 +648,47 @@ async fn oauth_refresh_failure_reloads_a_concurrently_refreshed_credential() {
 }
 
 #[test]
-fn model_overrides_reject_unsupported_transport_fields() {
+fn model_overrides_ignore_unsupported_transport_fields() {
     let temp_dir = TempDir::new().unwrap();
     let auth_path = temp_dir.path().join("auth.json");
     let models_path = temp_dir.path().join("models.json");
-    for (field, value) in [("api", "openai-responses"), ("baseUrl", "https://ignored.example")] {
-        fs::write(&models_path, format!(
-            r#"{{"providers":{{"openai":{{"modelOverrides":{{"gpt-5.5":{{"{field}":"{value}"}}}}}}}}}}"#
-        )).unwrap();
-        let registry = ModelRegistry::create(AuthStorage::new(auth_path.clone()), models_path.clone());
-        let error = registry.get_error().expect("unsupported override must fail load");
-        assert!(error.contains(&format!("unsupported field \"{field}\"")), "{error}");
-    }
+
+    // Build baseline registry first to get the default model definition.
+    let baseline_path = temp_dir.path().join("empty.json");
+    let baseline = ModelRegistry::create(AuthStorage::new(auth_path.clone()), baseline_path);
+    let original_model = baseline.find("openai", "gpt-4o").expect("should find default gpt-4o").clone();
+
+    // Write a models.json containing unknown/unsupported fields in modelOverrides.
+    // Also include a valid override field (like name) to prove it still applies.
+    let config_content = r#"{
+        "providers": {
+            "openai": {
+                "modelOverrides": {
+                    "gpt-4o": {
+                        "name": "GPT-4o Inert Override",
+                        "api": "unsupported-api-val",
+                        "baseUrl": "https://unsupported-base-url.example"
+                    }
+                }
+            }
+        }
+    }"#;
+    fs::write(&models_path, config_content).unwrap();
+
+    let registry = ModelRegistry::create(AuthStorage::new(auth_path), models_path);
+
+    // Validation must pass, get_error() must be None
+    assert!(
+        registry.get_error().is_none(),
+        "Expected no validation error, but got: {:?}",
+        registry.get_error()
+    );
+
+    // Valid override (name) must be applied
+    let overridden_model = registry.find("openai", "gpt-4o").expect("should find gpt-4o");
+    assert_eq!(overridden_model.name, "GPT-4o Inert Override");
+
+    // Inert fields (api, baseUrl) must NOT alter the model's api or base_url
+    assert_eq!(overridden_model.api, original_model.api);
+    assert_eq!(overridden_model.base_url, original_model.base_url);
 }
