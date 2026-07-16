@@ -1389,6 +1389,12 @@ dependencies = [
 [[package]]
 name = "pi-ext-protocol"
 version = "0.1.0"
+dependencies = [
+ "pi-ai",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
 
 [[package]]
 name = "pi-orchestrator"

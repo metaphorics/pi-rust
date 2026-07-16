@@ -1,0 +1,1 @@
+{"type":"ev","method":"action/sendUserMessage","params":{"content":{"text":"follow this","images":[{"type":"image","mimeType":"image/png","data":"AA=="}]},"deliverAs":"followUp"}}

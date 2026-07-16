@@ -1,0 +1,1 @@
+{"type":"ev","method":"tool/update","params":{"toolCallId":"call-1","partial":{"content":[{"type":"text","text":"working"}],"details":{"progress":0.5}}}}

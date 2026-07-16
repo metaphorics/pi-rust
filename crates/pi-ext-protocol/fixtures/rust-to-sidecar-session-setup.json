@@ -1,0 +1,1 @@
+{"type":"req","id":10,"method":"session/setup","params":{"token":"setup-1","sessionFile":"/sessions/new.jsonl"}}

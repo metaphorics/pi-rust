@@ -1,0 +1,1 @@
+{"type":"ev","method":"provider/register","params":{"name":"fixture","configDto":{"api":"fixture-api","baseUrl":"https://example.test","models":[{"id":"fixture-model","name":"Fixture Model"}]},"extensionPath":"/extensions/provider.ts"}}

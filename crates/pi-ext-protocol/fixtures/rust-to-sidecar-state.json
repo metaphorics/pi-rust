@@ -1,0 +1,1 @@
+{"type":"ev","method":"state/update","params":{"idle":false,"thinkingLevel":"xhigh","activeTools":["read","grep"],"contextUsage":{"tokens":512,"contextWindow":4096,"percent":12.5},"systemPrompt":"updated","footer":{"cwd":"/workspace","git":{"branch":"main","dirty":true}},"theme":{"name":"dark","json":{"name":"dark"}},"editorText":"draft","toolsExpanded":true}}
