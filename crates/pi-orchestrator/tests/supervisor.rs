@@ -734,6 +734,52 @@ async fn failed_record_removal_keeps_stop_retryable() {
 }
 
 #[tokio::test]
+async fn stop_tears_down_even_when_the_stopping_persist_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let probe = Storage::new(dir.path());
+    let fake = FakePi::new();
+    let marker = fake.options().cwd.join("sigterm.marker");
+    let failing = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&failing);
+    let storage = Storage::new(dir.path()).with_fault_injection(move |op| match op {
+        StorageOp::UpsertInstance(_) if flag.load(Ordering::SeqCst) => {
+            Err(std::io::Error::other("injected stopping persist").into())
+        }
+        _ => Ok(()),
+    });
+    let (presence, log) = TestPresence::assigning("radius-1");
+    let supervisor = Supervisor::new(storage, presence);
+    let record = supervisor
+        .spawn_instance(spawn_options(&fake))
+        .await
+        .unwrap();
+    failing.store(true, Ordering::SeqCst);
+
+    let error = supervisor.stop_instance(&record.id).await.unwrap_err();
+
+    // The `stopping` persist failure is primary: teardown and removal both
+    // succeeded, so nothing supersedes it.
+    assert_eq!(error.to_string(), "injected stopping persist");
+    // Teardown was not bypassed: the radius registration was released and
+    // the child disposed despite the failed persist.
+    assert!(
+        log.entries()
+            .contains(&format!("disconnect:{}:radius-1", record.id)),
+        "stop with a failing stopping persist skipped the radius disconnect"
+    );
+    assert!(
+        marker.exists(),
+        "stop with a failing stopping persist leaked the child"
+    );
+    // The stop still completed: live entry dropped, stored record removed.
+    assert!(
+        supervisor.list_live_instances().is_empty(),
+        "live entry survived the stop"
+    );
+    assert_eq!(probe.load_instances().unwrap(), []);
+}
+
+#[tokio::test]
 async fn fail_spawn_tears_down_even_when_every_persist_fails() {
     let dir = tempfile::tempdir().unwrap();
     let probe = Storage::new(dir.path());

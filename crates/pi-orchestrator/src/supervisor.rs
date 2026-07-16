@@ -169,20 +169,34 @@ impl Supervisor {
             return Ok(None);
         };
 
-        self.inner.set_status(&live, InstanceStatus::Stopping)?;
+        // Deviation: the oracle aborts on a `stopping` persist failure,
+        // leaving the child running and the radius registration held; here
+        // teardown always runs and the persist failure is captured instead.
+        let mut primary: Option<SupervisorError> = self
+            .inner
+            .set_status(&live, InstanceStatus::Stopping)
+            .err()
+            .map(Into::into);
         let cleanup = self.inner.cleanup_acquired_resources(&live).await;
         // Oracle finally block: mark stopped in memory (no upsert) and remove
         // the persisted record. Deviation: the oracle drops the live entry
         // before the removal, so a removal failure strands the stored record
         // forever (a later stop sees no live instance and returns early).
-        // Here a failed removal keeps the live entry and both views stay
+        // Here a failed removal keeps the live entry and the live view stays
         // `stopping` — a coherent incomplete stop that can be retried; the
         // entry only becomes `stopped` and is dropped once the record is
-        // removed. The removal error is primary (oracle finally-throw
-        // supersedes the cleanup error); the masked cleanup error is logged.
+        // removed. Error precedence keeps JS masking semantics: every later
+        // failure supersedes an earlier one (removal over cleanup over the
+        // `stopping` persist), and every masked error is logged.
+        if let Err(cleanup_error) = cleanup {
+            if let Some(masked) = primary.take() {
+                log::error!("Masked error while stopping {instance_id}: {masked}");
+            }
+            primary = Some(cleanup_error);
+        }
         if let Err(remove_error) = self.inner.storage.remove_instance(instance_id) {
-            if let Err(cleanup_error) = cleanup {
-                log::error!("Masked cleanup error while stopping {instance_id}: {cleanup_error}");
+            if let Some(masked) = primary.take() {
+                log::error!("Masked error while stopping {instance_id}: {masked}");
             }
             return Err(remove_error.into());
         }
@@ -192,8 +206,10 @@ impl Supervisor {
             record.last_seen_at = Some(now_iso_timestamp());
         }
         self.inner.live.lock().remove(instance_id);
-        cleanup?;
-        Ok(Some(live.record.lock().clone()))
+        match primary {
+            Some(error) => Err(error),
+            None => Ok(Some(live.record.lock().clone())),
+        }
     }
 
     pub async fn handle_rpc(
