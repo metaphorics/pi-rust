@@ -208,13 +208,18 @@ export function attachHost(options: HostOptions): SidecarHost {
       throw error;
     }
     host.uiBridge?.recordToolResult(toolCallId, result, false);
-    // Declared wire shape only ({content, details?, isError}); tool failure
-    // is a thrown error -> err frame. addedToolNames/terminate have no wire
-    // slot in protocol v1 (recorded as a gap in the task report).
+    // Tool failure is a thrown error -> err frame. Success relays pi's full
+    // AgentToolResult surface: addedToolNames (tools introduced from this
+    // transcript point) and terminate (stop after the current tool batch)
+    // ride the ok payload. The envelope decodes losslessly (result is a
+    // Value), but the host's typed ToolExecuteResult must gain the optional
+    // fields to consume them — flagged for the Rust-host owner.
     return {
       content: toWire(result.content),
       ...(result.details !== undefined ? { details: toWire(result.details) } : {}),
       isError: false,
+      ...(result.addedToolNames !== undefined ? { addedToolNames: result.addedToolNames } : {}),
+      ...(result.terminate !== undefined ? { terminate: result.terminate } : {}),
     };
   });
 

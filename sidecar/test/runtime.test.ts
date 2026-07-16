@@ -116,6 +116,57 @@ describe("tool execution", () => {
       bridge.peer.request("tool/execute", { toolCallId: "c", name: "no_such_tool", args: {} }),
     ).rejects.toThrow(RpcError);
   });
+  test("corpus structured-output relays terminate:true on the ok payload", async () => {
+    const bridge = createTestBridge();
+    await bridge.init(makeInitParams({ configuredPaths: [join(FIXTURES_DIR, "structured-output.ts")] }));
+    const result = await bridge.peer.request("tool/execute", {
+      toolCallId: "call-so",
+      name: "structured_output",
+      args: { headline: "H", summary: "S", actionItems: ["a", "b"] },
+    });
+    const typed = fromWire<{
+      content: Array<{ text: string }>;
+      details: { headline: string };
+      isError: boolean;
+      terminate?: boolean;
+      addedToolNames?: string[];
+    }>(result);
+    expect(typed.content[0]?.text).toBe("Saved structured output: H");
+    expect(typed.details.headline).toBe("H");
+    expect(typed.isError).toBe(false);
+    // The batch-stop hint MUST reach the host wire payload.
+    expect(typed.terminate).toBe(true);
+    expect(typed.addedToolNames).toBeUndefined();
+  });
+
+  test("tools activated during execution relay wrapper-computed addedToolNames", async () => {
+    const bridge = createTestBridge();
+    await bridge.init(
+      makeInitParams({
+        configuredPaths: [join(FIXTURES_DIR, "dynamic-tools.ts")],
+        state: makeStateBlock({ activeTools: ["read", "load_more_tools"] }),
+      }),
+    );
+    const result = await bridge.peer.request("tool/execute", {
+      toolCallId: "call-dyn",
+      name: "load_more_tools",
+      args: {},
+    });
+    const typed = fromWire<{
+      content: Array<{ text: string }>;
+      isError: boolean;
+      addedToolNames?: string[];
+      terminate?: boolean;
+    }>(result);
+    expect(typed.content[0]?.text).toBe("loaded");
+    // pi's wrapRegisteredTool diffs active tools around execute; the
+    // bridged mirror must preserve pre-existing names so only the newly
+    // activated tool is reported.
+    expect(typed.addedToolNames).toEqual(["after_load"]);
+    expect(typed.terminate).toBeUndefined();
+    const setActive = bridge.notificationsOf("action/setActiveTools");
+    expect(setActive).toContainEqual({ toolNames: ["read", "load_more_tools", "after_load"] });
+  });
 });
 
 describe("event dispatch", () => {

@@ -350,6 +350,10 @@ export interface ToolExecuteResultDto {
   content: JsonValue[];
   details?: JsonValue;
   isError: boolean;
+  /** Names of tools introduced by this result (AgentToolResult.addedToolNames). */
+  addedToolNames?: string[];
+  /** Early-termination hint: stop after the current tool batch (AgentToolResult.terminate). */
+  terminate?: boolean;
 }
 
 // ---------------------------------------------------------------------------
