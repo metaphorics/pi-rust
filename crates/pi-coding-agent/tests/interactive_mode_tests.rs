@@ -461,6 +461,119 @@ async fn escape_aborts_a_mid_stream_run_and_clears_working_status() {
     assert!(!screen.contains("Working..."));
     assert_no_flicker(&handle);
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn double_escape_honors_window_and_action_setting() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    // Deterministic clock: t0 + controllable offset.
+    let t0 = std::time::Instant::now();
+    let offset: Rc<Cell<Duration>> = Rc::new(Cell::new(Duration::ZERO));
+
+    let seed = make_runtime(TestRuntimeOptions {
+        with_auth: true,
+        ..Default::default()
+    })
+    .await;
+    let response = assistant_text_message(&seed.model, "tree seed reply");
+    drop(seed);
+    let test = make_runtime(TestRuntimeOptions {
+        with_auth: true,
+        script: vec![response],
+        ..Default::default()
+    })
+    .await;
+    let (terminal, handle) = VtTerminal::new(100, 30);
+    let clock = {
+        let offset = Rc::clone(&offset);
+        Rc::new(move || t0 + offset.get())
+    };
+    let mut mode = InteractiveMode::new(
+        test.runtime.clone(),
+        terminal,
+        InteractiveModeOptions {
+            clock: Some(clock),
+            ..Default::default()
+        },
+    );
+    mode.init();
+
+    // Seed the session so /tree has entries.
+    send(&mut mode, &handle, "seed message");
+    send(&mut mode, &handle, "\r");
+    pump_until(&mut mode, &handle, Duration::from_secs(2), |screen| {
+        screen.contains("tree seed reply")
+    })
+    .await;
+
+    // Two escapes 600ms apart: outside the window, nothing opens.
+    send(&mut mode, &handle, "\x1b");
+    offset.set(offset.get() + Duration::from_millis(600));
+    send(&mut mode, &handle, "\x1b");
+    mode.pump();
+    assert!(
+        handle.screen(|s| !s.serialize().contains("Session Tree")),
+        "600ms apart must not open the tree selector"
+    );
+
+    // Second press 499ms later: inside the window, tree selector opens.
+    offset.set(offset.get() + Duration::from_millis(499));
+    send(&mut mode, &handle, "\x1b");
+    mode.pump();
+    let screen = handle.screen(pi_vt::VtScreen::serialize);
+    assert!(
+        screen.contains("Session Tree"),
+        "double escape within 500ms must open /tree:\n{screen}"
+    );
+    assert_no_flicker(&handle);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn double_escape_respects_fork_and_none_settings() {
+    // action = "none": double escape does nothing.
+    let test = make_runtime(TestRuntimeOptions {
+        global_settings: Some(serde_json::json!({ "doubleEscapeAction": "none" })),
+        ..Default::default()
+    })
+    .await;
+    let (terminal, handle) = VtTerminal::new(100, 30);
+    let mut mode = InteractiveMode::new(
+        test.runtime.clone(),
+        terminal,
+        InteractiveModeOptions::default(),
+    );
+    mode.init();
+    send(&mut mode, &handle, "\x1b");
+    send(&mut mode, &handle, "\x1b");
+    mode.pump();
+    assert!(handle.screen(|s| {
+        let screen = s.serialize();
+        !screen.contains("Session Tree") && !screen.contains("No messages to fork from")
+    }));
+
+    // action = "fork": double escape routes to the fork selector path.
+    let test = make_runtime(TestRuntimeOptions {
+        global_settings: Some(serde_json::json!({ "doubleEscapeAction": "fork" })),
+        ..Default::default()
+    })
+    .await;
+    let (terminal, handle) = VtTerminal::new(100, 30);
+    let mut mode = InteractiveMode::new(
+        test.runtime.clone(),
+        terminal,
+        InteractiveModeOptions::default(),
+    );
+    mode.init();
+    send(&mut mode, &handle, "\x1b");
+    send(&mut mode, &handle, "\x1b");
+    mode.pump();
+    let screen = handle.screen(pi_vt::VtScreen::serialize);
+    assert!(
+        screen.contains("No messages to fork from"),
+        "fork action on empty session must show the fork status:\n{screen}"
+    );
+}
 /// Fg color of the editor's bottom border (last full-width `─` row).
 fn editor_border_fg(handle: &VtHandle) -> pi_vt::Color {
     handle.screen(|screen| {

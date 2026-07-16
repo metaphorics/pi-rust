@@ -981,6 +981,14 @@ impl SettingsManager {
             .unwrap_or(false)
     }
 
+    /// Oracle `getDoubleEscapeAction`: `doubleEscapeAction ?? "tree"`.
+    pub fn get_double_escape_action(&self) -> String {
+        self.settings
+            .get_str("doubleEscapeAction")
+            .unwrap_or("tree")
+            .to_owned()
+    }
+
     pub fn http_proxy(&self) -> Option<&str> {
         self.settings.get_str("httpProxy")
     }

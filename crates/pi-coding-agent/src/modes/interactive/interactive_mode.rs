@@ -120,6 +120,8 @@ pub struct InteractiveModeOptions {
     pub model_fallback_message: Option<String>,
     /// Install SIGTERM/SIGHUP handlers (binary entry points only).
     pub handle_signals: bool,
+    /// Time source for double-press windows (tests inject a fake clock).
+    pub clock: Option<Rc<dyn Fn() -> Instant>>,
 }
 
 // ============================================================================
@@ -509,6 +511,9 @@ pub struct InteractiveMode {
     // Input gating state.
     escape_override: Option<EscapeOverride>,
     last_sigint_time: Option<Instant>,
+    last_escape_time: Option<Instant>,
+    /// Monotonic time source (defaults to `Instant::now`).
+    now: Rc<dyn Fn() -> Instant>,
     is_bash_mode: bool,
     selector_open: bool,
     startup_messages: VecDeque<String>,
@@ -537,6 +542,10 @@ impl InteractiveMode {
         terminal: impl Terminal + 'static,
         options: InteractiveModeOptions,
     ) -> Self {
+        let clock: Rc<dyn Fn() -> Instant> = options
+            .clock
+            .clone()
+            .unwrap_or_else(|| Rc::new(Instant::now));
         let session = runtime.session();
         let services = runtime.services();
 
@@ -744,6 +753,8 @@ impl InteractiveMode {
             working_visible: true,
             escape_override: None,
             last_sigint_time: None,
+            last_escape_time: None,
+            now: clock,
             is_bash_mode: false,
             selector_open: false,
             compaction_queued: Vec::new(),
@@ -1321,12 +1332,39 @@ impl InteractiveMode {
             self.editor.borrow_mut().set_text("");
             self.is_bash_mode = false;
             self.update_editor_border_color();
+            return;
+        }
+        if self.editor.borrow().get_text().trim().is_empty() {
+            // Double-escape with empty editor triggers /tree, /fork, or
+            // nothing based on the setting (oracle :2553-2569).
+            let action = self
+                .runtime
+                .services()
+                .settings_manager
+                .lock()
+                .get_double_escape_action();
+            if action != "none" {
+                let now = (self.now)();
+                if self
+                    .last_escape_time
+                    .is_some_and(|last| now.duration_since(last) < Duration::from_millis(500))
+                {
+                    if action == "tree" {
+                        self.show_tree_selector();
+                    } else {
+                        self.show_user_message_selector();
+                    }
+                    self.last_escape_time = None;
+                } else {
+                    self.last_escape_time = Some(now);
+                }
+            }
         }
     }
 
     /// Double-press Ctrl+C quit semantics (oracle handleCtrlC :3478-3486).
     fn handle_ctrl_c(&mut self) {
-        let now = Instant::now();
+        let now = (self.now)();
         if self
             .last_sigint_time
             .is_some_and(|last| now.duration_since(last) < Duration::from_millis(500))

@@ -169,8 +169,20 @@ wait_for_count "Operation aborted" 1 10 || fail "abort"
 sleep 1.0
 pass "abort"
 
-# (8) /quit + Enter; poll until tmux has-session -t "$SESSION" fails
-echo "Step 8: Testing quit..."
+# (8) double-escape on empty editor: two quick Escapes open the tree selector
+echo "Step 8: Testing double-escape tree selector..."
+tmux send-keys -t "$SESSION" -l $'\x1b[27u'
+tmux send-keys -t "$SESSION" -l $'\x1b[27u'
+wait_for "Session Tree" 10 || fail "double-escape tree selector"
+sleep 0.6
+# One Escape cancels the selector and restores the editor
+tmux send-keys -t "$SESSION" -l $'\x1b[27u'
+wait_for_not "Session Tree" 10 || fail "double-escape selector close"
+sleep 1.0
+pass "double-escape tree selector"
+
+# (9) /quit + Enter; poll until tmux has-session -t "$SESSION" fails
+echo "Step 9: Testing quit..."
 tmux send-keys -t "$SESSION" -l '/quit'
 tmux send-keys -t "$SESSION" Enter
 
