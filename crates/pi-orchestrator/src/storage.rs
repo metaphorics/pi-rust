@@ -1,7 +1,9 @@
+use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs;
 use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 
 use crate::config;
 use crate::types::{InstanceRecord, MachineRecord};
@@ -20,11 +22,11 @@ pub type Result<T, E = StorageError> = std::result::Result<T, E>;
 
 /// JSON persistence for orchestrator state.
 ///
-/// All operations share one lock so a read-modify-write update cannot race another
-/// update made through this store.
+/// All instances targeting the same directory share one lock so a read-modify-write
+/// update cannot race an update made through another store.
 pub struct Storage {
     orchestrator_dir: PathBuf,
-    lock: Mutex<()>,
+    lock: Arc<Mutex<()>>,
 }
 
 impl Storage {
@@ -33,9 +35,11 @@ impl Storage {
     }
 
     pub fn new(orchestrator_dir: impl Into<PathBuf>) -> Self {
+        let orchestrator_dir = orchestrator_dir.into();
+        let lock = shared_lock(&orchestrator_dir);
         Self {
-            orchestrator_dir: orchestrator_dir.into(),
-            lock: Mutex::new(()),
+            orchestrator_dir,
+            lock,
         }
     }
 
@@ -135,6 +139,75 @@ impl Storage {
     }
 }
 
+const LOCK_REGISTRY_CLEANUP_THRESHOLD: usize = 64;
+type LockRegistry = HashMap<PathBuf, Weak<Mutex<()>>>;
+
+fn shared_lock(orchestrator_dir: &Path) -> Arc<Mutex<()>> {
+    static REGISTRY: OnceLock<Mutex<LockRegistry>> = OnceLock::new();
+
+    let key = stable_path_key(orchestrator_dir);
+    let mut registry = REGISTRY
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if registry.len() >= LOCK_REGISTRY_CLEANUP_THRESHOLD {
+        registry.retain(|_, lock| lock.strong_count() > 0);
+    }
+    if let Some(lock) = registry.get(&key).and_then(Weak::upgrade) {
+        return lock;
+    }
+
+    let lock = Arc::new(Mutex::new(()));
+    registry.insert(key, Arc::downgrade(&lock));
+    lock
+}
+
+fn stable_path_key(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_owned()
+    } else if let Ok(current_dir) = std::env::current_dir() {
+        current_dir.join(path)
+    } else {
+        path.to_owned()
+    };
+    let normalized = lexical_normalize(&absolute);
+    let mut existing = normalized.as_path();
+    let mut missing = Vec::<OsString>::new();
+
+    loop {
+        if let Ok(mut canonical) = fs::canonicalize(existing) {
+            for component in missing.iter().rev() {
+                canonical.push(component);
+            }
+            return canonical;
+        }
+        let Some(name) = existing.file_name() else {
+            return normalized;
+        };
+        missing.push(name.to_owned());
+        let Some(parent) = existing.parent() else {
+            return normalized;
+        };
+        existing = parent;
+    }
+}
+
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::Normal(name) => normalized.push(name),
+        }
+    }
+    normalized
+}
+
 fn remove_if_present(path: &Path) -> Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -230,6 +303,48 @@ mod tests {
 
         storage.remove_instance("one").unwrap();
         assert_eq!(storage.load_instances().unwrap(), vec![records[1].clone()]);
+    }
+
+    #[test]
+    fn concurrent_upserts_across_storage_instances_do_not_lose_records() {
+        const INITIAL_RECORDS: usize = 2_000;
+
+        let dir = TestDir::new();
+        let seed = Storage::new(&dir.0);
+        let initial = (0..INITIAL_RECORDS)
+            .map(|index| instance(&format!("seed-{index}"), InstanceStatus::Online))
+            .collect::<Vec<_>>();
+        seed.save_instances(&initial).unwrap();
+
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
+        for id in ["concurrent-one", "concurrent-two"] {
+            let storage = Storage::new(&dir.0);
+            let barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                storage.upsert_instance(instance(id, InstanceStatus::Starting))
+            }));
+        }
+        barrier.wait();
+        for worker in workers {
+            worker.join().unwrap().unwrap();
+        }
+
+        let records = seed.load_instances().unwrap();
+        assert_eq!(records.len(), INITIAL_RECORDS + 2);
+        assert!(records.iter().any(|record| record.id == "concurrent-one"));
+        assert!(records.iter().any(|record| record.id == "concurrent-two"));
+    }
+
+    #[test]
+    fn lock_key_is_stable_when_target_directory_is_created() {
+        let dir = TestDir::new();
+        let before_creation = Storage::new(&dir.0);
+        fs::create_dir_all(&dir.0).unwrap();
+        let after_creation = Storage::new(&dir.0);
+
+        assert!(Arc::ptr_eq(&before_creation.lock, &after_creation.lock));
     }
 
     #[test]
