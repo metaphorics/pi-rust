@@ -978,9 +978,12 @@ impl AgentSession {
             state.effective_system_prompt = state.base_system_prompt.clone();
         }
         self.flush_pending_bash_messages();
-        self.inner.emit(&AgentSessionEvent::AgentSettled);
-        // run_claim drop clears run_active and wakes idle waiters.
+        // Oracle `_emitAgentSettled` (agent-session.ts:534-541) clears the
+        // active flag BEFORE emitting agent_settled, so listeners observe an
+        // idle session and can prompt from the handler. Dropping the claim
+        // clears run_active and wakes idle waiters.
         drop(run_claim);
+        self.inner.emit(&AgentSessionEvent::AgentSettled);
     }
 
     /// One `runAgentLoop` invocation with fresh context snapshot.

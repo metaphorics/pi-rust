@@ -1405,6 +1405,77 @@ async fn tool_loop_second_provider_call_receives_turn_history() {
     );
 }
 
+/// agent_settled listeners must observe an idle session (oracle
+/// `_emitAgentSettled` clears the active flag before emitting,
+/// agent-session.ts:534-541) and must be able to immediately start the next
+/// prompt from the handler.
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_settled_listener_observes_idle_session() {
+    let fixture = tokio::task::spawn_blocking(|| {
+        let script = Arc::new(Mutex::new(VecDeque::new()));
+        let options = FixtureOptions {
+            stream_fn: Some(scripted_stream_fn(script.clone())),
+            ..Default::default()
+        };
+        let fixture = make_fixture(vec![], options);
+        script
+            .lock()
+            .push_back(assistant_text_message(&fixture.model, "hi"));
+        script
+            .lock()
+            .push_back(assistant_text_message(&fixture.model, "again"));
+        fixture
+    })
+    .await
+    .expect("fixture");
+    let session = fixture.session.clone();
+
+    let observed: Arc<Mutex<Vec<bool>>> = Arc::new(Mutex::new(Vec::new()));
+    type PromptHandle = tokio::task::JoinHandle<Result<(), String>>;
+    let listener_prompt: Arc<Mutex<Option<PromptHandle>>> = Arc::new(Mutex::new(None));
+    let listener_session = session.clone();
+    let listener_observed = observed.clone();
+    let listener_prompt_slot = listener_prompt.clone();
+    let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let unsubscribe = session.subscribe(Arc::new(move |event: &AgentSessionEvent| {
+        if matches!(event, AgentSessionEvent::AgentSettled)
+            && !fired.swap(true, Ordering::SeqCst)
+        {
+            listener_observed.lock().push(listener_session.is_idle());
+            // The user-visible contract: a listener can start the next
+            // prompt the moment agent_settled fires.
+            let prompt_session = listener_session.clone();
+            listener_prompt_slot.lock().replace(tokio::spawn(async move {
+                prompt_session
+                    .prompt("from listener", PromptOptions::default())
+                    .await
+            }));
+        }
+    }));
+    std::mem::forget(unsubscribe);
+
+    session
+        .prompt("hello", PromptOptions::default())
+        .await
+        .expect("prompt");
+
+    // Mutation guard: emitting agent_settled before releasing the run makes
+    // the listener observe a still-streaming session ([false]) and the
+    // listener-issued prompt fail with the already-processing error.
+    assert_eq!(
+        observed.lock().as_slice(),
+        &[true],
+        "agent_settled listener must observe idle"
+    );
+    let handle = listener_prompt.lock().take().expect("listener prompted");
+    handle
+        .await
+        .expect("join listener prompt")
+        .expect("listener prompt succeeds");
+    session.wait_for_idle().await;
+    assert_eq!(session.get_last_assistant_text().as_deref(), Some("again"));
+}
+
 /// Prompt preflight and run claim are one atomic step: a second concurrent
 /// prompt issued while the first is still inside preflight deterministically
 /// gets the verbatim already-processing error and is never silently dropped.
