@@ -723,6 +723,185 @@ impl SettingsManager {
             .cloned()
             .unwrap_or_default()
     }
+
+    fn mark_project_modified(&mut self, field: &str, nested: Option<&str>) {
+        self.modified_project_fields.insert(field.to_string());
+        if let Some(n) = nested {
+            self.modified_project_nested_fields
+                .entry(field.to_string())
+                .or_default()
+                .insert(n.to_string());
+        }
+    }
+
+    fn save_project(&mut self) -> Result<()> {
+        if !self.project_trusted {
+            return Err(SettingsError::Message(
+                "Project is not trusted; refusing to write project settings".to_string(),
+            ));
+        }
+        self.settings = deep_merge_settings(&self.global_settings, &self.project_settings);
+        if self.project_settings_load_error.is_some() {
+            return Ok(());
+        }
+        let snapshot = self.project_settings.clone();
+        let modified = self.modified_project_fields.clone();
+        let nested = self.modified_project_nested_fields.clone();
+        Self::persist_scoped(
+            self.storage.as_mut(),
+            SettingsScope::Project,
+            &snapshot,
+            &modified,
+            &nested,
+        )?;
+        self.modified_project_fields.clear();
+        self.modified_project_nested_fields.clear();
+        Ok(())
+    }
+
+    fn update_project_settings<F>(&mut self, field: &str, mut update: F) -> Result<()>
+    where
+        F: FnMut(&mut Settings),
+    {
+        if !self.project_trusted {
+            return Err(SettingsError::Message(
+                "Project is not trusted; refusing to write project settings".to_string(),
+            ));
+        }
+        let mut proj = self.project_settings.clone();
+        update(&mut proj);
+        self.project_settings = proj;
+        self.mark_project_modified(field, None);
+        self.save_project()
+    }
+
+    // --- resource-list setters ---
+
+    pub fn set_packages(&mut self, packages: Vec<Value>) {
+        self.global_settings
+            .insert("packages", Value::Array(packages));
+        self.mark_modified("packages", None);
+        self.save_global();
+    }
+
+    pub fn set_project_packages(&mut self, packages: Vec<Value>) -> Result<()> {
+        self.update_project_settings("packages", |settings| {
+            settings.insert("packages", Value::Array(packages.clone()));
+        })
+    }
+
+    pub fn set_extension_paths(&mut self, paths: Vec<String>) {
+        let arr = paths.into_iter().map(Value::String).collect();
+        self.global_settings.insert("extensions", Value::Array(arr));
+        self.mark_modified("extensions", None);
+        self.save_global();
+    }
+
+    pub fn set_project_extension_paths(&mut self, paths: Vec<String>) -> Result<()> {
+        self.update_project_settings("extensions", |settings| {
+            let arr = paths.iter().map(|p| Value::String(p.clone())).collect();
+            settings.insert("extensions", Value::Array(arr));
+        })
+    }
+
+    pub fn set_skill_paths(&mut self, paths: Vec<String>) {
+        let arr = paths.into_iter().map(Value::String).collect();
+        self.global_settings.insert("skills", Value::Array(arr));
+        self.mark_modified("skills", None);
+        self.save_global();
+    }
+
+    pub fn set_project_skill_paths(&mut self, paths: Vec<String>) -> Result<()> {
+        self.update_project_settings("skills", |settings| {
+            let arr = paths.iter().map(|p| Value::String(p.clone())).collect();
+            settings.insert("skills", Value::Array(arr));
+        })
+    }
+
+    pub fn set_prompt_template_paths(&mut self, paths: Vec<String>) {
+        let arr = paths.into_iter().map(Value::String).collect();
+        self.global_settings.insert("prompts", Value::Array(arr));
+        self.mark_modified("prompts", None);
+        self.save_global();
+    }
+
+    pub fn set_project_prompt_template_paths(&mut self, paths: Vec<String>) -> Result<()> {
+        self.update_project_settings("prompts", |settings| {
+            let arr = paths.iter().map(|p| Value::String(p.clone())).collect();
+            settings.insert("prompts", Value::Array(arr));
+        })
+    }
+
+    pub fn set_theme_paths(&mut self, paths: Vec<String>) {
+        let arr = paths.into_iter().map(Value::String).collect();
+        self.global_settings.insert("themes", Value::Array(arr));
+        self.mark_modified("themes", None);
+        self.save_global();
+    }
+
+    pub fn set_project_theme_paths(&mut self, paths: Vec<String>) -> Result<()> {
+        self.update_project_settings("themes", |settings| {
+            let arr = paths.iter().map(|p| Value::String(p.clone())).collect();
+            settings.insert("themes", Value::Array(arr));
+        })
+    }
+
+    // --- seven typed getters ---
+
+    pub fn get_npm_command(&self) -> Option<Vec<String>> {
+        self.settings
+            .get("npmCommand")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+    }
+
+    pub fn get_enabled_models(&self) -> Option<Vec<String>> {
+        self.settings
+            .get("enabledModels")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+    }
+
+    pub fn get_default_project_trust(&self) -> &str {
+        match self.global_settings.get_str("defaultProjectTrust") {
+            Some("always") => "always",
+            Some("never") => "never",
+            _ => "ask",
+        }
+    }
+
+    pub fn get_image_auto_resize(&self) -> bool {
+        self.settings
+            .get("images")
+            .and_then(|i| i.get("autoResize"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true)
+    }
+
+    pub fn get_http_idle_timeout_ms(&self) -> u64 {
+        if let Some(val) = self.settings.get("httpIdleTimeoutMs")
+            && let Some(timeout_ms) = parse_http_idle_timeout_ms(val)
+        {
+            return timeout_ms;
+        }
+        300000 // Default 300s (5 minutes)
+    }
+
+    pub fn get_quiet_startup(&self) -> bool {
+        self.settings.get_bool("quietStartup").unwrap_or(false)
+    }
+
+    pub fn http_proxy(&self) -> Option<&str> {
+        self.settings.get_str("httpProxy")
+    }
 }
 
 /// Pretty-print a JSON object like `JSON.stringify(obj, null, 2)`.
@@ -738,6 +917,41 @@ pub fn parse_settings_json(text: &str) -> Result<Settings> {
 /// Serialize settings with the same pretty layout pi uses for settings.json.
 pub fn serialize_settings_json(settings: &Settings) -> String {
     pretty_json_map(&settings.0)
+}
+
+fn parse_http_idle_timeout_ms(value: &Value) -> Option<u64> {
+    match value {
+        Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.eq_ignore_ascii_case("disabled") {
+                return Some(0);
+            }
+            if trimmed.is_empty() {
+                return None;
+            }
+            if let Ok(num) = trimmed.parse::<f64>()
+                && num.is_finite()
+                && num >= 0.0
+            {
+                return Some(num as u64);
+            }
+            None
+        }
+        Value::Number(n) => {
+            if let Some(i) = n.as_u64() {
+                Some(i)
+            } else if let Some(f) = n.as_f64() {
+                if f.is_finite() && f >= 0.0 {
+                    Some(f as u64)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -901,5 +1115,91 @@ mod tests {
         let m = deep_merge_settings(&base, &over);
         assert_eq!(m.get("compaction").unwrap()["enabled"], true);
         assert_eq!(m.get("compaction").unwrap()["reserveTokens"], 2);
+    }
+
+    #[test]
+    fn test_setters_preserving_concurrent_unknown_nested_fields() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let agent_dir = temp.path().join("agent");
+        let cwd = temp.path().join("project");
+
+        // Write a base global settings file
+        let global_settings_path = agent_dir.join("settings.json");
+        fs::create_dir_all(&agent_dir).unwrap();
+        fs::write(
+            &global_settings_path,
+            "{\n  \"some_unknown_key\": \"some_value\",\n  \"compaction\": {\n    \"enabled\": true,\n    \"reserveTokens\": 16384\n  }\n}",
+        )
+        .unwrap();
+
+        // Write a project settings file
+        let project_settings_path = cwd.join(CONFIG_DIR_NAME).join("settings.json");
+        fs::create_dir_all(cwd.join(CONFIG_DIR_NAME)).unwrap();
+        fs::write(
+            &project_settings_path,
+            "{\n  \"project_unknown\": 123,\n  \"extensions\": [\"old-proj-ext\"]\n}",
+        )
+        .unwrap();
+
+        // Load SettingsManager
+        let mut sm = SettingsManager::create(cwd.clone(), Some(agent_dir.clone()));
+
+        // Verify initial load
+        assert_eq!(
+            sm.settings().get_str("some_unknown_key"),
+            Some("some_value")
+        );
+
+        // Simulating CONCURRENT modification by another process on global file
+        fs::write(
+            &global_settings_path,
+            "{\n  \"some_unknown_key\": \"some_value\",\n  \"concurrent_global_key\": \"concurrent_val\",\n  \"compaction\": {\n    \"enabled\": true,\n    \"reserveTokens\": 12345\n  }\n}",
+        )
+        .unwrap();
+
+        // Simulating CONCURRENT modification by another process on project file
+        fs::write(
+            &project_settings_path,
+            "{\n  \"project_unknown\": 123,\n  \"concurrent_project_key\": 999,\n  \"extensions\": [\"old-proj-ext\"]\n}",
+        )
+        .unwrap();
+
+        // 1. Modify global extensions path (rereads under lock + merges modified keys)
+        sm.set_extension_paths(vec!["new-ext".to_string()]);
+
+        // Read the written global file
+        let global_content = fs::read_to_string(&global_settings_path).unwrap();
+        let global_val: Value = serde_json::from_str(&global_content).unwrap();
+        // Assert new key is set
+        assert_eq!(global_val["extensions"][0], "new-ext");
+        // Assert loaded unknown key is preserved
+        assert_eq!(global_val["some_unknown_key"], "some_value");
+        // Assert concurrent unknown key is preserved!
+        assert_eq!(global_val["concurrent_global_key"], "concurrent_val");
+        // Assert concurrent nested compaction fields are preserved!
+        assert_eq!(global_val["compaction"]["enabled"], true);
+        assert_eq!(global_val["compaction"]["reserveTokens"], 12345);
+
+        // 2. Modify project extensions path (trusted is true by default in sm.create)
+        sm.set_project_extension_paths(vec!["new-proj-ext".to_string()])
+            .unwrap();
+
+        let project_content = fs::read_to_string(&project_settings_path).unwrap();
+        let project_val: Value = serde_json::from_str(&project_content).unwrap();
+        assert_eq!(project_val["extensions"][0], "new-proj-ext");
+        assert_eq!(project_val["project_unknown"], 123); // preserved!
+        assert_eq!(project_val["concurrent_project_key"], 999); // concurrent change preserved!
+
+        // 3. Verify untrusted refusal
+        sm.set_project_trusted(false);
+        let untrusted_res = sm.set_project_extension_paths(vec!["untrusted-ext".to_string()]);
+        assert!(untrusted_res.is_err());
+        let err_msg = untrusted_res.err().unwrap().to_string();
+        assert!(err_msg.contains("Project is not trusted"));
+
+        // Verify file is NOT mutated on untrusted refusal
+        let project_content_after = fs::read_to_string(&project_settings_path).unwrap();
+        let project_val_after: Value = serde_json::from_str(&project_content_after).unwrap();
+        assert_eq!(project_val_after["extensions"][0], "new-proj-ext");
     }
 }

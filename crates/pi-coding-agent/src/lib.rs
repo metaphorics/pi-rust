@@ -23,10 +23,10 @@ pub use resource_loader::{
     ResourceSource, discover_extensions_in_dir,
 };
 pub use session_manager::{
-    NewSessionOptions, SessionContext, SessionError, SessionInfo, SessionManager, SessionModelRef,
-    SessionTreeNode, assert_valid_session_id, build_context_entries, build_session_context,
-    find_most_recent_session, load_entries_from_file, migrate_session_entries,
-    migrate_to_current_version,
+    NewSessionOptions, ResolvedSession, SessionContext, SessionError, SessionInfo, SessionManager,
+    SessionModelRef, SessionTreeNode, assert_valid_session_id, build_context_entries,
+    build_session_context, find_most_recent_session, load_entries_from_file,
+    migrate_session_entries, migrate_to_current_version, resolve_session_path,
 };
 pub use session_types::{
     CURRENT_SESSION_VERSION, FileEntry, SessionEntry, SessionHeader, parse_session_entries,
