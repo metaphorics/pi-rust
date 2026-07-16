@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod radius;
+pub mod ipc;
 pub mod storage;
 pub mod types;
 pub mod wire;
