@@ -105,6 +105,42 @@ impl CommandRunner for LocalGitRunner {
     }
 }
 
+#[derive(Clone)]
+struct DependencyGitRunner {
+    repository: PathBuf,
+    installs: Arc<Mutex<Vec<Vec<String>>>>,
+}
+
+impl CommandRunner for DependencyGitRunner {
+    fn run(
+        &self,
+        command: &str,
+        args: &[String],
+        cwd: Option<&Path>,
+    ) -> pi_coding_agent::package_manager::Result<()> {
+        if command == "npm" {
+            self.installs.lock().push(args.to_vec());
+            fs::create_dir_all(cwd.expect("npm cwd").join("node_modules/dependency"))?;
+            return Ok(());
+        }
+        let mut args = args.to_vec();
+        if command == "git" && args.first().is_some_and(|arg| arg == "clone") {
+            args[1] = self.repository.to_string_lossy().into_owned();
+        }
+        pi_coding_agent::ProcessCommandRunner.run(command, &args, cwd)
+    }
+
+    fn capture(
+        &self,
+        command: &str,
+        args: &[String],
+        cwd: Option<&Path>,
+        timeout_ms: Option<u64>,
+    ) -> pi_coding_agent::package_manager::Result<String> {
+        pi_coding_agent::ProcessCommandRunner.capture(command, args, cwd, timeout_ms)
+    }
+}
+
 fn git(repository: &Path, args: &[&str]) {
     pi_coding_agent::ProcessCommandRunner
         .run(
@@ -409,6 +445,32 @@ fn npm_and_git_use_injected_commands_and_managed_paths() {
         .find(|call| call.command == "git" && call.args.first().is_some_and(|arg| arg == "clone"))
         .unwrap();
     assert!(Path::new(clone.args.last().unwrap()).ends_with("git/github.com/user/repo"));
+}
+
+#[test]
+fn configured_plain_npm_command_uses_plain_git_dependency_install() {
+    let (_temp, cwd, agent) = fixture();
+    let runner = RecordingRunner::default();
+    let calls = runner.calls.clone();
+    let mut settings = Settings::new();
+    settings.insert("npmCommand", json!(["npm"]));
+    let mut manager = DefaultPackageManager::with_runner(
+        &cwd,
+        &agent,
+        SettingsManager::in_memory(settings, true),
+        runner,
+    );
+
+    let checkout = agent.join("git/github.com/user/repo");
+    fs::create_dir_all(&checkout).unwrap();
+    fs::write(checkout.join("package.json"), "{}").unwrap();
+    manager
+        .install_and_persist("git:github.com/user/repo", false)
+        .unwrap();
+
+    assert!(calls.lock().iter().any(|call| {
+        call.command == "npm" && call.args == ["install"] && call.cwd.as_deref() == Some(&checkout)
+    }));
 }
 
 #[test]
@@ -914,4 +976,56 @@ fn local_git_fixture_install_update_and_remove_smoke() {
     assert_eq!(head, "v2");
     assert!(manager.remove_and_persist(v2, false).unwrap());
     assert!(!checkout.exists());
+}
+
+#[test]
+fn git_update_reinstalls_dependencies_after_clean() {
+    let (_temp, cwd, agent) = fixture();
+    let repository = cwd.join("dependency-repository");
+    fs::create_dir_all(&repository).unwrap();
+    git(&repository, &["init"]);
+    git(
+        &repository,
+        &["config", "user.email", "pi-rust@example.invalid"],
+    );
+    git(&repository, &["config", "user.name", "pi-rust test"]);
+    fs::write(repository.join("package.json"), "{\"version\":1}\n").unwrap();
+    git(&repository, &["add", "package.json"]);
+    git(&repository, &["commit", "-m", "v1"]);
+    git(&repository, &["tag", "v1"]);
+    fs::write(repository.join("package.json"), "{\"version\":2}\n").unwrap();
+    git(&repository, &["commit", "-am", "v2"]);
+    git(&repository, &["tag", "v2"]);
+
+    let installs = Arc::new(Mutex::new(Vec::new()));
+    let runner = DependencyGitRunner {
+        repository,
+        installs: installs.clone(),
+    };
+    let mut manager = DefaultPackageManager::with_runner(
+        &cwd,
+        &agent,
+        SettingsManager::create(&cwd, Some(agent.clone())),
+        runner,
+    );
+    let v1 = "git:localhost/user/dependency@v1";
+    let v2 = "git:localhost/user/dependency@v2";
+    manager.install_and_persist(v1, false).unwrap();
+    let checkout = agent.join("git/localhost/user/dependency");
+    let dependency = checkout.join("node_modules/dependency");
+    assert!(dependency.is_dir());
+    fs::write(checkout.join("untracked"), "removed by clean").unwrap();
+
+    assert!(manager.add_source_to_settings(v2, false).unwrap());
+    manager.update(Some(v2)).unwrap();
+
+    assert!(!checkout.join("untracked").exists());
+    assert!(dependency.is_dir());
+    assert_eq!(
+        installs.lock().as_slice(),
+        [
+            vec!["install".to_string(), "--omit=dev".to_string()],
+            vec!["install".to_string(), "--omit=dev".to_string()],
+        ]
+    );
 }

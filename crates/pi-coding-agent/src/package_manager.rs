@@ -937,15 +937,7 @@ impl<R: CommandRunner> DefaultPackageManager<R> {
             self.runner
                 .run("git", &strings(["checkout", git_ref]), Some(&target))?;
         }
-        if target.join("package.json").exists() {
-            let (command, mut args) = self.npm_command()?;
-            if args.is_empty() {
-                args.extend(strings(["install", "--omit=dev"]));
-            } else {
-                args.push("install".into());
-            }
-            self.runner.run(&command, &args, Some(&target))?;
-        }
+        self.install_git_dependencies(&target)?;
         Ok(())
     }
 
@@ -995,8 +987,25 @@ impl<R: CommandRunner> DefaultPackageManager<R> {
             )?;
             self.runner
                 .run("git", &strings(["clean", "-fdx"]), Some(target))?;
+            self.install_git_dependencies(target)?;
         }
         Ok(())
+    }
+
+    fn install_git_dependencies(&self, target: &Path) -> Result<()> {
+        if !target.join("package.json").exists() {
+            return Ok(());
+        }
+        let (command, mut args) = self.npm_command()?;
+        args.extend(self.git_dependency_install_args());
+        self.runner.run(&command, &args, Some(target))
+    }
+
+    fn git_dependency_install_args(&self) -> Vec<String> {
+        match self.settings_manager.get_npm_command() {
+            Some(parts) if !parts.is_empty() => strings(["install"]),
+            _ => strings(["install", "--omit=dev"]),
+        }
     }
 
     fn npm_command(&self) -> Result<(String, Vec<String>)> {
