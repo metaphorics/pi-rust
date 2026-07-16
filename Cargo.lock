@@ -1321,6 +1321,13 @@ version = "0.1.0"
 [[package]]
 name = "pi-orchestrator"
 version = "0.1.0"
+dependencies = [
+ "dirs",
+ "jiff",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
 
 [[package]]
 name = "pi-tui"
