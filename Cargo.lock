@@ -1419,6 +1419,7 @@ dependencies = [
  "parking_lot",
  "pi-ai",
  "pi-coding-agent",
+ "pi-orchestrator",
  "rand 0.9.5",
  "reqwest",
  "rustix",
