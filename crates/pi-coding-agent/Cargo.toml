@@ -19,6 +19,15 @@ jiff.workspace = true
 uuid = { version = "1", features = ["v4", "v7"] }
 # Home directory for ~/.pi/agent resolution.
 dirs = "6"
+tokio.workspace = true
+regex = "1"
+globset = "0.4"
+base64 = "0.22"
+ignore = "0.4"
+diff = "0.1"
+tempfile = "3"
+parking_lot = "0.12"
+rustix = { workspace = true, features = ["fs", "process", "stdio", "termios", "system"] }
 
 [dev-dependencies]
 tempfile = "3"
