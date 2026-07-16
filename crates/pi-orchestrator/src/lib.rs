@@ -1,3 +1,6 @@
-//! pi-orchestrator: thin supervisor spawning `pi --mode rpc`.
-//!
-//! Port of packages/orchestrator. Skeleton only for Phase 0.
+//! Persistence and wire foundations for the pi orchestrator.
+
+pub mod config;
+pub mod storage;
+pub mod types;
+pub mod wire;

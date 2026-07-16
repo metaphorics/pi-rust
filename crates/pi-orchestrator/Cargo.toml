@@ -6,6 +6,11 @@ license.workspace = true
 description = "pi orchestrator: supervisor spawning pi --mode rpc"
 
 [dependencies]
+dirs = "6"
+jiff.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
 
 [[bin]]
 name = "pi-orchestrator"
