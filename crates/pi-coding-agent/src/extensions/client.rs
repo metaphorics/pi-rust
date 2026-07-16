@@ -271,7 +271,7 @@ impl SidecarConnection {
         tokio::select! {
             result = &mut pending => result,
             _ = &mut sleep => {
-                pending.cancel().await;
+                pending.try_cancel();
                 Err(ClientError::Timeout(deadline))
             }
         }
@@ -348,11 +348,20 @@ impl PendingReply {
         (&mut this).await
     }
 
-    /// Abandon the request: forget the pending slot and send a cancel frame.
+    /// Abandon the request: forget the pending slot and send a cancel frame,
+    /// awaiting writer-queue capacity.
     pub async fn cancel(self) {
         self.shared.pending.lock().map.remove(&self.id.get());
         if let Ok(bytes) = encode_frame(&Envelope::Cancel { id: self.id }) {
             let _ = self.shared.writer.send(bytes).await;
+        }
+    }
+
+    /// Retire a timed-out request without letting cancellation exceed its deadline.
+    fn try_cancel(self) {
+        self.shared.pending.lock().map.remove(&self.id.get());
+        if let Ok(bytes) = encode_frame(&Envelope::Cancel { id: self.id }) {
+            let _ = self.shared.writer.try_send(bytes);
         }
     }
 }

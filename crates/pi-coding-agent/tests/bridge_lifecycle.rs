@@ -420,6 +420,118 @@ async fn request_timeout_sends_cancel_frame() {
 }
 
 #[tokio::test]
+async fn explicit_cancel_waits_for_and_sends_cancel_frame() {
+    let harness = Harness::new("slow.sh", HarnessOptions::default());
+    let connection = harness.host.ensure_ready().await.unwrap();
+    let pending = connection
+        .begin_request(Request::LifecycleLoad(pi_ext_protocol::LoadParams {
+            paths: Vec::new(),
+        }))
+        .await
+        .unwrap();
+
+    let cancel_frame = format!("{{\"type\":\"cancel\",\"id\":{}}}", pending.id());
+    pending.cancel().await;
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let log = harness.log();
+        if log.contains(&cancel_frame) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "explicit cancel frame never observed; log: {log}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    harness.host.shutdown().await;
+}
+
+#[tokio::test]
+async fn request_timeout_does_not_wait_for_a_saturated_writer() {
+    let options = HarnessOptions {
+        client: ClientConfig {
+            writer_queue: 1,
+            heartbeat_interval: Duration::from_secs(30),
+            ..ClientConfig::default()
+        },
+        ..HarnessOptions::default()
+    };
+    let harness = Harness::new("stall-after-request.sh", options);
+    let connection = harness.host.ensure_ready().await.unwrap();
+    let request_deadline = Duration::from_secs(5);
+
+    // Start the timed request while the queue is empty. The fixture records
+    // that it read the frame before it stops consuming stdin, proving this
+    // exercises cancellation after admission rather than admission timeout.
+    let request_connection = Arc::clone(&connection);
+    let started = Instant::now();
+    let request = tokio::spawn(async move {
+        request_connection
+            .request_timeout(
+                Request::LifecycleLoad(pi_ext_protocol::LoadParams { paths: Vec::new() }),
+                request_deadline,
+            )
+            .await
+    });
+    let admitted_deadline = Instant::now() + Duration::from_secs(1);
+    while !harness.log().contains("request-admitted") {
+        assert!(
+            Instant::now() < admitted_deadline,
+            "sidecar did not admit the timed request"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // One large frame blocks the writer on the unread pipe; the next fills
+    // the single queue slot. Signal only after that second frame is admitted.
+    let (saturated_tx, saturated_rx) = tokio::sync::oneshot::channel();
+    let producer_connection = Arc::clone(&connection);
+    let producer = tokio::spawn(async move {
+        let payload = "x".repeat(512 * 1024);
+        let mut saturated_tx = Some(saturated_tx);
+        for index in 0..3 {
+            producer_connection
+                .notify(Notification::UiSetTitle(pi_ext_protocol::TextParams {
+                    text: payload.clone(),
+                }))
+                .await?;
+            if index == 1 {
+                let _ = saturated_tx.take().expect("signal sent once").send(());
+            }
+        }
+        Ok::<(), ClientError>(())
+    });
+    tokio::time::timeout(Duration::from_secs(1), saturated_rx)
+        .await
+        .expect("writer queue must saturate before the request deadline")
+        .expect("saturation producer must remain alive");
+    assert!(
+        !producer.is_finished(),
+        "third frame must be blocked behind the saturated writer queue"
+    );
+
+    let error = tokio::time::timeout(request_deadline + Duration::from_secs(1), request)
+        .await
+        .expect("timed request must not block while sending cancellation")
+        .expect("request task must not panic")
+        .unwrap_err();
+    assert!(
+        matches!(error, ClientError::Timeout(actual) if actual == request_deadline),
+        "unexpected request result: {error}"
+    );
+    assert!(
+        started.elapsed() < request_deadline + Duration::from_millis(500),
+        "timeout return was delayed by the saturated writer: {:?}",
+        started.elapsed()
+    );
+
+    producer.abort();
+    harness.host.shutdown().await;
+}
+
+#[tokio::test]
 async fn heartbeat_declares_a_silent_sidecar_dead() {
     let options = HarnessOptions {
         client: ClientConfig {
