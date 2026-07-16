@@ -11,7 +11,7 @@ use std::{
     time::Instant,
 };
 
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use globset::{Glob, GlobSetBuilder};
 use ignore::WalkBuilder;
 use parking_lot::Mutex;
@@ -19,7 +19,7 @@ use pi_agent::{AgentToolResult, ToolDefinition};
 use pi_ai::{Content, ImageContent, TextContent};
 use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -66,9 +66,36 @@ fn normalize_path(path: &Path) -> PathBuf {
 }
 
 fn resolve(cwd: &Path, raw: &str) -> PathBuf {
-    let path = Path::new(raw);
+    resolve_with_home(cwd, raw, None)
+}
+
+fn resolve_with_home(cwd: &Path, raw: &str, home_override: Option<&Path>) -> PathBuf {
+    let home = home_override.map(PathBuf::from).or_else(|| {
+        if cfg!(windows) {
+            std::env::var_os("USERPROFILE")
+                .or_else(|| std::env::var_os("HOME"))
+                .map(PathBuf::from)
+        } else {
+            std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .map(PathBuf::from)
+        }
+    });
+
+    let path = if let Some(ref home_path) = home {
+        if raw == "~" {
+            home_path.clone()
+        } else if raw.starts_with("~/") || (cfg!(windows) && raw.starts_with("~\\")) {
+            home_path.join(&raw[2..])
+        } else {
+            PathBuf::from(raw)
+        }
+    } else {
+        PathBuf::from(raw)
+    };
+
     let joined = if path.is_absolute() {
-        path.to_path_buf()
+        path
     } else {
         cwd.join(path)
     };
@@ -320,7 +347,9 @@ fn truncate_string_to_bytes_from_end(str: &str, max_bytes: usize) -> String {
         start += 1;
     }
     if start < bytes.len() {
-        std::str::from_utf8(&bytes[start..]).map(|s| s.to_string()).unwrap_or_default()
+        std::str::from_utf8(&bytes[start..])
+            .map(|s| s.to_string())
+            .unwrap_or_default()
     } else {
         String::new()
     }
@@ -342,7 +371,10 @@ fn truncate_line(line: &str, max_utf16_units: usize) -> (String, bool) {
     }
 
     if was_truncated {
-        (format!("{}... [truncated]", &line[..char_idx_boundary]), true)
+        (
+            format!("{}... [truncated]", &line[..char_idx_boundary]),
+            true,
+        )
     } else {
         (line.to_string(), false)
     }
@@ -364,7 +396,9 @@ impl Default for StreamingUtf8Decoder {
 
 impl StreamingUtf8Decoder {
     pub fn new() -> Self {
-        Self { leftover: Vec::new() }
+        Self {
+            leftover: Vec::new(),
+        }
     }
 
     pub fn decode(&mut self, chunk: &[u8], is_finished: bool) -> String {
@@ -435,7 +469,11 @@ pub struct OutputAccumulator {
 }
 
 impl OutputAccumulator {
-    pub fn new(max_lines: Option<usize>, max_bytes: Option<usize>, temp_file_prefix: Option<&str>) -> Self {
+    pub fn new(
+        max_lines: Option<usize>,
+        max_bytes: Option<usize>,
+        temp_file_prefix: Option<&str>,
+    ) -> Self {
         let max_lines = max_lines.unwrap_or(2000);
         let max_bytes = max_bytes.unwrap_or(50 * 1024);
         let max_rolling_bytes = std::cmp::max(max_bytes * 2, 1);
@@ -487,7 +525,11 @@ impl OutputAccumulator {
             || self.total_lines > self.max_lines
     }
 
-    pub fn append(&mut self, data: &[u8], decoder: &mut StreamingUtf8Decoder) -> std::io::Result<()> {
+    pub fn append(
+        &mut self,
+        data: &[u8],
+        decoder: &mut StreamingUtf8Decoder,
+    ) -> std::io::Result<()> {
         if self.finished {
             return Err(std::io::Error::other(
                 "Cannot append to a finished output accumulator",
@@ -533,15 +575,17 @@ impl OutputAccumulator {
     }
 
     pub fn snapshot(&mut self, persist_if_truncated: bool) -> OutputSnapshot {
-        let mut tail_truncation = truncate_tail(self.get_snapshot_text(), self.max_lines, self.max_bytes);
-        let truncated = self.total_lines > self.max_lines || self.total_decoded_bytes > self.max_bytes;
+        let mut tail_truncation =
+            truncate_tail(self.get_snapshot_text(), self.max_lines, self.max_bytes);
+        let truncated =
+            self.total_lines > self.max_lines || self.total_decoded_bytes > self.max_bytes;
         let truncated_by = if truncated {
             Some(tail_truncation.truncated_by.unwrap_or(
                 if self.total_decoded_bytes > self.max_bytes {
                     TruncatedBy::Bytes
                 } else {
                     TruncatedBy::Lines
-                }
+                },
             ))
         } else {
             None
@@ -616,7 +660,9 @@ impl OutputAccumulator {
         }
 
         self.tail_text = if start < buffer.len() {
-            std::str::from_utf8(&buffer[start..]).unwrap_or("").to_string()
+            std::str::from_utf8(&buffer[start..])
+                .unwrap_or("")
+                .to_string()
         } else {
             String::new()
         };
@@ -651,7 +697,11 @@ pub struct DiffStringResult {
     pub first_changed_line: Option<usize>,
 }
 
-pub fn generate_diff_string(old_content: &str, new_content: &str, context_lines: usize) -> DiffStringResult {
+pub fn generate_diff_string(
+    old_content: &str,
+    new_content: &str,
+    context_lines: usize,
+) -> DiffStringResult {
     let diff_res = diff::lines(old_content, new_content);
     let mut parts: Vec<Part> = Vec::new();
     for res in diff_res {
@@ -679,7 +729,9 @@ pub fn generate_diff_string(old_content: &str, new_content: &str, context_lines:
                 }
             }
             diff::Result::Both(b, _) => {
-                let is_common = !parts.is_empty() && !parts.last().unwrap().added && !parts.last().unwrap().removed;
+                let is_common = !parts.is_empty()
+                    && !parts.last().unwrap().added
+                    && !parts.last().unwrap().removed;
                 if is_common {
                     parts.last_mut().unwrap().value.push(b);
                 } else {
@@ -726,7 +778,8 @@ pub fn generate_diff_string(old_content: &str, new_content: &str, context_lines:
             }
             last_was_change = true;
         } else {
-            let next_part_is_change = i < parts.len() - 1 && (parts[i + 1].added || parts[i + 1].removed);
+            let next_part_is_change =
+                i < parts.len() - 1 && (parts[i + 1].added || parts[i + 1].removed);
             let has_leading_change = last_was_change;
             let has_trailing_change = next_part_is_change;
 
@@ -807,7 +860,12 @@ pub fn generate_diff_string(old_content: &str, new_content: &str, context_lines:
     }
 }
 
-pub fn generate_unified_patch(path: &str, old_content: &str, new_content: &str, context_lines: usize) -> String {
+pub fn generate_unified_patch(
+    path: &str,
+    old_content: &str,
+    new_content: &str,
+    context_lines: usize,
+) -> String {
     let diff_res = diff::lines(old_content, new_content);
     let mut parts: Vec<Part> = Vec::new();
     for res in diff_res {
@@ -835,7 +893,9 @@ pub fn generate_unified_patch(path: &str, old_content: &str, new_content: &str, 
                 }
             }
             diff::Result::Both(b, _) => {
-                let is_common = !parts.is_empty() && !parts.last().unwrap().added && !parts.last().unwrap().removed;
+                let is_common = !parts.is_empty()
+                    && !parts.last().unwrap().added
+                    && !parts.last().unwrap().removed;
                 if is_common {
                     parts.last_mut().unwrap().value.push(b);
                 } else {
@@ -953,10 +1013,7 @@ pub fn generate_unified_patch(path: &str, old_content: &str, new_content: &str, 
         hunks.push(hunk);
     }
 
-    let mut patch_lines = vec![
-        format!("--- {}", path),
-        format!("+++ {}", path),
-    ];
+    let mut patch_lines = vec![format!("--- {}", path), format!("+++ {}", path)];
     for hunk in hunks {
         patch_lines.push(format!(
             "@@ -{},{} +{},{} @@",
@@ -978,19 +1035,181 @@ fn string_arg<'a>(args: &'a Value, name: &str) -> Result<&'a str, String> {
 }
 
 fn limit_arg(args: &Value, name: &str) -> Option<f64> {
-    args.get(name)
-        .and_then(Value::as_f64)
+    args.get(name).and_then(Value::as_f64)
+}
+
+fn starts_with_ascii(buffer: &[u8], offset: usize, text: &str) -> bool {
+    if buffer.len() < offset + text.len() {
+        return false;
+    }
+    &buffer[offset..offset + text.len()] == text.as_bytes()
+}
+
+fn read_uint16_le(buffer: &[u8], offset: usize) -> u16 {
+    let b0 = buffer.get(offset).copied().unwrap_or(0) as u16;
+    let b1 = buffer.get(offset + 1).copied().unwrap_or(0) as u16;
+    b0 | (b1 << 8)
+}
+
+fn read_uint32_be(buffer: &[u8], offset: usize) -> u32 {
+    let b0 = buffer.get(offset).copied().unwrap_or(0) as u32;
+    let b1 = buffer.get(offset + 1).copied().unwrap_or(0) as u32;
+    let b2 = buffer.get(offset + 2).copied().unwrap_or(0) as u32;
+    let b3 = buffer.get(offset + 3).copied().unwrap_or(0) as u32;
+    (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+}
+
+fn read_uint32_le(buffer: &[u8], offset: usize) -> u32 {
+    let b0 = buffer.get(offset).copied().unwrap_or(0) as u32;
+    let b1 = buffer.get(offset + 1).copied().unwrap_or(0) as u32;
+    let b2 = buffer.get(offset + 2).copied().unwrap_or(0) as u32;
+    let b3 = buffer.get(offset + 3).copied().unwrap_or(0) as u32;
+    b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+}
+
+fn is_png(buffer: &[u8]) -> bool {
+    buffer.len() >= 16 && read_uint32_be(buffer, 8) == 13 && starts_with_ascii(buffer, 12, "IHDR")
+}
+
+fn is_animated_png(buffer: &[u8]) -> bool {
+    let mut offset = 8;
+    while offset + 8 <= buffer.len() {
+        let chunk_length = read_uint32_be(buffer, offset) as usize;
+        let chunk_type_offset = offset + 4;
+        if starts_with_ascii(buffer, chunk_type_offset, "acTL") {
+            return true;
+        }
+        if starts_with_ascii(buffer, chunk_type_offset, "IDAT") {
+            return false;
+        }
+        let next_offset = offset + 8 + chunk_length + 4;
+        if next_offset <= offset || next_offset > buffer.len() {
+            return false;
+        }
+        offset = next_offset;
+    }
+    false
+}
+
+fn is_bmp(buffer: &[u8]) -> bool {
+    if buffer.len() < 26 {
+        return false;
+    }
+    let declared_file_size = read_uint32_le(buffer, 2);
+    let pixel_data_offset = read_uint32_le(buffer, 10);
+    let dib_header_size = read_uint32_le(buffer, 14);
+
+    if declared_file_size != 0 && declared_file_size < 26 {
+        return false;
+    }
+    if pixel_data_offset < 14 + dib_header_size {
+        return false;
+    }
+    if declared_file_size != 0 && pixel_data_offset >= declared_file_size {
+        return false;
+    }
+
+    let color_planes: u16;
+    let bits_per_pixel: u16;
+    if dib_header_size == 12 {
+        color_planes = read_uint16_le(buffer, 22);
+        bits_per_pixel = read_uint16_le(buffer, 24);
+    } else if (40..=124).contains(&dib_header_size) {
+        if buffer.len() < 30 {
+            return false;
+        }
+        color_planes = read_uint16_le(buffer, 26);
+        bits_per_pixel = read_uint16_le(buffer, 28);
+    } else {
+        return false;
+    }
+
+    color_planes == 1 && [1, 4, 8, 16, 24, 32].contains(&bits_per_pixel)
+}
+
+fn detect_supported_image_mime_type(buffer: &[u8]) -> Option<&'static str> {
+    if buffer.len() >= 3 && buffer[0] == 0xff && buffer[1] == 0xd8 && buffer[2] == 0xff {
+        if buffer.len() >= 4 && buffer[3] == 0xf7 {
+            return None; // unsupported JPEG-LS
+        }
+        return Some("image/jpeg");
+    }
+
+    const PNG_SIGNATURE: &[u8] = &[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+    if buffer.starts_with(PNG_SIGNATURE) {
+        if is_png(buffer) && !is_animated_png(buffer) {
+            return Some("image/png");
+        }
+        return None; // unsupported animated PNG or malformed PNG
+    }
+
+    if starts_with_ascii(buffer, 0, "GIF") {
+        return Some("image/gif");
+    }
+
+    if starts_with_ascii(buffer, 0, "RIFF") && starts_with_ascii(buffer, 8, "WEBP") {
+        return Some("image/webp");
+    }
+
+    if starts_with_ascii(buffer, 0, "BM") && is_bmp(buffer) {
+        return Some("image/bmp");
+    }
+
+    None
 }
 
 fn image_mime(path: &Path) -> Option<&'static str> {
-    match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
-        "jpg" | "jpeg" => Some("image/jpeg"),
-        "png" => Some("image/png"),
-        "gif" => Some("image/gif"),
-        "webp" => Some("image/webp"),
-        "bmp" => Some("image/bmp"),
-        _ => None,
+    let mut file = File::open(path).ok()?;
+    let mut buffer = vec![0u8; 4100];
+    use std::io::Read;
+    let bytes_read = file.read(&mut buffer).ok()?;
+    detect_supported_image_mime_type(&buffer[..bytes_read])
+}
+
+fn prepare_edit_arguments(input: Value) -> Value {
+    let mut args = match input {
+        Value::Object(map) => map,
+        other => return other,
+    };
+
+    // 1. Some models (Opus 4.6, GLM-5.1) send edits as a JSON string instead of an array
+    if let Some(arr) = args
+        .get("edits")
+        .and_then(Value::as_str)
+        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+        .and_then(|v| match v {
+            Value::Array(arr) => Some(arr),
+            _ => None,
+        })
+    {
+        args.insert("edits".to_string(), Value::Array(arr));
     }
+
+    // 2. Legacy fallback
+    let old_text = args
+        .get("oldText")
+        .and_then(Value::as_str)
+        .map(String::from);
+    let new_text = args
+        .get("newText")
+        .and_then(Value::as_str)
+        .map(String::from);
+
+    if let (Some(old), Some(new)) = (old_text, new_text) {
+        let mut edits = match args.remove("edits") {
+            Some(Value::Array(arr)) => arr,
+            _ => Vec::new(),
+        };
+        edits.push(json!({
+            "oldText": old,
+            "newText": new
+        }));
+        args.insert("edits".to_string(), Value::Array(edits));
+        args.remove("oldText");
+        args.remove("newText");
+    }
+
+    Value::Object(args)
 }
 
 // =========================================================================
@@ -1048,7 +1267,8 @@ pub fn create_read_tool(cwd: impl Into<PathBuf>) -> ToolDefinition {
                     });
                 }
 
-                let contents = fs::read_to_string(&target).map_err(|error| error.to_string())?;
+                let bytes = fs::read(&target).map_err(|error| error.to_string())?;
+                let contents = String::from_utf8_lossy(&bytes).into_owned();
                 // Split by \n retaining empty elements to match TS string.split("\n")
                 let all_lines: Vec<&str> = contents.split('\n').collect();
                 let total_file_lines = all_lines.len();
@@ -1141,6 +1361,13 @@ pub fn write_schema() -> Value {
 }
 
 pub fn create_write_tool(cwd: impl Into<PathBuf>) -> ToolDefinition {
+    create_write_tool_with_home(cwd, None)
+}
+
+pub(crate) fn create_write_tool_with_home(
+    cwd: impl Into<PathBuf>,
+    home_override: Option<PathBuf>,
+) -> ToolDefinition {
     let cwd = cwd.into();
     ToolDefinition {
         name: "write".into(),
@@ -1152,10 +1379,11 @@ pub fn create_write_tool(cwd: impl Into<PathBuf>) -> ToolDefinition {
         renderer: None,
         execute: Arc::new(move |_, args, cancellation_token, _| {
             let cwd = cwd.clone();
+            let home_override = home_override.clone();
             Box::pin(async move {
                 let path = string_arg(&args, "path")?;
                 let content = string_arg(&args, "content")?;
-                let target = resolve(&cwd, path);
+                let target = resolve_with_home(&cwd, path, home_override.as_deref());
 
                 with_file_lock(target.clone(), || async {
                     if cancellation_token.as_ref().is_some_and(|ct| ct.is_cancelled()) {
@@ -1206,7 +1434,7 @@ pub fn create_edit_tool(cwd: impl Into<PathBuf>) -> ToolDefinition {
         description: "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.".into(),
         parameters: edit_schema(),
         execution_mode: None,
-        prepare_arguments: None,
+        prepare_arguments: Some(Arc::new(prepare_edit_arguments)),
         renderer: None,
         execute: Arc::new(move |_, args, cancellation_token, _| {
             let cwd = cwd.clone();
@@ -1333,7 +1561,7 @@ pub fn bash_schema() -> Value {
 fn kill_process_tree(pid: u32) {
     #[cfg(unix)]
     {
-        use rustix::process::{kill_process_group, Pid, Signal};
+        use rustix::process::{Pid, Signal, kill_process_group};
         if let Some(pgid) = Pid::from_raw(pid as i32) {
             let _ = kill_process_group(pgid, Signal::KILL);
         }
@@ -1688,12 +1916,17 @@ fn file_set(root: &Path, glob: Option<&str>) -> Result<Vec<PathBuf>, String> {
         .build()
     {
         let entry = entry.map_err(|error| error.to_string())?;
-        if entry.file_type().is_some_and(|kind| kind.is_file())
-            && matcher
-                .as_ref()
-                .is_none_or(|set| set.is_match(entry.path()))
-        {
-            files.push(entry.into_path());
+        if entry.file_type().is_some_and(|kind| kind.is_file()) {
+            let matched = match &matcher {
+                Some(set) => {
+                    let rel_path = entry.path().strip_prefix(root).unwrap_or(entry.path());
+                    set.is_match(rel_path)
+                }
+                None => true,
+            };
+            if matched {
+                files.push(entry.into_path());
+            }
         }
     }
     Ok(files)
@@ -2116,7 +2349,10 @@ mod tests {
         // Relative unresolved parent tests
         assert_eq!(resolve(cwd, "../tmp"), PathBuf::from("/home/alpha/exp/tmp"));
         assert_eq!(resolve(cwd, "../../tmp"), PathBuf::from("/home/alpha/tmp"));
-        assert_eq!(resolve(cwd, "a/../x"), PathBuf::from("/home/alpha/exp/pi-rust/x"));
+        assert_eq!(
+            resolve(cwd, "a/../x"),
+            PathBuf::from("/home/alpha/exp/pi-rust/x")
+        );
 
         // Literal /.. test
         assert_eq!(normalize_path(Path::new("/..")), PathBuf::from("/"));
@@ -2135,7 +2371,8 @@ mod tests {
 
         // Load fixtures
         let read_fixture: Value = serde_json::from_str(include_str!("fixtures/read.json")).unwrap();
-        let write_fixture: Value = serde_json::from_str(include_str!("fixtures/write.json")).unwrap();
+        let write_fixture: Value =
+            serde_json::from_str(include_str!("fixtures/write.json")).unwrap();
         let edit_fixture: Value = serde_json::from_str(include_str!("fixtures/edit.json")).unwrap();
         let bash_fixture: Value = serde_json::from_str(include_str!("fixtures/bash.json")).unwrap();
         let grep_fixture: Value = serde_json::from_str(include_str!("fixtures/grep.json")).unwrap();
@@ -2152,13 +2389,34 @@ mod tests {
         assert_eq!(ls_t.parameters, ls_fixture);
 
         // Description Assertions
-        assert_eq!(read_t.description, "Read the contents of a file. Supports text files and images (jpg, png, gif, webp, bmp). Images are sent as attachments. For text files, output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.");
-        assert_eq!(write_t.description, "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories.");
-        assert_eq!(edit_t.description, "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.");
-        assert_eq!(bash_t.description, "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds.");
-        assert_eq!(grep_t.description, "Search file contents for a pattern. Returns matching lines with file paths and line numbers. Respects .gitignore. Output is truncated to 100 matches or 50KB (whichever is hit first). Long lines are truncated to 500 chars.");
-        assert_eq!(find_t.description, "Search for files by glob pattern. Returns matching file paths relative to the search directory. Respects .gitignore. Output is truncated to 1000 results or 50KB (whichever is hit first).");
-        assert_eq!(ls_t.description, "List directory contents. Returns entries sorted alphabetically, with '/' suffix for directories. Includes dotfiles. Output is truncated to 500 entries or 50KB (whichever is hit first).");
+        assert_eq!(
+            read_t.description,
+            "Read the contents of a file. Supports text files and images (jpg, png, gif, webp, bmp). Images are sent as attachments. For text files, output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete."
+        );
+        assert_eq!(
+            write_t.description,
+            "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories."
+        );
+        assert_eq!(
+            edit_t.description,
+            "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes."
+        );
+        assert_eq!(
+            bash_t.description,
+            "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds."
+        );
+        assert_eq!(
+            grep_t.description,
+            "Search file contents for a pattern. Returns matching lines with file paths and line numbers. Respects .gitignore. Output is truncated to 100 matches or 50KB (whichever is hit first). Long lines are truncated to 500 chars."
+        );
+        assert_eq!(
+            find_t.description,
+            "Search for files by glob pattern. Returns matching file paths relative to the search directory. Respects .gitignore. Output is truncated to 1000 results or 50KB (whichever is hit first)."
+        );
+        assert_eq!(
+            ls_t.description,
+            "List directory contents. Returns entries sorted alphabetically, with '/' suffix for directories. Includes dotfiles. Output is truncated to 500 entries or 50KB (whichever is hit first)."
+        );
     }
 
     #[tokio::test]
@@ -2178,7 +2436,11 @@ mod tests {
             "beta\n\n[2 more lines in file. Use offset=3 to continue.]"
         );
 
-        fs::write(dir.join("picture.png"), [137, 80, 78, 71]).expect("image fixture");
+        fs::write(
+            dir.join("picture.png"),
+            [137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82],
+        )
+        .expect("image fixture");
         let image = (create_read_tool(&dir).execute)(
             "test".into(),
             json!({"path":"picture.png"}),
@@ -2187,10 +2449,7 @@ mod tests {
         )
         .await
         .expect("image read");
-        assert!(matches!(
-            image.content.get(1),
-            Some(Content::Image(_))
-        ));
+        assert!(matches!(image.content.get(1), Some(Content::Image(_))));
 
         assert!(
             run(
@@ -2265,12 +2524,22 @@ mod tests {
         );
 
         // Test limit=0 defaults/clamping to 1
-        let grep_zero = run(&create_grep_tool(&dir), json!({"pattern":"a","path":"input.txt","limit":0})).await.expect("grep limit 0");
+        let grep_zero = run(
+            &create_grep_tool(&dir),
+            json!({"pattern":"a","path":"input.txt","limit":0}),
+        )
+        .await
+        .expect("grep limit 0");
         assert!(grep_zero.contains("input.txt:1: alpha"));
         assert!(!grep_zero.contains("input.txt:2: delta"));
 
         // Test grep limit=1.5 returns 2 matches (ceil) on input.txt
-        let grep_frac = run(&create_grep_tool(&dir), json!({"pattern":"a","path":"input.txt","limit":1.5})).await.expect("grep fractional");
+        let grep_frac = run(
+            &create_grep_tool(&dir),
+            json!({"pattern":"a","path":"input.txt","limit":1.5}),
+        )
+        .await
+        .expect("grep fractional");
         assert!(grep_frac.contains("input.txt:1: alpha"));
         assert!(grep_frac.contains("input.txt:2: delta"));
         assert!(!grep_frac.contains("input.txt:3: gamma"));
@@ -2321,7 +2590,10 @@ mod tests {
         assert!(err_msg.contains("Command aborted"));
 
         tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-        assert!(!marker.exists(), "Descendant process survived and wrote marker!");
+        assert!(
+            !marker.exists(),
+            "Descendant process survived and wrote marker!"
+        );
 
         fs::remove_dir_all(dir).expect("cleanup");
     }
@@ -2338,7 +2610,11 @@ mod tests {
         )
         .await;
         assert!(res.is_err());
-        assert!(res.err().unwrap().contains("Command timed out after 0.1 seconds"));
+        assert!(
+            res.err()
+                .unwrap()
+                .contains("Command timed out after 0.1 seconds")
+        );
         fs::remove_dir_all(dir).expect("cleanup");
     }
 
@@ -2347,17 +2623,15 @@ mod tests {
         let dir = tempdir();
         let tool = create_bash_tool(&dir);
         let command = "for i in {1..2500}; do echo \"line $i\"; done";
-        let res = (tool.execute)(
-            "test".into(),
-            json!({"command": command}),
-            None,
-            None,
-        )
-        .await
-        .expect("bash execution");
+        let res = (tool.execute)("test".into(), json!({"command": command}), None, None)
+            .await
+            .expect("bash execution");
 
         assert!(res.details.get("truncation").is_some());
-        let full_output_path_val = res.details.get("fullOutputPath").expect("must have fullOutputPath");
+        let full_output_path_val = res
+            .details
+            .get("fullOutputPath")
+            .expect("must have fullOutputPath");
         let path_str = full_output_path_val.as_str().expect("must be string");
         let temp_path = PathBuf::from(path_str);
         assert!(temp_path.exists());
@@ -2367,6 +2641,194 @@ mod tests {
         assert!(full_content.contains("line 2500\n"));
 
         let _ = fs::remove_file(temp_path);
+        fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn test_edit_prepare_arguments() {
+        let tool = create_edit_tool(Path::new("."));
+        let prep = tool
+            .prepare_arguments
+            .as_ref()
+            .expect("prepare_arguments hook should be registered");
+
+        // 1. Legacy folding form: top-level oldText and newText are folded into edits
+        let input_legacy = json!({
+            "path": "test.txt",
+            "oldText": "original text",
+            "newText": "replaced text"
+        });
+        let result_legacy = prep(input_legacy);
+        assert_eq!(result_legacy["path"], "test.txt");
+        assert_eq!(
+            result_legacy["edits"],
+            json!([{"oldText": "original text", "newText": "replaced text"}])
+        );
+        assert!(result_legacy.get("oldText").is_none());
+        assert!(result_legacy.get("newText").is_none());
+
+        // 2. Stringified edits form: edits is a JSON string of an array
+        let input_stringified = json!({
+            "path": "test.txt",
+            "edits": "[{\"oldText\": \"alpha\", \"newText\": \"beta\"}]"
+        });
+        let result_stringified = prep(input_stringified);
+        assert_eq!(result_stringified["path"], "test.txt");
+        assert_eq!(
+            result_stringified["edits"],
+            json!([{"oldText": "alpha", "newText": "beta"}])
+        );
+
+        // 3. Combined legacy fold + stringified edits
+        let input_combined = json!({
+            "path": "test.txt",
+            "edits": "[{\"oldText\": \"alpha\", \"newText\": \"beta\"}]",
+            "oldText": "gamma",
+            "newText": "delta"
+        });
+        let result_combined = prep(input_combined);
+        assert_eq!(result_combined["path"], "test.txt");
+        assert_eq!(
+            result_combined["edits"],
+            json!([
+                {"oldText": "alpha", "newText": "beta"},
+                {"oldText": "gamma", "newText": "delta"}
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_injected_home_resolve() {
+        let dir = tempdir();
+
+        // Verify path resolution
+        let resolved_tilde = resolve_with_home(Path::new("."), "~", Some(&dir));
+        assert_eq!(resolved_tilde, dir);
+
+        let resolved_tilde_file = resolve_with_home(Path::new("."), "~/foo.txt", Some(&dir));
+        assert_eq!(resolved_tilde_file, dir.join("foo.txt"));
+
+        // Test a path-taking tool (write) using ~/foo.txt with home override
+        let write_res = run(
+            &create_write_tool_with_home(Path::new("."), Some(dir.clone())),
+            json!({"path": "~/foo.txt", "content": "hello tilde"}),
+        )
+        .await
+        .expect("write to tilde path should succeed");
+
+        assert!(write_res.contains("Successfully wrote 11 bytes"));
+        assert!(dir.join("foo.txt").exists());
+        assert_eq!(
+            fs::read_to_string(dir.join("foo.txt")).unwrap(),
+            "hello tilde"
+        );
+
+        // Clean up
+        fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn test_grep_glob_relative() {
+        let dir = tempdir();
+        let src_dir = dir.join("src");
+        fs::create_dir_all(&src_dir).expect("create src dir");
+        fs::write(src_dir.join("main.ts"), "const x = 42; // target\n").expect("write file");
+        fs::write(dir.join("other.ts"), "const y = 99; // target\n").expect("write file");
+
+        // Run grep with search root = dir, and glob = "src/**/*.ts"
+        let grep_tool = create_grep_tool(Path::new("."));
+        let grep_res = run(
+            &grep_tool,
+            json!({
+                "path": dir.to_string_lossy(),
+                "pattern": "target",
+                "glob": "src/**/*.ts"
+            }),
+        )
+        .await
+        .expect("grep execution");
+
+        // Should find main.ts but not other.ts because of the glob filter
+        assert!(grep_res.contains("src/main.ts"));
+        assert!(!grep_res.contains("other.ts"));
+
+        // Clean up
+        fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn test_read_lossy_utf8() {
+        let dir = tempdir();
+        let invalid_utf8_file = dir.join("invalid.txt");
+        fs::write(&invalid_utf8_file, b"hello \xff world").expect("write invalid file");
+
+        let read_tool = create_read_tool(&dir);
+        let read_res = run(&read_tool, json!({"path": "invalid.txt"}))
+            .await
+            .expect("read should succeed with lossy decoding");
+
+        assert!(read_res.contains("hello"));
+        assert!(read_res.contains("world"));
+        assert!(read_res.contains("\u{fffd}"));
+
+        // Clean up
+        fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn test_image_sniffing_by_magic_bytes() {
+        let dir = tempdir();
+
+        // 1. Extensionless valid PNG image
+        let extensionless_path = dir.join("valid_image_no_ext");
+        fs::write(
+            &extensionless_path,
+            [137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82],
+        )
+        .expect("write extensionless image");
+
+        let read_tool = create_read_tool(&dir);
+        let img_res = (read_tool.execute)(
+            "test".into(),
+            json!({"path": "valid_image_no_ext"}),
+            None,
+            None,
+        )
+        .await
+        .expect("read valid_image_no_ext");
+
+        assert!(matches!(img_res.content.get(1), Some(Content::Image(_))));
+
+        // 2. Fake .png image
+        let fake_png_path = dir.join("fake_image.png");
+        fs::write(&fake_png_path, b"this is not a png file").expect("write fake png");
+
+        let fake_res =
+            (read_tool.execute)("test".into(), json!({"path": "fake_image.png"}), None, None)
+                .await
+                .expect("read fake_image.png");
+
+        assert!(fake_res.content.len() == 1);
+        let Content::Text(ref txt) = fake_res.content[0] else {
+            panic!("expected text only for fake png");
+        };
+        assert!(txt.text.as_string().contains("this is not a png file"));
+
+        // 3. Reject unsupported JPEG-LS
+        let jpeg_ls = [0xff, 0xd8, 0xff, 0xf7];
+        assert_eq!(detect_supported_image_mime_type(&jpeg_ls), None);
+
+        // 4. Reject unsupported animated PNG (APNG)
+        let mut apng = vec![0u8; 50];
+        apng[0..8].copy_from_slice(&[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]); // PNG signature
+        apng[8..12].copy_from_slice(&[0, 0, 0, 13]); // IHDR length
+        apng[12..16].copy_from_slice(b"IHDR");
+        // next chunk starts at offset 33 (8 signature + 4 length + 4 type + 13 data + 4 CRC)
+        apng[33..37].copy_from_slice(&[0, 0, 0, 8]); // acTL length
+        apng[37..41].copy_from_slice(b"acTL");
+        assert_eq!(detect_supported_image_mime_type(&apng), None);
+
+        // Clean up
         fs::remove_dir_all(dir).expect("cleanup");
     }
 }
