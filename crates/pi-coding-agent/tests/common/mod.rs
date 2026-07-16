@@ -197,6 +197,8 @@ pub struct TestRuntimeOptions {
     pub bridge: Option<Arc<dyn ExtensionBridge>>,
     /// Pre-seeded `<agent-dir>/settings.json` content.
     pub global_settings: Option<serde_json::Value>,
+    /// Pre-seeded `<agent-dir>/auth.json` content.
+    pub auth_json: Option<serde_json::Value>,
 }
 
 pub struct TestRuntime {
@@ -228,6 +230,13 @@ pub async fn make_runtime(options: TestRuntimeOptions) -> TestRuntime {
         .expect("seed settings.json");
     }
 
+    if let Some(auth_json) = &options.auth_json {
+        std::fs::write(
+            agent_dir.join("auth.json"),
+            serde_json::to_string_pretty(auth_json).expect("auth json"),
+        )
+        .expect("seed auth.json");
+    }
     let auth = Arc::new(AuthStorage::new(agent_dir.join("auth.json")));
     if options.with_auth {
         auth.set_runtime_api_key("anthropic".to_string(), "test-key".to_string());

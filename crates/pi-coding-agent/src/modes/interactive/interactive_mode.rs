@@ -177,6 +177,7 @@ enum UiCommand {
 
 enum SettingChange {
     AutoCompact(bool),
+    Warnings(crate::settings_manager::WarningSettings),
     Steering(String),
     FollowUp(String),
     Thinking(ModelThinkingLevel),
@@ -368,6 +369,14 @@ const INTERCEPTED_ACTIONS: &[(&str, AppAction)] = &[
     ("app.session.resume", AppAction::SessionResume),
 ];
 
+/// Oracle `ANTHROPIC_SUBSCRIPTION_AUTH_WARNING` (interactive-mode.ts:214-215).
+const ANTHROPIC_SUBSCRIPTION_AUTH_WARNING: &str = "Anthropic subscription auth is active. Third-party harness usage draws from extra usage and is billed per token, not your Claude plan limits. Manage extra usage at https://claude.ai/settings/usage.";
+
+/// Oracle `isAnthropicSubscriptionAuthKey` (interactive-mode.ts:217-219).
+fn is_anthropic_subscription_auth_key(api_key: &str) -> bool {
+    api_key.starts_with("sk-ant-oat")
+}
+
 /// Escape-handler override while a background task runs (oracle swaps
 /// `defaultEditor.onEscape` and restores it afterwards).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -397,6 +406,7 @@ enum OpOutcome {
     ForkFinished(Result<crate::session::runtime::ReplaceResult, String>),
     TreeNavigated(Result<crate::session::NavigateTreeResult, String>),
     FlushQueuePromptFailed(String),
+    AnthropicKeyChecked(Option<String>),
     AuthChanged {
         provider: String,
         auth_type: AuthType,
@@ -512,6 +522,7 @@ pub struct InteractiveMode {
     escape_override: Option<EscapeOverride>,
     last_sigint_time: Option<Instant>,
     last_escape_time: Option<Instant>,
+    anthropic_subscription_warning_shown: bool,
     /// Monotonic time source (defaults to `Instant::now`).
     now: Rc<dyn Fn() -> Instant>,
     is_bash_mode: bool,
@@ -754,6 +765,7 @@ impl InteractiveMode {
             escape_override: None,
             last_sigint_time: None,
             last_escape_time: None,
+            anthropic_subscription_warning_shown: false,
             now: clock,
             is_bash_mode: false,
             selector_open: false,
@@ -791,6 +803,7 @@ impl InteractiveMode {
         if let Some(fallback) = self.options.model_fallback_message.take() {
             self.show_warning(&fallback);
         }
+        self.maybe_warn_about_anthropic_subscription_auth(None);
         self.tui.start_render_loop_hooks();
     }
 
@@ -1139,6 +1152,9 @@ impl InteractiveMode {
                 self.session.set_auto_compaction_enabled(enabled);
                 self.footer.borrow_mut().set_auto_compact_enabled(enabled);
             }
+            SettingChange::Warnings(warnings) => {
+                services.settings_manager.lock().set_warnings(&warnings);
+            }
             SettingChange::Steering(mode) => self.session.set_steering_mode(&mode),
             SettingChange::FollowUp(mode) => self.session.set_follow_up_mode(&mode),
             SettingChange::Thinking(level) => {
@@ -1386,6 +1402,57 @@ impl InteractiveMode {
             editor.set_border_color(theme().thinking_border_color(level));
         }
         self.tui.request_render(false);
+    }
+
+    /// Oracle `maybeWarnAboutAnthropicSubscriptionAuth` (:4346-4376): warn
+    /// once when the anthropic provider is backed by subscription (OAuth)
+    /// auth or an `sk-ant-oat` API key, unless disabled via warnings setting.
+    fn maybe_warn_about_anthropic_subscription_auth(&mut self, model: Option<&Model>) {
+        let warnings = self
+            .runtime
+            .services()
+            .settings_manager
+            .lock()
+            .get_warnings();
+        if warnings.anthropic_extra_usage == Some(false) {
+            return;
+        }
+        if self.anthropic_subscription_warning_shown {
+            return;
+        }
+        let model = match model {
+            Some(model) => model.clone(),
+            None => match self.session.model() {
+                Some(model) => model,
+                None => return,
+            },
+        };
+        if model.provider != "anthropic" {
+            return;
+        }
+
+        let services = self.runtime.services();
+        if matches!(
+            services.auth_storage.get_sync(&model.provider),
+            Ok(Some(pi_ai::auth::Credential::OAuth(_)))
+        ) {
+            self.anthropic_subscription_warning_shown = true;
+            self.show_warning(ANTHROPIC_SUBSCRIPTION_AUTH_WARNING);
+            return;
+        }
+
+        // API-key path resolves async (oracle awaits getApiKeyForProvider and
+        // ignores lookup failures).
+        let registry = services.model_registry.clone();
+        let provider = model.provider.clone();
+        self.ops.push(Box::pin(async move {
+            let key = registry
+                .read()
+                .await
+                .get_api_key_for_provider(&provider)
+                .await;
+            OpOutcome::AnthropicKeyChecked(key)
+        }));
     }
 
     // ========================================================================
@@ -2008,13 +2075,15 @@ impl InteractiveMode {
                     self.footer.borrow_mut().invalidate();
                     self.update_editor_border_color();
                     self.show_status(&format!("Model set to {}/{}", model.provider, model.id));
+                    self.maybe_warn_about_anthropic_subscription_auth(Some(&model));
                 }
                 Err(error) => self.show_error(&error),
             },
             OpOutcome::ModelCycled(result) => {
-                if result.is_some() {
+                if let Some(result) = result {
                     self.footer.borrow_mut().invalidate();
                     self.update_editor_border_color();
+                    self.maybe_warn_about_anthropic_subscription_auth(Some(&result.model));
                     self.tui.request_render(false);
                 }
             }
@@ -2089,6 +2158,7 @@ impl InteractiveMode {
                         ));
                         self.footer.borrow_mut().invalidate();
                         self.refresh_autocomplete_provider();
+                        self.maybe_warn_about_anthropic_subscription_auth(None);
                     }
                     Ok(()) if auth_type == AuthType::OAuth => {
                         self.show_status(&format!("Logged out of {provider}"));
@@ -2114,6 +2184,16 @@ impl InteractiveMode {
             }
             OpOutcome::FlushQueuePromptFailed(error) => {
                 self.show_error(&error);
+            }
+            OpOutcome::AnthropicKeyChecked(key) => {
+                if !self.anthropic_subscription_warning_shown
+                    && key
+                        .as_deref()
+                        .is_some_and(is_anthropic_subscription_auth_key)
+                {
+                    self.anthropic_subscription_warning_shown = true;
+                    self.show_warning(ANTHROPIC_SUBSCRIPTION_AUTH_WARNING);
+                }
             }
         }
     }
@@ -2858,6 +2938,7 @@ impl InteractiveMode {
                     std::env::var("PI_CLEAR_ON_SHRINK").ok().as_deref() == Some("1"),
                 ),
                 show_terminal_progress: nested_bool("terminal", "showTerminalProgress", false),
+                warnings: settings.get_warnings(),
             }
         };
 
@@ -3019,11 +3100,16 @@ impl InteractiveMode {
                     )));
             }),
             on_show_terminal_progress_change: queue_nested_bool(
-                q,
+                q.clone(),
                 "terminal",
                 "showTerminalProgress",
                 false,
             ),
+            on_warnings_change: Box::new(move |warnings| {
+                q.borrow_mut().push_back(UiCommand::SettingChanged(Box::new(
+                    SettingChange::Warnings(warnings),
+                )));
+            }),
             on_cancel: Box::new(move || {
                 q_cancel.borrow_mut().push_back(UiCommand::RestoreEditor);
             }),

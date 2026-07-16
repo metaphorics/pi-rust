@@ -3,8 +3,6 @@
 //! Port of `modes/interactive/components/settings-selector.ts`.
 //!
 //! Deviations from the oracle (see slice report):
-//! - The `warnings` item and `WarningSettingsSubmenu` are omitted — the Rust
-//!   `SettingsManager` has no `WarningSettings` backing API yet.
 //! - `HTTP_IDLE_TIMEOUT_CHOICES` / `format_http_idle_timeout_ms` mirror
 //!   `core/http-dispatcher.ts` locally because the HTTP dispatcher module is
 //!   not ported; move them there when it lands.
@@ -26,6 +24,7 @@ use crate::modes::interactive::theme::{
     TerminalTheme, ThemeColor, get_select_list_theme, get_settings_list_theme,
     parse_auto_theme_setting, theme,
 };
+use crate::settings_manager::WarningSettings;
 
 fn settings_submenu_select_list_layout() -> SelectListLayoutOptions {
     SelectListLayoutOptions {
@@ -139,7 +138,7 @@ pub fn format_http_idle_timeout_ms(timeout_ms: u64) -> String {
     }
 }
 
-/// Oracle `SettingsConfig` (minus `warnings` — no backing API).
+/// Oracle `SettingsConfig`.
 pub struct SettingsConfig {
     pub auto_compact: bool,
     pub show_images: bool,
@@ -176,6 +175,7 @@ pub struct SettingsConfig {
     pub default_project_trust: String,
     pub clear_on_shrink: bool,
     pub show_terminal_progress: bool,
+    pub warnings: WarningSettings,
 }
 
 /// Boxed `&str` callback (clippy `type_complexity`).
@@ -187,7 +187,7 @@ type SettingsChangeFn = Box<dyn FnMut(&str, &str)>;
 /// `(current_value, done)` submenu factory (pi-tui `SettingItem::submenu`).
 type SubmenuFactory = Box<dyn FnMut(&str, Box<dyn FnMut(Option<String>)>) -> ComponentBox>;
 
-/// Oracle `SettingsCallbacks` (minus `onWarningsChange` — no backing API).
+/// Oracle `SettingsCallbacks`.
 ///
 /// Fields are `Fn` (not `FnMut`) because the theme submenu shares the bundle
 /// across several closures via `Rc`.
@@ -219,6 +219,7 @@ pub struct SettingsCallbacks {
     pub on_default_project_trust_change: Box<dyn Fn(&str)>,
     pub on_clear_on_shrink_change: Box<dyn Fn(bool)>,
     pub on_show_terminal_progress_change: Box<dyn Fn(bool)>,
+    pub on_warnings_change: Box<dyn Fn(WarningSettings)>,
     pub on_cancel: Box<dyn Fn()>,
 }
 
@@ -227,6 +228,72 @@ impl SettingsCallbacks {
         if let Some(preview) = &self.on_theme_preview {
             preview(value);
         }
+    }
+}
+
+/// Oracle `WarningSettingsSubmenu` (settings-selector.ts:120-160): a
+/// `SettingsList` over the individual warning toggles.
+struct WarningSettingsSubmenu {
+    settings_list: SettingsList,
+}
+
+impl WarningSettingsSubmenu {
+    fn new(
+        warnings: WarningSettings,
+        on_change: Box<dyn Fn(WarningSettings)>,
+        on_cancel: Box<dyn FnMut()>,
+    ) -> Self {
+        let state = Rc::new(RefCell::new(warnings));
+        let items = vec![SettingItem {
+            id: "anthropic-extra-usage".to_owned(),
+            label: "Anthropic extra usage".to_owned(),
+            description: Some(
+                "Warn when Anthropic subscription auth may use paid extra usage".to_owned(),
+            ),
+            current_value: if state.borrow().anthropic_extra_usage.unwrap_or(true) {
+                "true".to_owned()
+            } else {
+                "false".to_owned()
+            },
+            values: Some(vec!["true".to_owned(), "false".to_owned()]),
+            submenu: None,
+        }];
+        let max_visible = items.len().min(10);
+        let change_state = Rc::clone(&state);
+        let settings_list = SettingsList::new(
+            items,
+            max_visible,
+            get_settings_list_theme(),
+            Box::new(move |id, new_value| {
+                if id == "anthropic-extra-usage" {
+                    change_state.borrow_mut().anthropic_extra_usage = Some(new_value == "true");
+                    on_change(change_state.borrow().clone());
+                }
+            }),
+            on_cancel,
+            SettingsListOptions {
+                enable_search: true,
+            },
+        );
+        Self { settings_list }
+    }
+}
+
+impl Component for WarningSettingsSubmenu {
+    fn render(&mut self, width: u16) -> &[Line] {
+        self.settings_list.render(width)
+    }
+
+    fn invalidate(&mut self) {
+        self.settings_list.invalidate();
+    }
+
+    fn handle_input(&mut self, data: &str) {
+        self.settings_list.handle_input(data);
+    }
+
+    fn last_render_status(&self) -> RenderStatus {
+        RenderStatus::Changed
     }
 }
 
@@ -991,8 +1058,30 @@ impl SettingsSelectorComponent {
                 ]),
                 submenu: None,
             },
-            // Oracle `warnings` item omitted: no `WarningSettings` backing API
-            // on the Rust SettingsManager yet.
+            SettingItem {
+                id: "warnings".to_owned(),
+                label: "Warnings".to_owned(),
+                description: Some("Enable or disable individual warnings".to_owned()),
+                current_value: "configure".to_owned(),
+                values: None,
+                submenu: Some({
+                    let callbacks = Rc::clone(&callbacks);
+                    let current_warnings = Rc::new(RefCell::new(config.warnings.clone()));
+                    Box::new(move |_current_value, mut done| {
+                        let cbs = Rc::clone(&callbacks);
+                        let shared = Rc::clone(&current_warnings);
+                        let change_shared = Rc::clone(&current_warnings);
+                        Box::new(WarningSettingsSubmenu::new(
+                            shared.borrow().clone(),
+                            Box::new(move |warnings| {
+                                *change_shared.borrow_mut() = warnings.clone();
+                                (cbs.on_warnings_change)(warnings);
+                            }),
+                            Box::new(move || done(None)),
+                        ))
+                    })
+                }),
+            },
             SettingItem {
                 id: "thinking".to_owned(),
                 label: "Thinking level".to_owned(),
@@ -1393,6 +1482,7 @@ mod tests {
             on_default_project_trust_change: Box::new(|_| {}),
             on_clear_on_shrink_change: Box::new(|_| {}),
             on_show_terminal_progress_change: Box::new(|_| {}),
+            on_warnings_change: Box::new(|_| {}),
             on_cancel: Box::new(|| {}),
         }
     }
@@ -1432,6 +1522,7 @@ mod tests {
             default_project_trust: "ask".to_owned(),
             clear_on_shrink: false,
             show_terminal_progress: true,
+            warnings: WarningSettings::default(),
         }
     }
 

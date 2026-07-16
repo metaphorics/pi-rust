@@ -574,6 +574,182 @@ async fn double_escape_respects_fork_and_none_settings() {
         "fork action on empty session must show the fork status:\n{screen}"
     );
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn warnings_submenu_persists_anthropic_extra_usage_setting() {
+    let test = make_runtime(TestRuntimeOptions::default()).await;
+    let settings_path = test.tmp.path().join("agent/settings.json");
+    let (terminal, handle) = VtTerminal::new(100, 30);
+    let mut mode = InteractiveMode::new(
+        test.runtime.clone(),
+        terminal,
+        InteractiveModeOptions::default(),
+    );
+    mode.init();
+
+    send(&mut mode, &handle, "/settings");
+    send(&mut mode, &handle, "\r");
+    pump_until(&mut mode, &handle, Duration::from_secs(1), |screen| {
+        screen.contains("Auto-compact")
+    })
+    .await;
+
+    // Search for the Warnings item and enter its submenu.
+    send(&mut mode, &handle, "warnings");
+    pump_until(&mut mode, &handle, Duration::from_secs(1), |screen| {
+        screen.contains("Enable or disable individual warnings")
+    })
+    .await;
+    send(&mut mode, &handle, "\r");
+    pump_until(&mut mode, &handle, Duration::from_secs(1), |screen| {
+        screen.contains("Anthropic extra usage")
+    })
+    .await;
+
+    // Toggle: default true -> false, persisted under warnings.anthropicExtraUsage.
+    send(&mut mode, &handle, "\r");
+    mode.pump();
+    let raw: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings_path).expect("settings written"))
+            .expect("settings json");
+    assert_eq!(
+        raw["warnings"]["anthropicExtraUsage"],
+        serde_json::Value::Bool(false),
+        "toggle must persist nested warnings settings: {raw}"
+    );
+    assert_no_flicker(&handle);
+}
+
+const OAUTH_ANTHROPIC: &str = r#"{
+    "anthropic": {
+        "type": "oauth",
+        "access": "access-token",
+        "refresh": "refresh-token",
+        "expires": 1893456000000
+    }
+}"#;
+
+#[tokio::test(flavor = "current_thread")]
+async fn anthropic_subscription_warning_fires_once_for_oauth_auth() {
+    let test = make_runtime(TestRuntimeOptions {
+        with_auth: true,
+        auth_json: Some(serde_json::from_str(OAUTH_ANTHROPIC).expect("auth json")),
+        ..Default::default()
+    })
+    .await;
+    let (terminal, handle) = VtTerminal::new(120, 40);
+    let mut mode = InteractiveMode::new(
+        test.runtime.clone(),
+        terminal,
+        InteractiveModeOptions::default(),
+    );
+    mode.init();
+    mode.pump();
+    let screen = handle.screen(pi_vt::VtScreen::serialize);
+    assert!(
+        screen.contains("Anthropic subscription auth is active."),
+        "oauth-backed anthropic model must warn on startup:\n{screen}"
+    );
+
+    // Cycling the model re-invokes the check; the warning must not repeat.
+    let session = test.runtime.session();
+    let original_model = session.model().map(|m| m.id);
+    send(&mut mode, &handle, "\x10");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while session.model().map(|m| m.id) == original_model {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "model cycle never completed"
+        );
+        mode.pump();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    mode.pump();
+    let screen = handle.screen(|s| {
+        let mut all = s.scrollback().join("\n");
+        all.push('\n');
+        all.push_str(&s.serialize());
+        all
+    });
+    assert_eq!(
+        screen
+            .matches("Anthropic subscription auth is active.")
+            .count(),
+        1,
+        "warning must fire exactly once:\n{screen}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn anthropic_subscription_warning_respects_setting_and_key_prefix() {
+    // Disabled via warnings.anthropicExtraUsage = false: no warning.
+    let test = make_runtime(TestRuntimeOptions {
+        with_auth: true,
+        auth_json: Some(serde_json::from_str(OAUTH_ANTHROPIC).expect("auth json")),
+        global_settings: Some(serde_json::json!({
+            "warnings": { "anthropicExtraUsage": false }
+        })),
+        ..Default::default()
+    })
+    .await;
+    let (terminal, handle) = VtTerminal::new(120, 40);
+    let mut mode = InteractiveMode::new(
+        test.runtime.clone(),
+        terminal,
+        InteractiveModeOptions::default(),
+    );
+    mode.init();
+    mode.pump();
+    assert!(
+        handle.screen(|s| !s.serialize().contains("Anthropic subscription auth")),
+        "disabled warning setting must suppress the banner"
+    );
+
+    // sk-ant-oat API key resolves through the async registry path and warns.
+    let test = make_runtime(TestRuntimeOptions {
+        auth_json: Some(serde_json::json!({
+            "anthropic": { "type": "api_key", "key": "sk-ant-oat-0123" }
+        })),
+        ..Default::default()
+    })
+    .await;
+    let (terminal, handle) = VtTerminal::new(120, 40);
+    let mut mode = InteractiveMode::new(
+        test.runtime.clone(),
+        terminal,
+        InteractiveModeOptions::default(),
+    );
+    mode.init();
+    pump_until(&mut mode, &handle, Duration::from_secs(2), |screen| {
+        screen.contains("Anthropic subscription auth is active.")
+    })
+    .await;
+
+    // A plain API key must NOT warn.
+    let test = make_runtime(TestRuntimeOptions {
+        auth_json: Some(serde_json::json!({
+            "anthropic": { "type": "api_key", "key": "sk-ant-regular" }
+        })),
+        ..Default::default()
+    })
+    .await;
+    let (terminal, handle) = VtTerminal::new(120, 40);
+    let mut mode = InteractiveMode::new(
+        test.runtime.clone(),
+        terminal,
+        InteractiveModeOptions::default(),
+    );
+    mode.init();
+    for _ in 0..20 {
+        mode.pump();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        handle.screen(|s| !s.serialize().contains("Anthropic subscription auth")),
+        "plain API key must not trigger the subscription warning"
+    );
+}
+
 /// Fg color of the editor's bottom border (last full-width `─` row).
 fn editor_border_fg(handle: &VtHandle) -> pi_vt::Color {
     handle.screen(|screen| {

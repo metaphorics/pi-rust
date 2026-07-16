@@ -989,9 +989,38 @@ impl SettingsManager {
             .to_owned()
     }
 
+    /// Oracle `getWarnings`: a copy of the `warnings` object (or empty).
+    pub fn get_warnings(&self) -> WarningSettings {
+        self.settings
+            .get("warnings")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default()
+    }
+
+    /// Oracle `setWarnings`: replace the global `warnings` object and save.
+    pub fn set_warnings(&mut self, warnings: &WarningSettings) {
+        let value = serde_json::to_value(warnings).unwrap_or_else(|_| Value::Object(Map::new()));
+        self.set_global_value("warnings", value);
+    }
+
     pub fn http_proxy(&self) -> Option<&str> {
         self.settings.get_str("httpProxy")
     }
+}
+
+/// Oracle `WarningSettings` (settings-manager.ts:58-60). Unknown keys are
+/// preserved across get/set round-trips (the oracle spreads plain objects).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct WarningSettings {
+    #[serde(
+        rename = "anthropicExtraUsage",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub anthropic_extra_usage: Option<bool>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 /// Pretty-print a JSON object like `JSON.stringify(obj, null, 2)`.
