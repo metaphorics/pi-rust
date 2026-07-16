@@ -19,7 +19,7 @@ jiff.workspace = true
 uuid = { version = "1", features = ["v4", "v7"] }
 # Home directory for ~/.pi/agent resolution.
 dirs = "6"
-tokio.workspace = true
+tokio = { workspace = true, features = ["io-std"] }
 regex = "1"
 globset = "0.4"
 base64 = "0.22"

@@ -80,4 +80,5 @@ pub use session::services::{
     create_agent_session_services,
 };
 
+pub mod modes;
 pub mod tools;
