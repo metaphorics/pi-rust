@@ -3,8 +3,8 @@ use std::fs;
 use std::path::Path;
 
 use pi_ext_protocol::{
-    Envelope, GetAllThemesResult, GetThemeResult, ResponseResult, TerminalInputResult, decode_frame,
-    encode_frame,
+    Envelope, GetAllThemesResult, GetThemeResult, ResponseResult, TerminalInputResult,
+    ToolExecuteResult, decode_frame, encode_frame,
 };
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -82,6 +82,7 @@ const RESULT_FIXTURES: &[(&str, &[u8])] = &[
     result_fixture!("sidecar-to-rust-ui-terminal-input-result.json"),
     result_fixture!("rust-to-sidecar-ui-theme-catalog-result.json"),
     result_fixture!("rust-to-sidecar-ui-theme-lookup-result.json"),
+    result_fixture!("sidecar-to-rust-tool-execute-result.json"),
 ];
 
 
@@ -157,6 +158,7 @@ fn result_payloads_are_byte_exact_and_typed() {
     assert_typed_ok::<TerminalInputResult>(RESULT_FIXTURES[0].1);
     assert_typed_ok::<GetAllThemesResult>(RESULT_FIXTURES[1].1);
     assert_typed_ok::<GetThemeResult>(RESULT_FIXTURES[2].1);
+    assert_typed_ok::<ToolExecuteResult>(RESULT_FIXTURES[3].1);
 }
 
 #[test]
