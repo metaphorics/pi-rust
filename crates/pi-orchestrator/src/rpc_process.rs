@@ -4,6 +4,7 @@ use std::process::ExitStatus;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
+use parking_lot::Mutex as SyncMutex;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdout, Command};
@@ -40,11 +41,29 @@ impl RpcProcessError {
     }
 }
 
-type PendingResult = Result<RpcResponseEnvelope, RpcProcessError>;
+type PendingResult = Result<(RpcResponseEnvelope, u64), RpcProcessError>;
 
 struct WriterMessage {
     line: String,
     request_id: Option<String>,
+}
+
+/// A request awaiting its response line. `claimed_by` names the output lane
+/// whose position fences the response: when the response line arrives, the
+/// oneshot resolves with that lane's sequence number at that instant, so the
+/// caller can wait until every earlier lane item has been delivered before
+/// publishing the response.
+struct PendingEntry {
+    sender: oneshot::Sender<PendingResult>,
+    claimed_by: Option<u64>,
+}
+
+/// One subscriber's ordered output lane. `seq` counts items pushed onto this
+/// lane; only `stdout_loop` (the single classifier of child lines) advances
+/// it, so lane order is exactly child stdout emission order.
+struct LaneSender {
+    sender: mpsc::UnboundedSender<(u64, Value)>,
+    seq: u64,
 }
 
 struct Inner {
@@ -52,10 +71,13 @@ struct Inner {
     next_request_id: AtomicU64,
     next_subscriber_id: AtomicU64,
     stderr: Mutex<Vec<u8>>,
-    pending: Mutex<HashMap<String, oneshot::Sender<PendingResult>>>,
-    event_subscribers: Mutex<HashMap<u64, mpsc::UnboundedSender<Value>>>,
+    pending: SyncMutex<HashMap<String, PendingEntry>>,
+    subscribers: SyncMutex<HashMap<u64, LaneSender>>,
+    /// The subscriber currently receiving `extension_ui_request` lines
+    /// (last claim wins; `None` drops them), mirroring the oracle's single
+    /// `setUiRequestHandler` slot.
+    ui_owner: SyncMutex<Option<u64>>,
     exit_subscribers: Mutex<HashMap<u64, mpsc::UnboundedSender<RpcProcessError>>>,
-    ui_handler: Mutex<Option<mpsc::UnboundedSender<Value>>>,
     writer: StdMutex<Option<mpsc::UnboundedSender<WriterMessage>>>,
     terminate: mpsc::UnboundedSender<()>,
     exit_notify: Notify,
@@ -106,10 +128,10 @@ impl RpcProcessInstance {
             next_request_id: AtomicU64::new(0),
             next_subscriber_id: AtomicU64::new(0),
             stderr: Mutex::new(Vec::new()),
-            pending: Mutex::new(HashMap::new()),
-            event_subscribers: Mutex::new(HashMap::new()),
+            pending: SyncMutex::new(HashMap::new()),
+            subscribers: SyncMutex::new(HashMap::new()),
+            ui_owner: SyncMutex::new(None),
             exit_subscribers: Mutex::new(HashMap::new()),
-            ui_handler: Mutex::new(None),
             writer: StdMutex::new(Some(writer_tx)),
             terminate: terminate_tx,
             exit_notify: Notify::new(),
@@ -138,6 +160,30 @@ impl RpcProcessInstance {
         &self,
         command: RpcCommandEnvelope,
     ) -> Result<RpcResponseEnvelope, RpcProcessError> {
+        self.send_inner(command, None)
+            .await
+            .map(|(response, _)| response)
+    }
+
+    /// Send a command whose response is fenced against `subscriber`'s output
+    /// lane. Returns the response plus the lane barrier: the lane sequence
+    /// number of the last item the child emitted before this response. The
+    /// caller must not publish the response until it has delivered every lane
+    /// item up to that barrier, which preserves the child's total stdout
+    /// order.
+    pub async fn send_claimed(
+        &self,
+        command: RpcCommandEnvelope,
+        subscriber: u64,
+    ) -> Result<(RpcResponseEnvelope, u64), RpcProcessError> {
+        self.send_inner(command, Some(subscriber)).await
+    }
+
+    async fn send_inner(
+        &self,
+        command: RpcCommandEnvelope,
+        claimed_by: Option<u64>,
+    ) -> Result<(RpcResponseEnvelope, u64), RpcProcessError> {
         if self.inner.exited.load(Ordering::Acquire) {
             return Err(self.not_running_error().await);
         }
@@ -149,12 +195,16 @@ impl RpcProcessInstance {
         let line =
             encode_line(&command).map_err(|error| RpcProcessError::new(error.to_string()))?;
         let (sender, receiver) = oneshot::channel();
-        self.inner.pending.lock().await.insert(id.clone(), sender);
+        self.inner
+            .pending
+            .lock()
+            .insert(id.clone(), PendingEntry { sender, claimed_by });
 
         if self.inner.exited.load(Ordering::Acquire) {
-            if let Some(sender) = self.inner.pending.lock().await.remove(&id) {
+            let entry = self.inner.pending.lock().remove(&id);
+            if let Some(entry) = entry {
                 let error = self.not_running_error().await;
-                let _ = sender.send(Err(error));
+                let _ = entry.sender.send(Err(error));
             }
         } else {
             let sent = self
@@ -172,7 +222,7 @@ impl RpcProcessInstance {
                         .is_ok()
                 });
             if !sent {
-                reject_pending(&self.inner, &id, RpcProcessError::new("broken pipe")).await;
+                reject_pending(&self.inner, &id, RpcProcessError::new("broken pipe"));
             }
         }
 
@@ -205,18 +255,35 @@ impl RpcProcessInstance {
         Ok(())
     }
 
-    pub async fn set_ui_request_handler(&self, handler: Option<mpsc::UnboundedSender<Value>>) {
-        *self.inner.ui_handler.lock().await = handler;
-    }
-
-    pub async fn subscribe_events(&self) -> mpsc::UnboundedReceiver<Value> {
+    pub fn subscribe_output(&self) -> (u64, mpsc::UnboundedReceiver<(u64, Value)>) {
         let (sender, receiver) = mpsc::unbounded_channel();
         let id = self
             .inner
             .next_subscriber_id
             .fetch_add(1, Ordering::Relaxed);
-        self.inner.event_subscribers.lock().await.insert(id, sender);
-        receiver
+        self.inner
+            .subscribers
+            .lock()
+            .insert(id, LaneSender { sender, seq: 0 });
+        (id, receiver)
+    }
+
+    pub fn unsubscribe_output(&self, subscriber: u64) {
+        self.inner.subscribers.lock().remove(&subscriber);
+    }
+
+    /// Route subsequent `extension_ui_request` lines to `subscriber`'s
+    /// output lane (last claim wins).
+    pub fn claim_ui(&self, subscriber: u64) {
+        *self.inner.ui_owner.lock() = Some(subscriber);
+    }
+
+    /// Release the UI slot if `subscriber` still owns it.
+    pub fn release_ui(&self, subscriber: u64) {
+        let mut owner = self.inner.ui_owner.lock();
+        if *owner == Some(subscriber) {
+            *owner = None;
+        }
     }
 
     pub async fn subscribe_exit(&self) -> mpsc::UnboundedReceiver<RpcProcessError> {
@@ -238,8 +305,8 @@ impl RpcProcessInstance {
     }
 
     pub async fn dispose(&self) {
-        *self.inner.ui_handler.lock().await = None;
-        reject_all_pending(&self.inner, RpcProcessError::new("RPC process disposed")).await;
+        *self.inner.ui_owner.lock() = None;
+        reject_all_pending(&self.inner, RpcProcessError::new("RPC process disposed"));
         if self.inner.exited.load(Ordering::Acquire) {
             return;
         }
@@ -298,9 +365,9 @@ async fn finish_writer(error: std::io::Error, request_id: Option<&str>, inner: &
     inner.writer.lock().expect("writer lock poisoned").take();
     let error = RpcProcessError::new(error.to_string());
     if let Some(id) = request_id {
-        reject_pending(inner, id, error.clone()).await;
+        reject_pending(inner, id, error.clone());
     }
-    reject_all_pending(inner, error.clone()).await;
+    reject_all_pending(inner, error.clone());
 
     let mut subscribers = inner.exit_subscribers.lock().await;
     for subscriber in subscribers.values() {
@@ -311,6 +378,12 @@ async fn finish_writer(error: std::io::Error, request_id: Option<&str>, inner: &
     let _ = inner.terminate.send(());
 }
 
+/// The single classifier of child stdout lines. Dispatch order per line is
+/// the ordering contract: events and UI requests are pushed onto subscriber
+/// lanes (advancing each lane's sequence number) strictly in stdout order,
+/// and a response resolves its pending oneshot carrying the claiming lane's
+/// current sequence number as a barrier. No two of the `pending`,
+/// `subscribers`, and `ui_owner` locks are ever held at once.
 async fn stdout_loop(stdout: ChildStdout, inner: Arc<Inner>) {
     let mut lines = BufReader::new(stdout).lines();
     while let Ok(Some(line)) = lines.next_line().await {
@@ -326,22 +399,38 @@ async fn stdout_loop(stdout: ChildStdout, inner: Arc<Inner>) {
                 let Some(id) = response.id.clone() else {
                     continue;
                 };
-                if let Some(pending) = inner.pending.lock().await.remove(&id) {
-                    let _ = pending.send(Ok(response));
+                let entry = inner.pending.lock().remove(&id);
+                if let Some(entry) = entry {
+                    let barrier = entry
+                        .claimed_by
+                        .and_then(|subscriber| {
+                            inner
+                                .subscribers
+                                .lock()
+                                .get(&subscriber)
+                                .map(|lane| lane.seq)
+                        })
+                        .unwrap_or(0);
+                    let _ = entry.sender.send(Ok((response, barrier)));
                 }
             }
             ChildLine::UiRequest(request) => {
-                let handler = inner.ui_handler.lock().await.clone();
-                if let Some(handler) = handler {
-                    let _ = handler.send(request);
+                let owner = *inner.ui_owner.lock();
+                if let Some(owner) = owner {
+                    let mut subscribers = inner.subscribers.lock();
+                    if let Some(lane) = subscribers.get_mut(&owner) {
+                        lane.seq += 1;
+                        if lane.sender.send((lane.seq, request)).is_err() {
+                            subscribers.remove(&owner);
+                        }
+                    }
                 }
             }
             ChildLine::Event(event) => {
-                inner
-                    .event_subscribers
-                    .lock()
-                    .await
-                    .retain(|_, subscriber| subscriber.send(event.clone()).is_ok());
+                inner.subscribers.lock().retain(|_, lane| {
+                    lane.seq += 1;
+                    lane.sender.send((lane.seq, event.clone())).is_ok()
+                });
             }
         }
     }
@@ -380,7 +469,7 @@ async fn finish_child(
         }
         Err(error) => RpcProcessError::new(format!("RPC process error: {error}. Stderr: {stderr}")),
     };
-    reject_all_pending(inner, error.clone()).await;
+    reject_all_pending(inner, error.clone());
     let _ = writer_task.await;
     let mut subscribers = inner.exit_subscribers.lock().await;
     for subscriber in subscribers.values() {
@@ -390,16 +479,17 @@ async fn finish_child(
     inner.exit_notify.notify_waiters();
 }
 
-async fn reject_pending(inner: &Arc<Inner>, id: &str, error: RpcProcessError) {
-    if let Some(pending) = inner.pending.lock().await.remove(id) {
-        let _ = pending.send(Err(error));
+fn reject_pending(inner: &Arc<Inner>, id: &str, error: RpcProcessError) {
+    let entry = inner.pending.lock().remove(id);
+    if let Some(entry) = entry {
+        let _ = entry.sender.send(Err(error));
     }
 }
 
-async fn reject_all_pending(inner: &Arc<Inner>, error: RpcProcessError) {
-    let pending = std::mem::take(&mut *inner.pending.lock().await);
-    for (_, sender) in pending {
-        let _ = sender.send(Err(error.clone()));
+fn reject_all_pending(inner: &Arc<Inner>, error: RpcProcessError) {
+    let pending = std::mem::take(&mut *inner.pending.lock());
+    for (_, entry) in pending {
+        let _ = entry.sender.send(Err(error.clone()));
     }
 }
 
@@ -584,21 +674,23 @@ mod tests {
             next_request_id: AtomicU64::new(0),
             next_subscriber_id: AtomicU64::new(0),
             stderr: Mutex::new(Vec::new()),
-            pending: Mutex::new(HashMap::new()),
-            event_subscribers: Mutex::new(HashMap::new()),
+            pending: SyncMutex::new(HashMap::new()),
+            subscribers: SyncMutex::new(HashMap::new()),
+            ui_owner: SyncMutex::new(None),
             exit_subscribers: Mutex::new(HashMap::new()),
-            ui_handler: Mutex::new(None),
             writer: StdMutex::new(Some(writer_tx.clone())),
             terminate,
             exit_notify: Notify::new(),
         });
         let weak_inner = Arc::downgrade(&inner);
         let (result_tx, result_rx) = oneshot::channel();
-        inner
-            .pending
-            .lock()
-            .await
-            .insert("request".into(), result_tx);
+        inner.pending.lock().insert(
+            "request".into(),
+            PendingEntry {
+                sender: result_tx,
+                claimed_by: None,
+            },
+        );
 
         let writer_task = tokio::spawn(writer_loop(
             FailingWriter(failure_point),

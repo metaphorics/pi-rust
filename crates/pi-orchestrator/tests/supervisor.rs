@@ -415,22 +415,25 @@ async fn rpc_streams_fan_out_events_and_the_last_ui_handler_wins() {
     assert!(supervisor.open_rpc_stream("missing").is_none());
     let mut stream_a = supervisor.open_rpc_stream(&record.id).unwrap();
     let mut stream_b = supervisor.open_rpc_stream(&record.id).unwrap();
+    let mut lane_a = stream_a.take_output();
+    let mut lane_b = stream_b.take_output();
 
     // Events fan out to every open stream.
     stream_b
         .handle_rpc(command(json!({ "type": "emit", "value": 42 })))
         .await
         .unwrap();
-    assert_eq!(stream_a.events.recv().await.unwrap()["value"], 42);
-    assert_eq!(stream_b.events.recv().await.unwrap()["value"], 42);
+    assert_eq!(lane_a.recv().await.unwrap().1["value"], 42);
+    assert_eq!(lane_b.recv().await.unwrap().1["value"], 42);
 
-    // UI requests reach only the most recently opened stream.
+    // UI requests reach only the most recently opened stream, in child
+    // emission order on its lane (the request precedes later events).
     stream_a
         .handle_rpc(command(json!({ "type": "ui" })))
         .await
         .unwrap();
-    assert_eq!(stream_b.ui_requests.recv().await.unwrap()["id"], "ui-1");
-    assert!(stream_a.ui_requests.try_recv().is_err());
+    assert_eq!(lane_b.recv().await.unwrap().1["id"], "ui-1");
+    assert!(lane_a.try_recv().is_err());
 
     // UI responses flow back through the child and out as events.
     stream_b
@@ -440,8 +443,8 @@ async fn rpc_streams_fan_out_events_and_the_last_ui_handler_wins() {
             "value": "picked"
         }))
         .unwrap();
-    assert_eq!(stream_a.events.recv().await.unwrap()["value"], "picked");
-    assert_eq!(stream_b.events.recv().await.unwrap()["value"], "picked");
+    assert_eq!(lane_a.recv().await.unwrap().1["value"], "picked");
+    assert_eq!(lane_b.recv().await.unwrap().1["value"], "picked");
 
     // Closing a non-owner leaves the UI slot with its owner.
     stream_a.close();
@@ -449,16 +452,17 @@ async fn rpc_streams_fan_out_events_and_the_last_ui_handler_wins() {
         .handle_rpc(command(json!({ "type": "ui" })))
         .await
         .unwrap();
-    assert_eq!(stream_b.ui_requests.recv().await.unwrap()["id"], "ui-1");
+    assert_eq!(lane_b.recv().await.unwrap().1["id"], "ui-1");
 
     // Closing the owner releases the slot; the next stream claims it.
     stream_b.close();
     let mut stream_c = supervisor.open_rpc_stream(&record.id).unwrap();
+    let mut lane_c = stream_c.take_output();
     stream_c
         .handle_rpc(command(json!({ "type": "ui" })))
         .await
         .unwrap();
-    assert_eq!(stream_c.ui_requests.recv().await.unwrap()["id"], "ui-1");
+    assert_eq!(lane_c.recv().await.unwrap().1["id"], "ui-1");
 
     // Stream commands hit the same metadata-refresh path.
     stream_c

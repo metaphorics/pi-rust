@@ -7,7 +7,6 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
@@ -44,26 +43,16 @@ pub struct SpawnOptions {
     pub command_override: Option<(PathBuf, Vec<String>)>,
 }
 
-struct UiSlot {
-    token: u64,
-    sender: mpsc::UnboundedSender<Value>,
-}
-
 #[derive(Default)]
 struct Resources {
     rpc_process: Option<RpcProcessInstance>,
     radius_pi_id: Option<String>,
-    event_task: Option<JoinHandle<()>>,
     exit_task: Option<JoinHandle<()>>,
-    ui_task: Option<JoinHandle<()>>,
 }
 
 struct LiveInstance {
     record: Mutex<InstanceRecord>,
     resources: Mutex<Resources>,
-    subscribers: Mutex<HashMap<u64, mpsc::UnboundedSender<Value>>>,
-    ui_handler: Mutex<Option<UiSlot>>,
-    next_stream_id: AtomicU64,
 }
 
 impl LiveInstance {
@@ -71,35 +60,19 @@ impl LiveInstance {
         Self {
             record: Mutex::new(record),
             resources: Mutex::new(Resources::default()),
-            subscribers: Mutex::new(HashMap::new()),
-            ui_handler: Mutex::new(None),
-            next_stream_id: AtomicU64::new(0),
         }
     }
 
-    /// Abort forwarding tasks and detach the UI handler (clearBindings).
+    /// Abort the exit-forwarding task (clearBindings).
     ///
     /// The unexpected-exit path passes `abort_exit: false`: it runs inside
     /// the exit task itself, and aborting that handle would cancel the
     /// cleanup mid-flight. The handle is still taken so it is never aborted
     /// later by another path.
-    async fn clear_bindings(&self, abort_exit: bool) {
-        let (event_task, exit_task, ui_task, process) = {
-            let mut resources = self.resources.lock();
-            (
-                resources.event_task.take(),
-                resources.exit_task.take(),
-                resources.ui_task.take(),
-                resources.rpc_process.clone(),
-            )
-        };
-        let exit_task = if abort_exit { exit_task } else { None };
-        for task in [event_task, exit_task, ui_task].into_iter().flatten() {
+    fn clear_bindings(&self, abort_exit: bool) {
+        let exit_task = self.resources.lock().exit_task.take();
+        if abort_exit && let Some(task) = exit_task {
             task.abort();
-        }
-        self.ui_handler.lock().take();
-        if let Some(process) = process {
-            process.set_ui_request_handler(None).await;
         }
     }
 }
@@ -234,32 +207,25 @@ impl Supervisor {
         Ok(Some(response))
     }
 
-    /// Subscribe to an instance's event stream and claim its UI-request slot.
+    /// Subscribe to an instance's ordered output lane and claim its
+    /// UI-request slot.
     ///
     /// Events fan out to every open stream; UI requests go to the most
-    /// recently opened stream only (last handler wins).
+    /// recently opened stream only (last claim wins). Each stream's lane
+    /// preserves the child's stdout emission order.
     pub fn open_rpc_stream(&self, instance_id: &str) -> Option<RpcStream> {
         let live = self.inner.live.lock().get(instance_id).cloned()?;
         let process = live.resources.lock().rpc_process.clone()?;
 
-        let (event_sender, events) = mpsc::unbounded_channel();
-        let (ui_sender, ui_requests) = mpsc::unbounded_channel();
-        let subscriber_id = live.next_stream_id.fetch_add(1, Ordering::Relaxed);
-        let ui_token = live.next_stream_id.fetch_add(1, Ordering::Relaxed);
-        live.subscribers.lock().insert(subscriber_id, event_sender);
-        *live.ui_handler.lock() = Some(UiSlot {
-            token: ui_token,
-            sender: ui_sender,
-        });
+        let (subscriber_id, output) = process.subscribe_output();
+        process.claim_ui(subscriber_id);
 
         Some(RpcStream {
             inner: Arc::clone(&self.inner),
             live,
             process,
             subscriber_id,
-            ui_token,
-            events,
-            ui_requests,
+            output: Some(output),
         })
     }
 
@@ -383,36 +349,9 @@ impl Inner {
         live: &Arc<LiveInstance>,
         process: RpcProcessInstance,
     ) {
-        live.clear_bindings(true).await;
+        live.clear_bindings(true);
 
-        let mut event_receiver = process.subscribe_events().await;
         let mut exit_receiver = process.subscribe_exit().await;
-        let (ui_sender, mut ui_receiver) = mpsc::unbounded_channel();
-        process.set_ui_request_handler(Some(ui_sender)).await;
-
-        let event_live = Arc::clone(live);
-        let event_task = tokio::spawn(async move {
-            while let Some(event) = event_receiver.recv().await {
-                event_live
-                    .subscribers
-                    .lock()
-                    .retain(|_, subscriber| subscriber.send(event.clone()).is_ok());
-            }
-        });
-
-        let ui_live = Arc::clone(live);
-        let ui_task = tokio::spawn(async move {
-            while let Some(request) = ui_receiver.recv().await {
-                let handler = ui_live
-                    .ui_handler
-                    .lock()
-                    .as_ref()
-                    .map(|slot| slot.sender.clone());
-                if let Some(handler) = handler {
-                    let _ = handler.send(request);
-                }
-            }
-        });
 
         let exit_inner = Arc::downgrade(self);
         let exit_live = Arc::clone(live);
@@ -426,9 +365,7 @@ impl Inner {
 
         let mut resources = live.resources.lock();
         resources.rpc_process = Some(process);
-        resources.event_task = Some(event_task);
         resources.exit_task = Some(exit_task);
-        resources.ui_task = Some(ui_task);
     }
 
     async fn handle_unexpected_exit(self: &Arc<Self>, live: &Arc<LiveInstance>) {
@@ -462,7 +399,7 @@ impl Inner {
             }
         }
 
-        live.clear_bindings(false).await;
+        live.clear_bindings(false);
         live.resources.lock().rpc_process = None;
         let has_radius = live.resources.lock().radius_pi_id.is_some();
         if has_radius {
@@ -507,7 +444,7 @@ impl Inner {
     /// oracle.
     async fn cleanup_acquired_resources(self: &Arc<Self>, live: &Arc<LiveInstance>) -> Result<()> {
         let process = live.resources.lock().rpc_process.clone();
-        live.clear_bindings(true).await;
+        live.clear_bindings(true);
         let has_radius = live.resources.lock().radius_pi_id.is_some();
         let mut disconnect_error = None;
         if has_radius {
@@ -610,47 +547,62 @@ impl PresenceCoordinator for Inner {
     }
 }
 
-/// One open `rpc_stream` connection: an event subscription plus (until a
-/// newer stream claims it) ownership of the instance's UI-request slot.
+/// A stream command's response plus the position it must not overtake:
+/// `lane_barrier` is the stream's output-lane sequence number at the moment
+/// the child emitted the response line. The caller must deliver every lane
+/// item up to the barrier before publishing the response, preserving the
+/// child's total stdout order.
+pub struct StreamRpcResponse {
+    pub response: RpcResponseEnvelope,
+    pub lane_barrier: u64,
+}
+
+/// One open `rpc_stream` connection: an ordered output-lane subscription plus
+/// (until a newer stream claims it) ownership of the instance's UI-request
+/// slot.
 pub struct RpcStream {
     inner: Arc<Inner>,
     live: Arc<LiveInstance>,
     process: RpcProcessInstance,
     subscriber_id: u64,
-    ui_token: u64,
-    pub events: mpsc::UnboundedReceiver<Value>,
-    pub ui_requests: mpsc::UnboundedReceiver<Value>,
+    output: Option<mpsc::UnboundedReceiver<(u64, Value)>>,
 }
 
 impl RpcStream {
+    /// Take the stream's ordered output lane: events and UI requests in
+    /// exact child stdout emission order, each stamped with the lane
+    /// sequence number that [`StreamRpcResponse::lane_barrier`] fences
+    /// against. Panics if called twice.
+    pub fn take_output(&mut self) -> mpsc::UnboundedReceiver<(u64, Value)> {
+        self.output.take().expect("stream output already taken")
+    }
+
     /// Forward a command; after any session-metadata command the persisted
     /// record is refreshed before the response is returned.
-    pub async fn handle_rpc(&self, command: RpcCommandEnvelope) -> Result<RpcResponseEnvelope> {
+    pub async fn handle_rpc(&self, command: RpcCommandEnvelope) -> Result<StreamRpcResponse> {
         let refresh = command.refreshes_session_metadata();
-        let response = self.process.send(command).await?;
+        let (response, lane_barrier) = self
+            .process
+            .send_claimed(command, self.subscriber_id)
+            .await?;
         if refresh {
             self.inner.sync_instance_record(&self.live).await?;
         }
-        Ok(response)
+        Ok(StreamRpcResponse {
+            response,
+            lane_barrier,
+        })
     }
 
     pub fn handle_ui_response<T: Serialize>(&self, response: &T) -> Result<(), RpcProcessError> {
         self.process.handle_ui_response(response)
     }
 
-    /// Drop the event subscription; release the UI slot only if this stream
-    /// still owns it.
+    /// Drop the output-lane subscription; release the UI slot only if this
+    /// stream still owns it.
     pub fn close(&self) {
-        {
-            let mut slot = self.live.ui_handler.lock();
-            if slot
-                .as_ref()
-                .is_some_and(|slot| slot.token == self.ui_token)
-            {
-                *slot = None;
-            }
-        }
-        self.live.subscribers.lock().remove(&self.subscriber_id);
+        self.process.release_ui(self.subscriber_id);
+        self.process.unsubscribe_output(self.subscriber_id);
     }
 }
 
