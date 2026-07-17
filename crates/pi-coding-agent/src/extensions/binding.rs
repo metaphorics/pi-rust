@@ -48,6 +48,7 @@ use super::events::{
     StateSource, agent_thinking_level, session_state_block, state_block_all_tools,
     wire_thinking_level,
 };
+use super::provider::ExtensionProviders;
 use super::tools::{ExtensionToolContext, ToolUpdateRouter, extension_tool_definitions};
 use super::{
     ClientConfig, ExtensionHost, ExtensionHostConfig, ExtensionPathError, HostError,
@@ -93,6 +94,12 @@ pub struct BindOptions {
     /// during bind (session_shutdown + blocking before_switch/before_fork
     /// reach the sidecar instead of the initial `NoopExtensionBridge`).
     pub runtime: Option<Arc<AgentSessionRuntime>>,
+    /// Extension provider directory (C7). Pass the instance whose
+    /// [`extension_stream_fn`](super::provider::extension_stream_fn)
+    /// wrapper went into the session's stream fn; `None` creates a fresh
+    /// one (registry mutation still works; sidecar streaming needs the
+    /// shared instance).
+    pub providers: Option<Arc<ExtensionProviders>>,
 }
 
 impl BindOptions {
@@ -123,6 +130,7 @@ impl BindOptions {
             fallback: None,
             hook_timeout: DEFAULT_HOOK_TIMEOUT,
             runtime: None,
+            providers: None,
         }
     }
 }
@@ -141,6 +149,8 @@ pub struct ExtensionBinding {
     /// Shared execute-context (host handle + `tool/update` router) captured
     /// by every bridged tool definition (C7).
     tool_context: Arc<ExtensionToolContext>,
+    /// Extension provider directory (registry mutation + sidecar streams).
+    providers: Arc<ExtensionProviders>,
 }
 
 impl Drop for ExtensionBinding {
@@ -259,20 +269,32 @@ pub fn bind_extensions(
         },
     });
 
+    let providers = options.providers.unwrap_or_default();
+    providers.attach_host(&host);
+    providers.attach_registry(session.model_registry());
+
     // Compose the notification fallback: `tool/update` routes to the
-    // in-flight tool call; everything else keeps the caller's sink (C8).
+    // in-flight tool call, `provider/event` to its stream; everything else
+    // keeps the caller's sink (C8).
     let fallback: Option<NotificationSink> = {
         let caller = options.fallback;
         let tool_router = tool_router.clone();
-        Some(Arc::new(move |notification: Notification| {
-            if let Notification::ToolUpdate(params) = notification {
-                tool_router.dispatch(&params.tool_call_id, params.partial);
-                return;
-            }
-            if let Some(caller) = &caller {
-                caller(notification);
-            }
-        }))
+        let providers = providers.clone();
+        Some(Arc::new(
+            move |notification: Notification| match notification {
+                Notification::ToolUpdate(params) => {
+                    tool_router.dispatch(&params.tool_call_id, params.partial);
+                }
+                Notification::ProviderEvent(params) => {
+                    providers.dispatch_event(&params.stream_id, params.event);
+                }
+                other => {
+                    if let Some(caller) = &caller {
+                        caller(other);
+                    }
+                }
+            },
+        ))
     };
 
     let config = Arc::new(ActionServerConfig {
@@ -292,6 +314,7 @@ pub fn bind_extensions(
         server_task,
         unsubscribe: parking_lot::Mutex::new(None),
         tool_context,
+        providers,
     });
     // Registration snapshots (initial load, reload, respawn replay,
     // `refreshTools` payloads) rebuild the bound session's extension tool
@@ -304,6 +327,19 @@ pub fn bind_extensions(
             .set_registrations_listener(Arc::new(move |registrations| {
                 if let Some(binding) = weak.upgrade() {
                     binding.apply_registration_tools(registrations);
+                    // Provider snapshot needs the async registry lock;
+                    // reconciliation runs off-listener (registered providers
+                    // become visible to the host catalog shortly after —
+                    // pi's own registration effects are also async wrt the
+                    // load promise).
+                    let providers = registrations.providers.clone();
+                    let generation = binding.providers().allocate_snapshot_generation();
+                    let binding = binding.clone();
+                    tokio::spawn(async move {
+                        binding
+                            .apply_provider_snapshot(generation, &providers)
+                            .await;
+                    });
                 }
             }));
     }
@@ -375,6 +411,7 @@ impl ExtensionBinding {
     pub async fn rebind(self: &Arc<Self>, session: AgentSession) {
         self.forwarder.rebind_session(session.clone()).await;
         self.attach_session(&session);
+        self.providers.attach_registry(session.model_registry());
         self.apply_registration_tools(&self.forwarder.registrations());
     }
 
@@ -383,6 +420,46 @@ impl ExtensionBinding {
     pub fn apply_registration_tools(&self, registrations: &Registrations) {
         let tools = extension_tool_definitions(&registrations.tools, &self.tool_context);
         self.shared.session().refresh_extension_tools(tools);
+    }
+
+    /// Extension provider directory (sidecar streaming lookups).
+    pub fn providers(&self) -> &Arc<ExtensionProviders> {
+        &self.providers
+    }
+
+    /// Reconcile a provider registration snapshot into the session's model
+    /// registry (register listed, drop vanished).
+    pub async fn apply_provider_snapshot(
+        &self,
+        generation: u64,
+        providers: &[pi_ext_protocol::ProviderRegistration],
+    ) {
+        let registry = self.shared.session().model_registry();
+        self.providers
+            .apply_snapshot(
+                generation,
+                &registry,
+                providers,
+                self.forwarder.error_sink(),
+            )
+            .await;
+    }
+
+    /// Apply one runtime `provider/register` notification.
+    pub async fn apply_provider_register(
+        &self,
+        registration: &pi_ext_protocol::ProviderRegistration,
+    ) {
+        let registry = self.shared.session().model_registry();
+        self.providers
+            .register(&registry, registration, self.forwarder.error_sink())
+            .await;
+    }
+
+    /// Apply one runtime `provider/unregister` notification.
+    pub async fn apply_provider_unregister(&self, name: &str) {
+        let registry = self.shared.session().model_registry();
+        self.providers.unregister(&registry, name).await;
     }
 
     /// Subscribe the session's event stream + compaction hooks.
@@ -398,6 +475,81 @@ impl ExtensionBinding {
         session.bind_compact_hooks(Some(Arc::new(ForwarderCompactHooks {
             forwarder: self.forwarder.clone(),
         })));
+        session.bind_command_hooks(Some(Arc::new(BindingCommandHooks {
+            binding: Arc::downgrade(self),
+        })));
+    }
+
+    /// Registered extension CLI flags in the shape the CLI help consumes
+    /// (provenance = registering extension path).
+    pub fn registered_flags(&self) -> Vec<crate::cli::args::ExtensionFlag> {
+        self.registrations()
+            .flags
+            .into_iter()
+            .map(|flag| crate::cli::args::ExtensionFlag {
+                name: flag.name,
+                r#type: match flag.kind {
+                    pi_ext_protocol::FlagKind::Boolean => "boolean".to_string(),
+                    pi_ext_protocol::FlagKind::String => "string".to_string(),
+                },
+                description: flag.description,
+                extension_path: flag.extension_path,
+            })
+            .collect()
+    }
+
+    /// Execute an extension slash command in the sidecar (oracle
+    /// `command.handler(args, createCommandContext())`). A fresh state
+    /// patch precedes the request so command-context sync getters resolve
+    /// at call time.
+    pub async fn execute_command(&self, name: &str, args: &str) -> Result<(), String> {
+        let Some(connection) = self.host.current_connection().await else {
+            return Err("extension sidecar is not running".to_string());
+        };
+        let patch = (self.tool_context.fresh_state)();
+        if connection
+            .notify(pi_ext_protocol::Notification::StateUpdate(Box::new(patch)))
+            .await
+            .is_err()
+        {
+            return Err("extension sidecar is not running".to_string());
+        }
+        connection
+            .request(pi_ext_protocol::Request::CommandExecute(
+                pi_ext_protocol::CommandExecuteParams {
+                    name: name.to_string(),
+                    args: args.to_string(),
+                },
+            ))
+            .await
+            .map(|_| ())
+            .map_err(|error| match error {
+                super::ClientError::Remote(remote) => remote.message,
+                other => other.to_string(),
+            })
+    }
+
+    /// Invoke an extension keyboard shortcut in the sidecar.
+    pub async fn invoke_shortcut(&self, key_id: &str) -> Result<(), String> {
+        let Some(connection) = self.host.current_connection().await else {
+            return Err("extension sidecar is not running".to_string());
+        };
+        let patch = (self.tool_context.fresh_state)();
+        let _ = connection
+            .notify(pi_ext_protocol::Notification::StateUpdate(Box::new(patch)))
+            .await;
+        connection
+            .request(pi_ext_protocol::Request::ShortcutInvoke(
+                pi_ext_protocol::ShortcutInvokeParams {
+                    key_id: key_id.to_string(),
+                },
+            ))
+            .await
+            .map(|_| ())
+            .map_err(|error| match error {
+                super::ClientError::Remote(remote) => remote.message,
+                other => other.to_string(),
+            })
     }
 
     /// Graceful teardown: flush the queue, then bounded sidecar shutdown.
@@ -421,6 +573,43 @@ pub(super) fn wire_source_info(info: pi_ext_protocol::SourceInfo) -> SourceInfo 
             pi_ext_protocol::SourceOrigin::TopLevel => SourceOrigin::TopLevel,
         },
         base_dir: info.base_dir,
+    }
+}
+
+/// [`ExtensionCommandHooks`] routed to the sidecar (`command/execute`).
+/// Weak: the session owns these hooks; a strong binding handle would cycle
+/// through session → hooks → binding → shared session.
+struct BindingCommandHooks {
+    binding: Weak<ExtensionBinding>,
+}
+
+impl crate::extension_bridge::ExtensionCommandHooks for BindingCommandHooks {
+    fn has_command(&self, name: &str) -> bool {
+        self.binding.upgrade().is_some_and(|binding| {
+            binding
+                .registrations()
+                .commands
+                .iter()
+                .any(|command| command.name == name)
+        })
+    }
+
+    fn execute(&self, name: String, args: String) -> BoxFuture<'static, ()> {
+        let Some(binding) = self.binding.upgrade() else {
+            return ready(());
+        };
+        Box::pin(async move {
+            if let Err(error) = binding.execute_command(&name, &args).await {
+                // Oracle parity: handler failures surface as extension
+                // errors (`command:<name>`), never to the prompt caller.
+                (binding.forwarder().error_sink())(pi_ext_protocol::ExtensionError {
+                    extension_path: format!("command:{name}"),
+                    event: "command".to_string(),
+                    error,
+                    stack: None,
+                });
+            }
+        })
     }
 }
 
@@ -709,6 +898,29 @@ impl HostActions for SessionHostActions {
             binding.forwarder().update_registrations(registrations);
         }
         ready(())
+    }
+
+    /// Runtime `pi.registerProvider` — model catalog mutation (F9), ordered
+    /// on the serve loop.
+    fn provider_register(
+        &self,
+        registration: pi_ext_protocol::ProviderRegistration,
+    ) -> BoxFuture<'static, ()> {
+        let Some(binding) = self.binding() else {
+            return ready(());
+        };
+        Box::pin(async move {
+            binding.apply_provider_register(&registration).await;
+        })
+    }
+
+    fn provider_unregister(&self, name: String) -> BoxFuture<'static, ()> {
+        let Some(binding) = self.binding() else {
+            return ready(());
+        };
+        Box::pin(async move {
+            binding.apply_provider_unregister(&name).await;
+        })
     }
 
     fn set_thinking_level(&self, params: SetThinkingLevelParams) -> BoxFuture<'static, ()> {

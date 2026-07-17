@@ -369,6 +369,9 @@ struct SessionInner {
     /// Phase 6 blocking compaction hooks (sidecar `session_before_compact` /
     /// `session_compact`); `None` = zero extensions, zero overhead.
     compact_hooks: Mutex<Option<Arc<dyn crate::extension_bridge::CompactHooks>>>,
+    /// Phase 6 extension slash-command hooks (`_tryExecuteExtensionCommand`
+    /// dispatch, agent-session.ts:1228); `None` = zero extensions.
+    command_hooks: Mutex<Option<Arc<dyn crate::extension_bridge::ExtensionCommandHooks>>>,
 }
 
 impl SessionInner {
@@ -609,6 +612,7 @@ impl AgentSession {
                 active_tx,
                 active_rx,
                 compact_hooks: Mutex::new(None),
+                command_hooks: Mutex::new(None),
             }),
         }
     }
@@ -636,10 +640,19 @@ impl AgentSession {
         *self.inner.compact_hooks.lock() = hooks;
     }
 
+    /// Bind (or clear) the Phase 6 extension slash-command hooks. Bound by
+    /// the extension binding; `prompt()` dispatches `/name args` to them
+    /// before anything else (oracle agent-session.ts:1084-1092).
+    pub fn bind_command_hooks(
+        &self,
+        hooks: Option<Arc<dyn crate::extension_bridge::ExtensionCommandHooks>>,
+    ) {
+        *self.inner.command_hooks.lock() = hooks;
+    }
+
     // =====================================================================
     // Read-only state access
     // =====================================================================
-
     pub fn cwd(&self) -> &PathBuf {
         &self.inner.cwd
     }
@@ -848,6 +861,25 @@ impl AgentSession {
         options: PromptOptions,
     ) -> Result<Option<(Vec<AgentMessage>, RunGuard)>, String> {
         let expand = options.expand_prompt_templates.unwrap_or(true);
+
+        // Extension commands execute immediately — even during streaming —
+        // and never start a turn (oracle prompt(), agent-session.ts:
+        // 1084-1092; extension commands drive their own LLM interaction via
+        // pi.sendMessage()).
+        if expand && text.starts_with('/') {
+            let hooks = self.inner.command_hooks.lock().clone();
+            if let Some(hooks) = hooks {
+                let rest = &text[1..];
+                let (name, args) = match rest.find(' ') {
+                    Some(space) => (&rest[..space], &rest[space + 1..]),
+                    None => (rest, ""),
+                };
+                if hooks.has_command(name) {
+                    hooks.execute(name.to_string(), args.to_string()).await;
+                    return Ok(None);
+                }
+            }
+        }
 
         let mut expanded_text = text.to_string();
         if expand {
@@ -2711,6 +2743,12 @@ impl AgentSession {
             .system_prompt_override
             .clone()
             .unwrap_or_else(|| state.base_system_prompt.clone());
+    }
+
+    /// Shared model registry handle (extension provider registration
+    /// mutates the catalog at runtime, oracle `registerProvider` binding).
+    pub fn model_registry(&self) -> Arc<tokio::sync::RwLock<ModelRegistry>> {
+        self.inner.registry.clone()
     }
 
     /// Whether a tool name passes the allow/deny registry filters.

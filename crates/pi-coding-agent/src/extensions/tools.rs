@@ -104,7 +104,7 @@ pub struct ExtensionToolContext {
 
 /// Resolves when `token` is cancelled (house token is a bare flag; polls at
 /// the same cadence as the forwarder's cancel arms).
-async fn cancelled(token: CancellationToken) {
+pub(super) async fn wait_cancelled(token: CancellationToken) {
     while !token.is_cancelled() {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
@@ -223,7 +223,7 @@ async fn execute_extension_tool(
         Some(token) => {
             tokio::select! {
                 outcome = &mut pending => outcome,
-                _ = cancelled(token) => {
+                _ = wait_cancelled(token) => {
                     // Abandon + wire cancel frame; the sidecar aborts the
                     // extension tool's AbortSignal (wrapper.ts signature).
                     pending.cancel().await;

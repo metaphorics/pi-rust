@@ -304,6 +304,7 @@ export interface FlagRegistrationDto {
 export interface ProviderRegistrationDto {
   name: string;
   configDto: JsonValue;
+  hasStreamSimple?: boolean;
   extensionPath?: string;
 }
 

@@ -1096,6 +1096,12 @@ pub enum FlagKind {
 pub struct ProviderRegistration {
     pub name: String,
     pub config_dto: Value,
+    /// Whether the provider carries a `streamSimple` implementation (a
+    /// function — it never crosses the wire): such providers stream via
+    /// `provider/stream` in the sidecar; data-only providers resolve
+    /// natively in the host registry.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub has_stream_simple: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extension_path: Option<String>,
 }
@@ -1867,6 +1873,7 @@ mod tests {
             Notification::ProviderRegister(ProviderRegistration {
                 name: "p".into(),
                 config_dto: json!({"baseUrl":"https://example.test"}),
+                has_stream_simple: true,
                 extension_path: None,
             }),
             Notification::ProviderUnregister(NameParams { name: "p".into() }),

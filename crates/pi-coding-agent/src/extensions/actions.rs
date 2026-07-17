@@ -125,6 +125,19 @@ pub trait HostActions: Send + Sync {
     fn replaced_send_user_message(&self, _params: SendUserMessageParams) -> BoxFuture<'static, ()> {
         ready(())
     }
+    /// `pi.registerProvider` at runtime (load-time registrations arrive in
+    /// the `initialized`/`refreshTools` snapshots). Ordered: the serve loop
+    /// awaits it before the next inbound frame.
+    fn provider_register(
+        &self,
+        _registration: pi_ext_protocol::ProviderRegistration,
+    ) -> BoxFuture<'static, ()> {
+        ready(())
+    }
+    /// `pi.unregisterProvider` at runtime.
+    fn provider_unregister(&self, _name: String) -> BoxFuture<'static, ()> {
+        ready(())
+    }
 }
 
 /// Frames C6 has no consumer for yet (`ui/frame`, `tool/update`,
@@ -388,11 +401,18 @@ async fn handle_notification(
             }
         }
 
-        // Provider registrations mutate the reported registration set; the
-        // runtime model-catalog merge is C7 (F9).
-        Notification::ProviderRegister(_)
-        | Notification::ProviderUnregister(_)
-        | Notification::ProviderEvent(_)
+        // Runtime provider registration mutates the host model catalog
+        // (C7/F9); ordered through the serve loop like other actions.
+        Notification::ProviderRegister(registration) => {
+            config.actions.provider_register(registration).await;
+        }
+        Notification::ProviderUnregister(params) => {
+            config.actions.provider_unregister(params.name).await;
+        }
+
+        // `provider/event` streams + frames route through the composed
+        // fallback sink (C7 providers, C8 frames).
+        Notification::ProviderEvent(_)
         | Notification::ToolUpdate(_)
         | Notification::UiFrame(_)
         | Notification::UiDispose(_)
