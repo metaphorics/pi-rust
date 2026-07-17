@@ -21,7 +21,7 @@ use parking_lot::Mutex;
 use pi_agent::AgentThinkingLevel;
 use pi_coding_agent::cli::args::{Args, DiagnosticType, ListModels, Mode, UnknownFlagValue};
 use pi_coding_agent::cli::{
-    self, AppMode, history, initial_message, model_select, session_select, startup_ui,
+    self, AppMode, initial_message, model_select, session_select, startup_ui,
 };
 use pi_coding_agent::config::{
     env_session_dir_key, expand_tilde_path, get_agent_dir, normalize_path,
@@ -875,7 +875,6 @@ async fn main() {
                     initial_messages: std::mem::take(&mut parsed.messages),
                     model_fallback_message: runtime.model_fallback_message(),
                     handle_signals: true,
-                    history_path: Some(history::get_history_path()),
                     ..Default::default()
                 },
             );

@@ -1310,3 +1310,85 @@ async fn follow_up_expands_large_paste_markers() {
     assert!(!follow_up[0].contains("[paste"), "{:?}", follow_up[0]);
     assert_no_flicker(&handle);
 }
+
+/// Editor history is in-memory only (oracle editor.ts:402-408): a submitted
+/// prompt is recalled with Up and resubmits verbatim, and nothing is
+/// persisted under the agent dir.
+#[tokio::test(flavor = "current_thread")]
+async fn editor_history_recalls_in_memory_and_persists_nothing() {
+    let seed = make_runtime(TestRuntimeOptions {
+        with_auth: true,
+        ..Default::default()
+    })
+    .await;
+    let first = assistant_text_message(&seed.model, "first reply");
+    let second = assistant_text_message(&seed.model, "second reply");
+    drop(seed);
+    let test = make_runtime(TestRuntimeOptions {
+        with_auth: true,
+        script: vec![first, second],
+        ..Default::default()
+    })
+    .await;
+    let session = test.runtime.session();
+    let (terminal, handle) = VtTerminal::new(90, 28);
+    let mut mode = InteractiveMode::new(
+        test.runtime.clone(),
+        terminal,
+        InteractiveModeOptions::default(),
+    );
+    mode.init();
+
+    send(&mut mode, &handle, "alpha-one prompt");
+    send(&mut mode, &handle, "\r");
+    pump_until(&mut mode, &handle, Duration::from_secs(2), |screen| {
+        screen.contains("first reply")
+    })
+    .await;
+
+    // Up recalls the submitted prompt into the (now empty) editor; Enter
+    // resubmits it verbatim.
+    send(&mut mode, &handle, "\x1b[A");
+    send(&mut mode, &handle, "\r");
+    pump_until(&mut mode, &handle, Duration::from_secs(2), |screen| {
+        screen.contains("second reply")
+    })
+    .await;
+
+    let user_texts: Vec<String> = session
+        .messages()
+        .iter()
+        .filter_map(|message| {
+            if let Some(Message::User(user)) = message.as_message() {
+                match &user.content {
+                    UserContent::Text(text) => Some(text.clone()),
+                    UserContent::Blocks(blocks) => blocks.iter().find_map(|block| {
+                        if let Content::Text(text) = block {
+                            Some(text.text.to_string())
+                        } else {
+                            None
+                        }
+                    }),
+                }
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(
+        user_texts,
+        vec!["alpha-one prompt".to_string(), "alpha-one prompt".to_string()],
+        "Up-arrow recall must resubmit the in-memory history entry"
+    );
+
+    // Nothing history-related is written to disk: the agent dir holds no
+    // new files beyond what runtime creation itself produced.
+    let unexpected: Vec<String> = std::fs::read_dir(test.tmp.path().join("agent"))
+        .expect("agent dir")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains("history"))
+        .collect();
+    assert!(unexpected.is_empty(), "{unexpected:?}");
+    assert_no_flicker(&handle);
+}

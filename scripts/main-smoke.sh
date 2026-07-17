@@ -3,8 +3,7 @@
 # package subcommands, real settings/session fixtures, print/json/rpc against
 # a local scripted provider, signals/exit codes, stdout purity, extension
 # detection (zero-extension = no Bun; missing Bun degrades gracefully; real
-# sidecar startup when Bun is present), and an interactive tmux PTY pass with
-# persistent editor history.
+# sidecar startup when Bun is present), and an interactive tmux PTY pass.
 set -u
 cd "$(dirname "$0")/.."
 REPO=$(pwd)
@@ -279,22 +278,6 @@ if command -v tmux >/dev/null 2>&1; then
     tmux has-session -t pi-main-smoke 2>/dev/null || break
     sleep 0.25
   done
-  check_contains "history.jsonl persisted" "hello interactive" "$(cat "$AGENT/history.jsonl" 2>/dev/null)"
-
-  # Second run: Up arrow recalls the persisted prompt.
-  tmux kill-session -t pi-main-smoke 2>/dev/null
-  tmux new-session -d -s pi-main-smoke -x 100 -y 30 \
-    "env PI_CODING_AGENT_DIR='$AGENT' PI_OFFLINE=1 '$BIN' --no-session"
-  sleep 2
-  tmux send-keys -t pi-main-smoke Up
-  sleep 0.5
-  recall=0
-  tmux capture-pane -t pi-main-smoke -p 2>/dev/null | grep -q "hello interactive" && recall=1
-  check "history recall via Up" 1 "$recall"
-  tmux send-keys -t pi-main-smoke C-c
-  tmux send-keys -t pi-main-smoke -l "/quit"
-  tmux send-keys -t pi-main-smoke Enter
-  sleep 1
   tmux kill-session -t pi-main-smoke 2>/dev/null
 else
   echo "skip - interactive PTY smoke (tmux missing)"

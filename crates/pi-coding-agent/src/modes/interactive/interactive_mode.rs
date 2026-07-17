@@ -126,9 +126,6 @@ pub struct InteractiveModeOptions {
     /// The default ignores SIGINT, sends SIGTSTP to the process group, and
     /// restores SIGINT after SIGCONT resumes execution.
     pub suspend_signal: Option<Rc<dyn Fn()>>,
-    /// Persist editor prompt history to this file (`~/.pi/agent/
-    /// history.jsonl`); loaded on init, appended on each submission.
-    pub history_path: Option<std::path::PathBuf>,
 }
 
 // ============================================================================
@@ -835,13 +832,6 @@ impl InteractiveMode {
             return;
         }
         self.initialized = true;
-        if let Some(history_path) = &self.options.history_path {
-            let entries = crate::cli::history::load_history(history_path);
-            let mut editor = self.editor.borrow_mut();
-            for entry in &entries {
-                editor.add_to_history(entry);
-            }
-        }
         self.update_editor_border_color();
         self.update_terminal_title();
         self.render_current_session_state();
@@ -3774,14 +3764,11 @@ impl InteractiveMode {
         }));
     }
 
-    /// Editor history for a genuine user submission: in-memory (Up-arrow)
-    /// plus persistent history.jsonl. Session-replay population
-    /// (`render_session_entries`) deliberately stays in-memory only.
+    /// Editor history for a genuine user submission — in-memory Up-arrow
+    /// history only (oracle keeps editor history session-scoped;
+    /// editor.ts:402-408).
     fn record_history(&self, text: &str) {
         self.editor.borrow_mut().add_to_history(text);
-        if let Some(path) = &self.options.history_path {
-            crate::cli::history::append_history(path, text);
-        }
     }
 
     fn queue_compaction_message(&mut self, text: String, mode: StreamingBehavior) {
