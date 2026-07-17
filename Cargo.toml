@@ -8,6 +8,7 @@ members = [
     "crates/pi-coding-agent",
     "crates/pi-orchestrator",
     "crates/pi-ext-protocol",
+    "crates/pi-vt",
 ]
 exclude = ["inkferro"]
 

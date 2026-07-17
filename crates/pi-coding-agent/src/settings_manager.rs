@@ -618,6 +618,31 @@ impl SettingsManager {
         self.save_global();
     }
 
+    /// Persist one top-level global setting while preserving unknown keys.
+    pub(crate) fn set_global_value(&mut self, key: &str, value: Value) {
+        self.global_settings.insert(key.to_owned(), value);
+        self.mark_modified(key, None);
+        self.save_global();
+    }
+
+    /// Persist one nested global setting while preserving sibling keys.
+    pub(crate) fn set_global_nested_value(&mut self, section: &str, key: &str, value: Value) {
+        let object = self
+            .global_settings
+            .0
+            .entry(section.to_owned())
+            .or_insert_with(|| Value::Object(Map::new()));
+        if !object.is_object() {
+            *object = Value::Object(Map::new());
+        }
+        object
+            .as_object_mut()
+            .expect("object initialized above")
+            .insert(key.to_owned(), value);
+        self.mark_modified(section, Some(key));
+        self.save_global();
+    }
+
     pub fn get_theme(&self) -> Option<&str> {
         let theme = self.settings.get_str("theme")?;
         if theme.contains('/') {
@@ -947,9 +972,55 @@ impl SettingsManager {
         self.settings.get_bool("quietStartup").unwrap_or(false)
     }
 
+    /// Oracle `getShowTerminalProgress`: `terminal.showTerminalProgress ?? false`.
+    pub fn get_show_terminal_progress(&self) -> bool {
+        self.settings
+            .get("terminal")
+            .and_then(|t| t.get("showTerminalProgress"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    }
+
+    /// Oracle `getDoubleEscapeAction`: `doubleEscapeAction ?? "tree"`.
+    pub fn get_double_escape_action(&self) -> String {
+        self.settings
+            .get_str("doubleEscapeAction")
+            .unwrap_or("tree")
+            .to_owned()
+    }
+
+    /// Oracle `getWarnings`: a copy of the `warnings` object (or empty).
+    pub fn get_warnings(&self) -> WarningSettings {
+        self.settings
+            .get("warnings")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default()
+    }
+
+    /// Oracle `setWarnings`: replace the global `warnings` object and save.
+    pub fn set_warnings(&mut self, warnings: &WarningSettings) {
+        let value = serde_json::to_value(warnings).unwrap_or_else(|_| Value::Object(Map::new()));
+        self.set_global_value("warnings", value);
+    }
+
     pub fn http_proxy(&self) -> Option<&str> {
         self.settings.get_str("httpProxy")
     }
+}
+
+/// Oracle `WarningSettings` (settings-manager.ts:58-60). Unknown keys are
+/// preserved across get/set round-trips (the oracle spreads plain objects).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct WarningSettings {
+    #[serde(
+        rename = "anthropicExtraUsage",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub anthropic_extra_usage: Option<bool>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 /// Pretty-print a JSON object like `JSON.stringify(obj, null, 2)`.

@@ -2,9 +2,9 @@
 #![allow(dead_code, unused_imports)]
 
 use pi_tui::autocomplete::{
-    AutocompleteItem, AutocompleteProvider, AutocompleteSuggestions, AppliedCompletion,
-    CancellationToken, CombinedAutocompleteProvider, CommandEntry, SlashCommand,
-    SuggestionOptions, SuggestionStart,
+    AppliedCompletion, AutocompleteItem, AutocompleteProvider, AutocompleteSuggestions,
+    CancellationToken, CombinedAutocompleteProvider, CommandEntry, SlashCommand, SuggestionOptions,
+    SuggestionStart,
 };
 use pi_tui::component::Component;
 use pi_tui::components::editor::{
@@ -199,7 +199,10 @@ fn replaces_the_entire_document_with_unicode_text_via_settext_paste_simulation()
     let mut e = editor(&t);
     e.set_text("H\u{e4}ll\u{f6} W\u{f6}rld! \u{1f600} \u{e4}\u{f6}\u{fc}\u{c4}\u{d6}\u{dc}\u{df}");
     let text = e.get_text();
-    assert_eq!(text, "H\u{e4}ll\u{f6} W\u{f6}rld! \u{1f600} \u{e4}\u{f6}\u{fc}\u{c4}\u{d6}\u{dc}\u{df}");
+    assert_eq!(
+        text,
+        "H\u{e4}ll\u{f6} W\u{f6}rld! \u{1f600} \u{e4}\u{f6}\u{fc}\u{c4}\u{d6}\u{dc}\u{df}"
+    );
 }
 
 #[test]

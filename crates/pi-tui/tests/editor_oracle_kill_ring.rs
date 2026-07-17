@@ -2,9 +2,9 @@
 #![allow(dead_code, unused_imports)]
 
 use pi_tui::autocomplete::{
-    AutocompleteItem, AutocompleteProvider, AutocompleteSuggestions, AppliedCompletion,
-    CancellationToken, CombinedAutocompleteProvider, CommandEntry, SlashCommand,
-    SuggestionOptions, SuggestionStart,
+    AppliedCompletion, AutocompleteItem, AutocompleteProvider, AutocompleteSuggestions,
+    CancellationToken, CombinedAutocompleteProvider, CommandEntry, SlashCommand, SuggestionOptions,
+    SuggestionStart,
 };
 use pi_tui::component::Component;
 use pi_tui::components::editor::{
@@ -243,7 +243,9 @@ fn backward_deletions_prepend_forward_deletions_append_during_accumulation() {
     let mut e = editor(&t);
     e.set_text("prefix|suffix");
     e.handle_input("\x01");
-    for _ in 0..6 { e.handle_input("\x1b[C"); }
+    for _ in 0..6 {
+        e.handle_input("\x1b[C");
+    }
     e.handle_input("\x0b");
     e.handle_input("\x0b");
     assert_eq!(e.get_text(), "prefix");
@@ -352,7 +354,9 @@ fn handles_yank_in_middle_of_text() {
     e.handle_input("\x17");
     e.set_text("hello world");
     e.handle_input("\x01");
-    for _ in 0..6 { e.handle_input("\x1b[C"); }
+    for _ in 0..6 {
+        e.handle_input("\x1b[C");
+    }
     e.handle_input("\x19");
     assert_eq!(e.get_text(), "hello wordworld");
 }
@@ -367,7 +371,9 @@ fn handles_yank_pop_in_middle_of_text() {
     e.handle_input("\x17");
     e.set_text("hello world");
     e.handle_input("\x01");
-    for _ in 0..6 { e.handle_input("\x1b[C"); }
+    for _ in 0..6 {
+        e.handle_input("\x1b[C");
+    }
     e.handle_input("\x19");
     assert_eq!(e.get_text(), "hello SECONDworld");
     e.handle_input("\x1by");
@@ -386,7 +392,9 @@ fn multiline_yank_and_yank_pop_in_middle_of_text() {
     e.handle_input("\x15");
     e.set_text("hello world");
     e.handle_input("\x01");
-    for _ in 0..6 { e.handle_input("\x1b[C"); }
+    for _ in 0..6 {
+        e.handle_input("\x1b[C");
+    }
     e.handle_input("\x19");
     assert_eq!(e.get_text(), "hello A\nBworld");
     e.handle_input("\x1by");

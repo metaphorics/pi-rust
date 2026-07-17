@@ -38,6 +38,109 @@ pub const DESIRED_KITTY_KEYBOARD_PROTOCOL_FLAGS: u32 = 7;
 pub const KEYBOARD_PROTOCOL_RESPONSE_FRAGMENT_TIMEOUT_MS: u64 = 150;
 /// Kitty progressive enhancement query: push flags 7, query flags, DA sentinel.
 pub const KITTY_KEYBOARD_PROTOCOL_QUERY: &str = "\x1b[>7u\x1b[?u\x1b[c";
+/// OSC 11 background query plus DA fallback sentinel.
+pub const TERMINAL_BACKGROUND_COLOR_QUERY: &str = "\x1b]11;?\x07\x1b[c";
+
+/// Parse an OSC 11 `rgb:RR/GG/BB` response terminated by BEL or ST.
+///
+/// The terminal may return 8-, 12-, or 16-bit channels; each is scaled to an
+/// 8-bit sRGB component. A DA response deliberately parses as `None`: it is
+/// the fallback sentinel indicating OSC 11 support is absent.
+#[must_use]
+pub fn parse_terminal_background_color_response(sequence: &str) -> Option<(u8, u8, u8)> {
+    let start = sequence.find("\x1b]11;rgb:")?;
+    if device_attributes_response_offset(sequence).is_some_and(|offset| offset < start) {
+        return None;
+    }
+    let value_start = start + "\x1b]11;rgb:".len();
+    let response = &sequence[value_start..];
+    let terminator = match (response.find('\x07'), response.find("\x1b\\")) {
+        (Some(bel), Some(st)) => bel.min(st),
+        (Some(bel), None) => bel,
+        (None, Some(st)) => st,
+        (None, None) => return None,
+    };
+    let value = &response[..terminator];
+    let mut channels = value.split('/');
+    let parse_channel = |channel: &str| {
+        if !(2..=4).contains(&channel.len())
+            || !channel.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return None;
+        }
+        let maximum = (1_u32 << (channel.len() * 4)) - 1;
+        let parsed = u32::from_str_radix(channel, 16).ok()?;
+        Some(((parsed * 255 + maximum / 2) / maximum) as u8)
+    };
+    let red = parse_channel(channels.next()?)?;
+    let green = parse_channel(channels.next()?)?;
+    let blue = parse_channel(channels.next()?)?;
+    channels.next().is_none().then_some((red, green, blue))
+}
+
+fn device_attributes_response_offset(sequence: &str) -> Option<usize> {
+    let mut offset = 0;
+    while let Some(found) = sequence[offset..].find("\x1b[") {
+        let start = offset + found;
+        let tail = &sequence[start + 2..];
+        if matches!(tail.as_bytes().first(), Some(b'?' | b'>')) {
+            let body = &tail[1..];
+            if let Some(end) = body.find('c') {
+                let digits = &body[..end];
+                if digits
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || byte == b';')
+                {
+                    return Some(start);
+                }
+            }
+        }
+        offset = start + 2;
+    }
+    None
+}
+
+fn strip_terminal_query_responses(sequence: &[u8]) -> Vec<u8> {
+    let mut kept = Vec::with_capacity(sequence.len());
+    let mut index = 0;
+    while index < sequence.len() {
+        let rest = &sequence[index..];
+        if rest.starts_with(b"\x1b]11;rgb:") {
+            let bel_end = rest
+                .iter()
+                .position(|byte| *byte == b'\x07')
+                .map(|offset| (offset, offset + 1));
+            let st_end = rest
+                .windows(2)
+                .position(|bytes| bytes == b"\x1b\\")
+                .map(|offset| (offset, offset + 2));
+            if let Some((_, end)) = match (bel_end, st_end) {
+                (Some(bel), Some(st)) => Some(if bel.0 < st.0 { bel } else { st }),
+                (Some(end), None) | (None, Some(end)) => Some(end),
+                (None, None) => None,
+            } {
+                index += end;
+                continue;
+            }
+        }
+        if rest.starts_with(b"\x1b[")
+            && let Some(end) = rest.iter().position(|byte| *byte == b'c')
+        {
+            let body = &rest[2..end];
+            if matches!(body.first(), Some(b'?' | b'>'))
+                && body[1..]
+                    .iter()
+                    .all(|byte| byte.is_ascii_digit() || *byte == b';')
+            {
+                index += end + 1;
+                continue;
+            }
+        }
+        kept.push(sequence[index]);
+        index += 1;
+    }
+    kept
+}
 
 /// Kitty keyboard protocol negotiation result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,14 +155,17 @@ pub fn parse_keyboard_protocol_negotiation_sequence(
 ) -> Option<KeyboardProtocolNegotiationSequence> {
     if let Some(rest) = sequence.strip_prefix("\x1b[?") {
         if let Some(digits) = rest.strip_suffix('u')
-            && !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
-                && let Ok(flags) = digits.parse::<u32>() {
-                    return Some(KeyboardProtocolNegotiationSequence::KittyFlags { flags });
-                }
+            && !digits.is_empty()
+            && digits.bytes().all(|b| b.is_ascii_digit())
+            && let Ok(flags) = digits.parse::<u32>()
+        {
+            return Some(KeyboardProtocolNegotiationSequence::KittyFlags { flags });
+        }
         if let Some(body) = rest.strip_suffix('c')
-            && body.bytes().all(|b| b.is_ascii_digit() || b == b';') {
-                return Some(KeyboardProtocolNegotiationSequence::DeviceAttributes);
-            }
+            && body.bytes().all(|b| b.is_ascii_digit() || b == b';')
+        {
+            return Some(KeyboardProtocolNegotiationSequence::DeviceAttributes);
+        }
     }
     None
 }
@@ -185,6 +291,8 @@ pub struct ProcessTerminal {
     stdin_tx: Option<Sender<Vec<u8>>>,
     stdin_rx: Option<Receiver<Vec<u8>>>,
     stdin_segmenter: Segmenter,
+    /// Bytes typed while a pre-start terminal probe owns stdin.
+    pending_stdin_chunks: Vec<Vec<u8>>,
     #[cfg(unix)]
     saved_termios: Option<rustix::termios::Termios>,
     last_cols: u16,
@@ -218,6 +326,7 @@ impl ProcessTerminal {
             stdin_tx: None,
             stdin_rx: None,
             stdin_segmenter: Segmenter::default(),
+            pending_stdin_chunks: Vec::new(),
             #[cfg(unix)]
             saved_termios: None,
             last_cols: cols,
@@ -234,6 +343,82 @@ impl ProcessTerminal {
         let mut out = io::stdout().lock();
         let _ = out.write_all(data.as_bytes());
         let _ = out.flush();
+    }
+    /// Query OSC 11 before starting the TUI, preserving unrelated typed input.
+    ///
+    /// A DA response is a sentinel that the terminal does not support OSC 11.
+    /// The probe never starts a reader thread and restores the preceding
+    /// termios state before returning.
+    #[must_use]
+    pub fn query_background_color(&mut self, timeout_ms: u64) -> Option<(u8, u8, u8)> {
+        #[cfg(unix)]
+        {
+            use rustix::stdio::{stdin, stdout};
+            use rustix::termios;
+
+            if self.running.load(Ordering::SeqCst)
+                || !termios::isatty(stdin())
+                || !termios::isatty(stdout())
+                || self.enable_raw_mode().is_err()
+            {
+                return None;
+            }
+
+            Self::write_stdout(TERMINAL_BACKGROUND_COLOR_QUERY);
+            let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+            let mut received = Vec::new();
+            let result = loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break None;
+                }
+                let timeout = remaining.as_millis().min(i32::MAX as u128) as i32;
+                let mut poll_fd = libc::pollfd {
+                    fd: libc::STDIN_FILENO,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: poll_fd points to valid stack storage for one descriptor.
+                let ready = unsafe { libc::poll(&mut poll_fd, 1, timeout) };
+                if ready <= 0 {
+                    break None;
+                }
+                let mut chunk = [0_u8; 4096];
+                // SAFETY: chunk is writable storage and stdin is a valid descriptor.
+                let count = unsafe {
+                    libc::read(
+                        libc::STDIN_FILENO,
+                        chunk.as_mut_ptr().cast::<libc::c_void>(),
+                        chunk.len(),
+                    )
+                };
+                if count <= 0 {
+                    break None;
+                }
+                received.extend_from_slice(&chunk[..count as usize]);
+                let text = String::from_utf8_lossy(&received);
+                let osc_offset = text.find("\x1b]11;rgb:");
+                if let Some(da_offset) = device_attributes_response_offset(&text)
+                    && osc_offset.is_none_or(|osc_offset| da_offset < osc_offset)
+                {
+                    break None;
+                }
+                if let Some(color) = parse_terminal_background_color_response(&text) {
+                    break Some(color);
+                }
+            };
+            let preserved = strip_terminal_query_responses(&received);
+            if !preserved.is_empty() {
+                self.pending_stdin_chunks.push(preserved);
+            }
+            self.restore_termios();
+            result
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = timeout_ms;
+            None
+        }
     }
 
     fn append_write_log(&self, data: &str) {
@@ -334,7 +519,7 @@ impl ProcessTerminal {
             self.csi_2026_frames_seen = self.csi_2026_frames_seen.saturating_add(1);
         }
 
-                let segments = self.stdin_segmenter.push(bytes);
+        let segments = self.stdin_segmenter.push(bytes);
         for segment in segments {
             match segment {
                 Segment::Bytes(raw) => {
@@ -482,6 +667,7 @@ impl Terminal for ProcessTerminal {
         self.resize_handler = Some(on_resize);
 
         let _ = self.enable_raw_mode();
+        self.stdin_segmenter = Segmenter::default();
 
         // Bracketed paste enable.
         Self::write_stdout("\x1b[?2004h");
@@ -495,13 +681,15 @@ impl Terminal for ProcessTerminal {
         self.keyboard_protocol_pushed = true;
         self.clear_keyboard_protocol_negotiation_buffer();
         Self::write_stdout(KITTY_KEYBOARD_PROTOCOL_QUERY);
+        for chunk in std::mem::take(&mut self.pending_stdin_chunks) {
+            self.process_stdin_chunk(&chunk);
+        }
 
         self.running.store(true, Ordering::SeqCst);
         let running = Arc::clone(&self.running);
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
         self.stdin_tx = Some(tx.clone());
         self.stdin_rx = Some(rx);
-        self.stdin_segmenter = Segmenter::default();
 
         let join = thread::Builder::new()
             .name("pi-tui-stdin".into())
@@ -647,6 +835,43 @@ impl Terminal for ProcessTerminal {
         Self::write_stdout(&format!("\x1b]0;{title}\x07"));
     }
 
+    /// Suspend teardown (oracle: `ui.stop()` before SIGTSTP): clear
+    /// progress, disable bracketed paste, pop Kitty protocol, restore
+    /// termios. The stdin reader thread, channels, and handlers stay
+    /// alive — `stop()`'s thread detach + a second `start()` would race
+    /// two readers on the same fd after resume.
+    fn suspend(&mut self) {
+        if self.progress_active {
+            Self::write_stdout(TERMINAL_PROGRESS_CLEAR_SEQUENCE);
+            self.progress_active = false;
+            self.progress_last_emit = None;
+        }
+        Self::write_stdout("\x1b[?2004l");
+        let should_disable_kitty = self.keyboard_protocol_pushed || self.kitty_protocol_active;
+        self.clear_keyboard_protocol_negotiation_buffer();
+        if should_disable_kitty {
+            Self::write_stdout("\x1b[<u");
+            self.keyboard_protocol_pushed = false;
+            self.kitty_protocol_active = false;
+            set_kitty_protocol_active(false);
+        }
+        self.disable_modify_other_keys();
+        self.restore_termios();
+    }
+
+    /// Resume after SIGCONT (oracle: `ui.start()` in the SIGCONT handler):
+    /// mirrors `start()` minus thread/handler setup. Self-SIGWINCH refreshes
+    /// dimensions lost while stopped (terminal.ts:152-156).
+    fn resume(&mut self) {
+        let _ = self.enable_raw_mode();
+        self.stdin_segmenter = Segmenter::default();
+        Self::write_stdout("\x1b[?2004h");
+        Self::signal_sigwinch_self();
+        self.keyboard_protocol_pushed = true;
+        self.clear_keyboard_protocol_negotiation_buffer();
+        Self::write_stdout(KITTY_KEYBOARD_PROTOCOL_QUERY);
+    }
+
     fn set_progress(&mut self, active: bool) {
         if active {
             Self::write_stdout(TERMINAL_PROGRESS_ACTIVE_SEQUENCE);
@@ -700,5 +925,32 @@ mod tests {
         term.process_stdin_chunk(b"a");
         let guard = got.lock().unwrap();
         assert_eq!(guard.as_slice(), &["a".to_string()]);
+    }
+
+    #[test]
+    fn parses_st_terminated_osc11_rgb() {
+        assert_eq!(
+            parse_terminal_background_color_response("\x1b]11;rgb:ffff/0000/8080\x1b\\"),
+            Some((255, 0, 128))
+        );
+    }
+
+    #[test]
+    fn parses_bel_terminated_osc11_rgb() {
+        assert_eq!(
+            parse_terminal_background_color_response("\x1b]11;rgb:ff/80/00\x07"),
+            Some((255, 128, 0))
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_osc11_and_device_attributes() {
+        assert_eq!(parse_terminal_background_color_response("garbage"), None);
+        assert_eq!(parse_terminal_background_color_response("\x1b[?1;2c"), None);
+        assert_eq!(device_attributes_response_offset("\x1b[?1;2c"), Some(0));
+        assert_eq!(
+            parse_terminal_background_color_response("\x1b[?1;2c\x1b]11;rgb:ffff/0000/8080\x1b\\"),
+            None
+        );
     }
 }

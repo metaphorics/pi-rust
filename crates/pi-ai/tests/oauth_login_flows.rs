@@ -332,7 +332,8 @@ async fn openai_codex_bind_failure_falls_back_to_paste_prompt() {
 
     let token_server = MockServer::spawn(Arc::new(move |_line, path, body| {
         if path.starts_with("/token")
-            && (body.contains("authorization_code") || body.contains("grant_type=authorization_code"))
+            && (body.contains("authorization_code")
+                || body.contains("grant_type=authorization_code"))
         {
             (200, "application/json", token_json.clone())
         } else {
@@ -375,9 +376,9 @@ async fn openai_codex_bind_failure_falls_back_to_paste_prompt() {
         on_progress: Some(Box::new(|_msg: &str| {})),
         on_manual_code_input: None,
         on_select: Box::new(move |_prompt: OAuthSelectPrompt| {
-            Box::pin(async move {
-                Some(openai_codex::OPENAI_CODEX_BROWSER_LOGIN_METHOD.to_owned())
-            }) as Pin<Box<dyn Future<Output = Option<String>> + Send>>
+            Box::pin(
+                async move { Some(openai_codex::OPENAI_CODEX_BROWSER_LOGIN_METHOD.to_owned()) },
+            ) as Pin<Box<dyn Future<Output = Option<String>> + Send>>
         }),
         cancellation: None,
         open_browser: false,
@@ -391,7 +392,10 @@ async fn openai_codex_bind_failure_falls_back_to_paste_prompt() {
         token_server.url("/device-token"),
     );
 
-    let credentials = provider.login(&callbacks).await.expect("paste fallback login");
+    let credentials = provider
+        .login(&callbacks)
+        .await
+        .expect("paste fallback login");
     assert_eq!(credentials.extra["accountId"], "acct_paste");
     assert_eq!(
         prompt_hits.load(Ordering::SeqCst),

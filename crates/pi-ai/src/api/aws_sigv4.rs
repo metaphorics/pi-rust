@@ -10,8 +10,7 @@
 
 use std::{
     collections::BTreeMap,
-    env,
-    fs,
+    env, fs,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -98,7 +97,9 @@ fn load_profile_credentials(
     })
 }
 
-fn profile_region(options_env: Option<&std::collections::HashMap<String, String>>) -> Option<String> {
+fn profile_region(
+    options_env: Option<&std::collections::HashMap<String, String>>,
+) -> Option<String> {
     let profile = profile_name(options_env);
     let config_path = env::var("AWS_CONFIG_FILE")
         .map(PathBuf::from)
@@ -172,24 +173,20 @@ pub fn sign_post_headers(
         headers.insert("x-amz-security-token".into(), token.clone());
     }
 
-    let signed_headers = headers
-        .keys()
-        .cloned()
-        .collect::<Vec<_>>()
-        .join(";");
+    let signed_headers = headers.keys().cloned().collect::<Vec<_>>().join(";");
     let canonical_headers = headers
         .iter()
         .map(|(k, v)| format!("{k}:{}\n", trim_all(v)))
         .collect::<String>();
-    let canonical_request = format!(
-        "POST\n{path}\n{query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
-    );
+    let canonical_request =
+        format!("POST\n{path}\n{query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}");
     let credential_scope = format!("{date_stamp}/{region}/{service}/aws4_request");
     let string_to_sign = format!(
         "AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{}",
         hex_sha256(canonical_request.as_bytes())
     );
-    let signing_key = derive_signing_key(&credentials.secret_access_key, date_stamp, region, service);
+    let signing_key =
+        derive_signing_key(&credentials.secret_access_key, date_stamp, region, service);
     let signature = hex_hmac(&signing_key, string_to_sign.as_bytes());
     let authorization = format!(
         "AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={}, Signature={}",
@@ -438,10 +435,7 @@ mod tests {
             .find(|(k, _)| k == "authorization")
             .map(|(_, v)| v.as_str())
             .unwrap();
-        let signature = auth
-            .rsplit_once("Signature=")
-            .map(|(_, sig)| sig)
-            .unwrap();
+        let signature = auth.rsplit_once("Signature=").map(|(_, sig)| sig).unwrap();
         // Pinned: canonical URI encodes model-id colon as %3A.
         assert_eq!(
             signature,

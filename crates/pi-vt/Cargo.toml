@@ -1,0 +1,10 @@
+[package]
+name = "pi-vt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Cell-grid terminal screen emulator for pi-rust tests (replaces pi's @xterm/headless harness)"
+
+[dependencies]
+vte = "0.14"
+unicode-width = "0.2"

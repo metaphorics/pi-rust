@@ -2,9 +2,9 @@
 #![allow(dead_code, unused_imports)]
 
 use pi_tui::autocomplete::{
-    AutocompleteItem, AutocompleteProvider, AutocompleteSuggestions, AppliedCompletion,
-    CancellationToken, CombinedAutocompleteProvider, CommandEntry, SlashCommand,
-    SuggestionOptions, SuggestionStart,
+    AppliedCompletion, AutocompleteItem, AutocompleteProvider, AutocompleteSuggestions,
+    CancellationToken, CombinedAutocompleteProvider, CommandEntry, SlashCommand, SuggestionOptions,
+    SuggestionStart,
 };
 use pi_tui::component::Component;
 use pi_tui::components::editor::{
@@ -115,7 +115,9 @@ fn preserves_target_column_when_moving_up_through_a_shorter_line() {
     e.set_text("2222222222x222\n\n1111111111_111111111111");
     assert_eq!(e.get_cursor(), (2, 23));
     e.handle_input("\x01");
-    for _ in 0..10 { e.handle_input("\x1b[C"); }
+    for _ in 0..10 {
+        e.handle_input("\x1b[C");
+    }
     assert_eq!(e.get_cursor(), (2, 10));
     e.handle_input("\x1b[A");
     assert_eq!(e.get_cursor(), (1, 0));
@@ -131,7 +133,9 @@ fn preserves_target_column_when_moving_down_through_a_shorter_line() {
     e.handle_input("\x1b[A");
     e.handle_input("\x1b[A");
     e.handle_input("\x01");
-    for _ in 0..10 { e.handle_input("\x1b[C"); }
+    for _ in 0..10 {
+        e.handle_input("\x1b[C");
+    }
     assert_eq!(e.get_cursor(), (0, 10));
     e.handle_input("\x1b[B");
     assert_eq!(e.get_cursor(), (1, 0));
@@ -145,7 +149,9 @@ fn resets_sticky_column_on_horizontal_movement_left_arrow() {
     let mut e = editor(&t);
     e.set_text("1234567890\n\n1234567890");
     e.handle_input("\x01");
-    for _ in 0..5 { e.handle_input("\x1b[C"); }
+    for _ in 0..5 {
+        e.handle_input("\x1b[C");
+    }
     assert_eq!(e.get_cursor(), (2, 5));
     e.handle_input("\x1b[A");
     e.handle_input("\x1b[A");
@@ -165,7 +171,9 @@ fn resets_sticky_column_on_horizontal_movement_right_arrow() {
     e.handle_input("\x1b[A");
     e.handle_input("\x1b[A");
     e.handle_input("\x01");
-    for _ in 0..5 { e.handle_input("\x1b[C"); }
+    for _ in 0..5 {
+        e.handle_input("\x1b[C");
+    }
     assert_eq!(e.get_cursor(), (0, 5));
     e.handle_input("\x1b[B");
     e.handle_input("\x1b[B");
@@ -183,7 +191,9 @@ fn resets_sticky_column_on_typing() {
     let mut e = editor(&t);
     e.set_text("1234567890\n\n1234567890");
     e.handle_input("\x01");
-    for _ in 0..8 { e.handle_input("\x1b[C"); }
+    for _ in 0..8 {
+        e.handle_input("\x1b[C");
+    }
     e.handle_input("\x1b[A");
     e.handle_input("\x1b[A");
     assert_eq!(e.get_cursor(), (0, 8));
@@ -200,7 +210,9 @@ fn resets_sticky_column_on_backspace() {
     let mut e = editor(&t);
     e.set_text("1234567890\n\n1234567890");
     e.handle_input("\x01");
-    for _ in 0..8 { e.handle_input("\x1b[C"); }
+    for _ in 0..8 {
+        e.handle_input("\x1b[C");
+    }
     e.handle_input("\x1b[A");
     e.handle_input("\x1b[A");
     assert_eq!(e.get_cursor(), (0, 8));
@@ -217,7 +229,9 @@ fn resets_sticky_column_on_ctrl_a_move_to_line_start() {
     let mut e = editor(&t);
     e.set_text("1234567890\n\n1234567890");
     e.handle_input("\x01");
-    for _ in 0..8 { e.handle_input("\x1b[C"); }
+    for _ in 0..8 {
+        e.handle_input("\x1b[C");
+    }
     e.handle_input("\x1b[A");
     e.handle_input("\x01");
     assert_eq!(e.get_cursor(), (1, 0));
@@ -231,7 +245,9 @@ fn resets_sticky_column_on_ctrl_e_move_to_line_end() {
     let mut e = editor(&t);
     e.set_text("12345\n\n1234567890");
     e.handle_input("\x01");
-    for _ in 0..3 { e.handle_input("\x1b[C"); }
+    for _ in 0..3 {
+        e.handle_input("\x1b[C");
+    }
     e.handle_input("\x1b[A");
     e.handle_input("\x1b[A");
     assert_eq!(e.get_cursor(), (0, 3));
@@ -285,7 +301,9 @@ fn resets_sticky_column_on_undo() {
     e.handle_input("\x1b[A");
     e.handle_input("\x1b[A");
     e.handle_input("\x01");
-    for _ in 0..8 { e.handle_input("\x1b[C"); }
+    for _ in 0..8 {
+        e.handle_input("\x1b[C");
+    }
     assert_eq!(e.get_cursor(), (0, 8));
     e.handle_input("\x1b[B");
     e.handle_input("\x1b[B");
@@ -310,7 +328,9 @@ fn handles_multiple_consecutive_up_down_movements() {
     let mut e = editor(&t);
     e.set_text("1234567890\nab\ncd\nef\n1234567890");
     e.handle_input("\x01");
-    for _ in 0..7 { e.handle_input("\x1b[C"); }
+    for _ in 0..7 {
+        e.handle_input("\x1b[C");
+    }
     assert_eq!(e.get_cursor(), (4, 7));
     e.handle_input("\x1b[A");
     e.handle_input("\x1b[A");
@@ -345,7 +365,9 @@ fn handles_settext_resetting_sticky_column() {
     let mut e = editor(&t);
     e.set_text("1234567890\n\n1234567890");
     e.handle_input("\x01");
-    for _ in 0..8 { e.handle_input("\x1b[C"); }
+    for _ in 0..8 {
+        e.handle_input("\x1b[C");
+    }
     e.handle_input("\x1b[A");
     e.set_text("abcdefghij\n\nabcdefghij");
     assert_eq!(e.get_cursor(), (2, 10));
@@ -360,7 +382,9 @@ fn handles_editor_resizes_when_preferredvisualcol_is_on_the_same_line() {
     let mut e = editor(&t);
     e.set_text("12345678901234567890\n\n12345678901234567890");
     e.handle_input("\x01");
-    for _ in 0..15 { e.handle_input("\x1b[C"); }
+    for _ in 0..15 {
+        e.handle_input("\x1b[C");
+    }
     e.handle_input("\x1b[A");
     e.handle_input("\x1b[A");
     assert_eq!(e.get_cursor(), (0, 15));
@@ -376,7 +400,9 @@ fn handles_editor_resizes_when_preferredvisualcol_is_on_a_different_line() {
     let mut e = editor(&t);
     e.set_text("short\n12345678901234567890");
     e.handle_input("\x01");
-    for _ in 0..15 { e.handle_input("\x1b[C"); }
+    for _ in 0..15 {
+        e.handle_input("\x1b[C");
+    }
     assert_eq!(e.get_cursor(), (1, 15));
     e.handle_input("\x1b[A");
     assert_eq!(e.get_cursor(), (0, 5));

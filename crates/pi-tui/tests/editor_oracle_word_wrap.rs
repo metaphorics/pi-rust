@@ -2,9 +2,9 @@
 #![allow(dead_code, unused_imports)]
 
 use pi_tui::autocomplete::{
-    AutocompleteItem, AutocompleteProvider, AutocompleteSuggestions, AppliedCompletion,
-    CancellationToken, CombinedAutocompleteProvider, CommandEntry, SlashCommand,
-    SuggestionOptions, SuggestionStart,
+    AppliedCompletion, AutocompleteItem, AutocompleteProvider, AutocompleteSuggestions,
+    CancellationToken, CombinedAutocompleteProvider, CommandEntry, SlashCommand, SuggestionOptions,
+    SuggestionStart,
 };
 use pi_tui::component::Component;
 use pi_tui::components::editor::{
@@ -167,7 +167,10 @@ fn splits_when_word_plus_multi_space_plus_word_exceeds_width() {
 
 #[test]
 fn breaks_long_whitespace_at_line_boundary() {
-    let chunks = word_wrap_line("Lorem ipsum dolor sit amet,                         consectetur", 30);
+    let chunks = word_wrap_line(
+        "Lorem ipsum dolor sit amet,                         consectetur",
+        30,
+    );
     assert_eq!(chunks.len(), 3);
     assert_eq!(chunks[0].text, "Lorem ipsum dolor sit ");
     assert_eq!(chunks[1].text, "amet,                         ");
@@ -176,7 +179,10 @@ fn breaks_long_whitespace_at_line_boundary() {
 
 #[test]
 fn breaks_long_whitespace_at_line_boundary_2() {
-    let chunks = word_wrap_line("Lorem ipsum dolor sit amet,                          consectetur", 30);
+    let chunks = word_wrap_line(
+        "Lorem ipsum dolor sit amet,                          consectetur",
+        30,
+    );
     assert_eq!(chunks.len(), 3);
     assert_eq!(chunks[0].text, "Lorem ipsum dolor sit ");
     assert_eq!(chunks[1].text, "amet,                         ");
@@ -185,7 +191,10 @@ fn breaks_long_whitespace_at_line_boundary_2() {
 
 #[test]
 fn breaks_whitespace_spanning_full_lines() {
-    let chunks = word_wrap_line("Lorem ipsum dolor sit amet,                                     consectetur", 30);
+    let chunks = word_wrap_line(
+        "Lorem ipsum dolor sit amet,                                     consectetur",
+        30,
+    );
     assert_eq!(chunks.len(), 3);
     assert_eq!(chunks[0].text, "Lorem ipsum dolor sit ");
     assert_eq!(chunks[1].text, "amet,                         ");
@@ -194,9 +203,15 @@ fn breaks_whitespace_spanning_full_lines() {
 
 #[test]
 fn force_breaks_when_wide_char_after_word_boundary_wrap_still_overflows() {
-    let chunks = word_wrap_line(" aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u{4f60}", 187);
+    let chunks = word_wrap_line(
+        " aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u{4f60}",
+        187,
+    );
     let reconstructed: String = chunks.iter().map(|c| c.text.as_str()).collect();
-    assert_eq!(reconstructed, " aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u{4f60}");
+    assert_eq!(
+        reconstructed,
+        " aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u{4f60}"
+    );
 }
 
 #[test]
@@ -216,7 +231,6 @@ fn splits_oversized_atomic_segment_across_multiple_chunks() {
     assert_eq!(reconstructed, line);
 }
 
-
 #[test]
 fn splits_oversized_atomic_segment_at_start_of_line() {
     let marker = "[paste #1 +20 lines]";
@@ -230,7 +244,6 @@ fn splits_oversized_atomic_segment_at_start_of_line() {
     let reconstructed: String = chunks.iter().map(|c| c.text.as_str()).collect();
     assert_eq!(reconstructed, line);
 }
-
 
 #[test]
 fn splits_oversized_atomic_segment_at_end_of_line() {
@@ -246,7 +259,6 @@ fn splits_oversized_atomic_segment_at_end_of_line() {
     assert_eq!(reconstructed, line);
 }
 
-
 #[test]
 fn splits_consecutive_oversized_atomic_segments() {
     let m1 = "[paste #1 +20 lines]";
@@ -260,7 +272,6 @@ fn splits_consecutive_oversized_atomic_segments() {
     let reconstructed: String = chunks.iter().map(|c| c.text.as_str()).collect();
     assert_eq!(reconstructed, line);
 }
-
 
 #[test]
 fn wraps_normally_after_oversized_atomic_segment() {
@@ -283,7 +294,6 @@ fn wraps_normally_after_oversized_atomic_segment() {
     assert_eq!(reconstructed, line);
 }
 
-
 #[test]
 fn wraps_at_word_boundaries_instead_of_mid_word() {
     let t = tui();
@@ -297,7 +307,6 @@ fn wraps_at_word_boundaries_instead_of_mid_word() {
     }
 }
 
-
 #[test]
 fn handles_empty_string_render() {
     let t = tui();
@@ -306,7 +315,6 @@ fn handles_empty_string_render() {
     let lines = render_plain(&mut e, 40);
     assert_eq!(lines.len(), 3);
 }
-
 
 #[test]
 fn handles_single_word_that_fits_exactly() {

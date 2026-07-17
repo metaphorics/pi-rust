@@ -8,7 +8,10 @@ fn main() -> anyhow::Result<()> {
 
     // 1. Check parser-level diagnostics first
     if !parsed.diagnostics.is_empty() {
-        let has_errors = parsed.diagnostics.iter().any(|d| d.r#type == pi_coding_agent::cli::DiagnosticType::Error);
+        let has_errors = parsed
+            .diagnostics
+            .iter()
+            .any(|d| d.r#type == pi_coding_agent::cli::DiagnosticType::Error);
         for d in &parsed.diagnostics {
             let prefix = match d.r#type {
                 pi_coding_agent::cli::DiagnosticType::Error => "Error",
@@ -34,7 +37,9 @@ fn main() -> anyhow::Result<()> {
     // 3. Run combination validation
     let combo_diagnostics = pi_coding_agent::cli::validate_arg_combinations(&parsed);
     if !combo_diagnostics.is_empty() {
-        let has_errors = combo_diagnostics.iter().any(|d| d.r#type == pi_coding_agent::cli::DiagnosticType::Error);
+        let has_errors = combo_diagnostics
+            .iter()
+            .any(|d| d.r#type == pi_coding_agent::cli::DiagnosticType::Error);
         for d in &combo_diagnostics {
             let prefix = match d.r#type {
                 pi_coding_agent::cli::DiagnosticType::Error => "Error",

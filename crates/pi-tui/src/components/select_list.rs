@@ -89,7 +89,6 @@ pub struct SelectListLayoutOptions {
     pub truncate_primary: Option<Box<dyn Fn(SelectListTruncatePrimaryContext<'_>) -> String>>,
 }
 
-
 /// Filterable, keyboard-navigable list. Always re-renders (`RenderStatus::Changed`).
 pub struct SelectList {
     items: Vec<SelectItem>,
@@ -223,29 +222,29 @@ impl SelectList {
         let prefix_width = visible_width(prefix);
 
         if let Some(desc) = description_single_line
-            && width > 40 {
-                let effective = primary_column_width
-                    .min(width.saturating_sub(prefix_width).saturating_sub(4))
-                    .max(1);
-                let max_primary = effective.saturating_sub(PRIMARY_COLUMN_GAP).max(1);
-                let truncated_value =
-                    self.truncate_primary(item, is_selected, max_primary, effective);
-                let truncated_value_width = visible_width(&truncated_value);
-                let spacing_len = effective.saturating_sub(truncated_value_width).max(1);
-                let spacing = " ".repeat(spacing_len);
-                let description_start = prefix_width + truncated_value_width + spacing_len;
-                let remaining = width.saturating_sub(description_start).saturating_sub(2);
+            && width > 40
+        {
+            let effective = primary_column_width
+                .min(width.saturating_sub(prefix_width).saturating_sub(4))
+                .max(1);
+            let max_primary = effective.saturating_sub(PRIMARY_COLUMN_GAP).max(1);
+            let truncated_value = self.truncate_primary(item, is_selected, max_primary, effective);
+            let truncated_value_width = visible_width(&truncated_value);
+            let spacing_len = effective.saturating_sub(truncated_value_width).max(1);
+            let spacing = " ".repeat(spacing_len);
+            let description_start = prefix_width + truncated_value_width + spacing_len;
+            let remaining = width.saturating_sub(description_start).saturating_sub(2);
 
-                if remaining > MIN_DESCRIPTION_WIDTH {
-                    let truncated_desc = truncate_to_width_no_ellipsis(desc, remaining);
-                    if is_selected {
-                        let body = format!("{prefix}{truncated_value}{spacing}{truncated_desc}");
-                        return (self.theme.selected_text)(&body);
-                    }
-                    let desc_text = (self.theme.description)(&format!("{spacing}{truncated_desc}"));
-                    return format!("{prefix}{truncated_value}{desc_text}");
+            if remaining > MIN_DESCRIPTION_WIDTH {
+                let truncated_desc = truncate_to_width_no_ellipsis(desc, remaining);
+                if is_selected {
+                    let body = format!("{prefix}{truncated_value}{spacing}{truncated_desc}");
+                    return (self.theme.selected_text)(&body);
                 }
+                let desc_text = (self.theme.description)(&format!("{spacing}{truncated_desc}"));
+                return format!("{prefix}{truncated_value}{desc_text}");
             }
+        }
 
         let max_width = width.saturating_sub(prefix_width).saturating_sub(2);
         let truncated_value = self.truncate_primary(item, is_selected, max_width, max_width);
@@ -259,9 +258,10 @@ impl SelectList {
 
     fn notify_selection_change(&mut self) {
         if let Some(item) = self.filtered_items.get(self.selected_index).cloned()
-            && let Some(cb) = &mut self.on_selection_change {
-                cb(&item);
-            }
+            && let Some(cb) = &mut self.on_selection_change
+        {
+            cb(&item);
+        }
     }
 }
 
@@ -358,13 +358,15 @@ impl Component for SelectList {
             self.notify_selection_change();
         } else if kb.matches(key_data, "tui.select.confirm") {
             if let Some(item) = self.filtered_items.get(self.selected_index).cloned()
-                && let Some(cb) = &mut self.on_select {
-                    cb(&item);
-                }
-        } else if kb.matches(key_data, "tui.select.cancel")
-            && let Some(cb) = &mut self.on_cancel {
-                cb();
+                && let Some(cb) = &mut self.on_select
+            {
+                cb(&item);
             }
+        } else if kb.matches(key_data, "tui.select.cancel")
+            && let Some(cb) = &mut self.on_cancel
+        {
+            cb();
+        }
     }
 
     fn last_render_status(&self) -> RenderStatus {

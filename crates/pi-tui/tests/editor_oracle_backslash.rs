@@ -2,9 +2,9 @@
 #![allow(dead_code, unused_imports)]
 
 use pi_tui::autocomplete::{
-    AutocompleteItem, AutocompleteProvider, AutocompleteSuggestions, AppliedCompletion,
-    CancellationToken, CombinedAutocompleteProvider, CommandEntry, SlashCommand,
-    SuggestionOptions, SuggestionStart,
+    AppliedCompletion, AutocompleteItem, AutocompleteProvider, AutocompleteSuggestions,
+    CancellationToken, CombinedAutocompleteProvider, CommandEntry, SlashCommand, SuggestionOptions,
+    SuggestionStart,
 };
 use pi_tui::component::Component;
 use pi_tui::components::editor::{
@@ -140,7 +140,9 @@ fn does_not_trigger_newline_when_backslash_is_not_immediately_before_cursor() {
     let mut e = editor(&t);
     let submitted = std::rc::Rc::new(std::cell::RefCell::new(false));
     let s2 = submitted.clone();
-    e.on_submit = Some(Box::new(move |_| { *s2.borrow_mut() = true; }));
+    e.on_submit = Some(Box::new(move |_| {
+        *s2.borrow_mut() = true;
+    }));
     e.handle_input("\\");
     e.handle_input("x");
     e.handle_input("\r");

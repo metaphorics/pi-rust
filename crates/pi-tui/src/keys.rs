@@ -43,7 +43,6 @@ const FN_PAGE_DOWN: i32 = -13;
 const FN_HOME: i32 = -14;
 const FN_END: i32 = -15;
 
-
 fn is_symbol_key(s: &str) -> bool {
     matches!(
         s,
@@ -261,15 +260,16 @@ fn matches_kitty_sequence(data: &str, expected_cp: i32, expected_mod: u32) -> bo
     }
     // baseLayoutKey fallback for non-Latin layouts
     if let Some(base) = parsed.base_layout_key
-        && base == expected_cp {
-            let is_latin = (97..=122).contains(&normalized);
-            let is_symbol = char::from_u32(normalized as u32)
-                .map(|c| is_symbol_key(&c.to_string()))
-                .unwrap_or(false);
-            if !is_latin && !is_symbol {
-                return true;
-            }
+        && base == expected_cp
+    {
+        let is_latin = (97..=122).contains(&normalized);
+        let is_symbol = char::from_u32(normalized as u32)
+            .map(|c| is_symbol_key(&c.to_string()))
+            .unwrap_or(false);
+        if !is_latin && !is_symbol {
+            return true;
         }
+    }
     false
 }
 
@@ -344,8 +344,6 @@ fn raw_ctrl_char(key: &str) -> Option<char> {
     }
     None
 }
-
-
 
 struct ParsedKeyId {
     key: String,
@@ -703,20 +701,26 @@ fn match_printable(data: &str, key: &str, modifier: u32, kitty: bool) -> bool {
     let codepoint = ch as i32;
     let raw_ctrl = raw_ctrl_char(key);
 
-    if modifier == MOD_CTRL + MOD_ALT && !kitty
+    if modifier == MOD_CTRL + MOD_ALT
+        && !kitty
         && let Some(rc) = raw_ctrl
-            && data == format!("\x1b{rc}") {
-                return true;
-            }
-    if modifier == MOD_ALT && !kitty && (is_letter || is_digit || is_symbol_key(key))
-        && data == format!("\x1b{key}") {
-            return true;
-        }
+        && data == format!("\x1b{rc}")
+    {
+        return true;
+    }
+    if modifier == MOD_ALT
+        && !kitty
+        && (is_letter || is_digit || is_symbol_key(key))
+        && data == format!("\x1b{key}")
+    {
+        return true;
+    }
     if modifier == MOD_CTRL {
         if let Some(rc) = raw_ctrl
-            && data == rc.to_string() {
-                return true;
-            }
+            && data == rc.to_string()
+        {
+            return true;
+        }
         return matches_kitty_sequence(data, codepoint, MOD_CTRL)
             || matches_printable_mok(data, codepoint, MOD_CTRL);
     }
@@ -1025,9 +1029,10 @@ pub fn decode_kitty_printable(data: &str) -> Option<String> {
     }
     let mut effective = codepoint;
     if modifier & MOD_SHIFT != 0
-        && let Some(s) = shifted {
-            effective = s;
-        }
+        && let Some(s) = shifted
+    {
+        effective = s;
+    }
     effective = normalize_kitty_functional(effective);
     if effective < 32 {
         return None;

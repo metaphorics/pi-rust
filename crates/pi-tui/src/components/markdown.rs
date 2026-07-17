@@ -649,8 +649,7 @@ impl Markdown {
                         }
                     }
                 }
-                let mut lines =
-                    self.render_table(&header, &rows, width, &raw_fallback, style_ctx);
+                let mut lines = self.render_table(&header, &rows, width, &raw_fallback, style_ctx);
                 if self.next_block_needs_spacing(events, end) {
                     lines.push(String::new());
                 }
@@ -771,8 +770,8 @@ impl Markdown {
         for row in rows {
             for (i, cell) in row.iter().enumerate().take(num_cols) {
                 natural_widths[i] = natural_widths[i].max(visible_width(cell));
-                min_word_widths[i] = min_word_widths[i]
-                    .max(Self::get_longest_word_width(cell, MAX_UNBROKEN).max(1));
+                min_word_widths[i] =
+                    min_word_widths[i].max(Self::get_longest_word_width(cell, MAX_UNBROKEN).max(1));
             }
         }
 
@@ -783,10 +782,7 @@ impl Markdown {
             min_column_widths = vec![1usize; num_cols];
             let remaining = available_for_cells.saturating_sub(num_cols);
             if remaining > 0 {
-                let total_weight: usize = min_word_widths
-                    .iter()
-                    .map(|w| w.saturating_sub(1))
-                    .sum();
+                let total_weight: usize = min_word_widths.iter().map(|w| w.saturating_sub(1)).sum();
                 let mut growth = vec![0usize; num_cols];
                 for i in 0..num_cols {
                     let weight = min_word_widths[i].saturating_sub(1);
@@ -867,11 +863,7 @@ impl Markdown {
             .enumerate()
             .map(|(i, text)| Self::wrap_cell_text(text, column_widths[i]))
             .collect();
-        let header_line_count = header_cell_lines
-            .iter()
-            .map(|c| c.len())
-            .max()
-            .unwrap_or(1);
+        let header_line_count = header_cell_lines.iter().map(|c| c.len()).max().unwrap_or(1);
         for line_idx in 0..header_line_count {
             let row_parts: Vec<String> = header_cell_lines
                 .iter()
@@ -941,7 +933,9 @@ impl Markdown {
             return false;
         }
         // Don't add spacing before lists (TS: next !== "list" && next !== "space")
-        matches!(&events[next], Event::Start(Tag::List(_)) | Event::End(_)).then_some(false).unwrap_or(true)
+        matches!(&events[next], Event::Start(Tag::List(_)) | Event::End(_))
+            .then_some(false)
+            .unwrap_or(true)
     }
 
     fn render_list(
@@ -1185,7 +1179,10 @@ fn find_end(events: &[Event<'_>], start: usize, end_tag: TagEnd) -> usize {
                     depth = 1;
                 } else if t.to_end() == end_tag
                     || matches!((t.to_end(), end_tag), (TagEnd::List(_), TagEnd::List(_)))
-                    || matches!((t.to_end(), end_tag), (TagEnd::Heading(_), TagEnd::Heading(_)))
+                    || matches!(
+                        (t.to_end(), end_tag),
+                        (TagEnd::Heading(_), TagEnd::Heading(_))
+                    )
                     || matches!(
                         (t.to_end(), end_tag),
                         (TagEnd::BlockQuote(_), TagEnd::BlockQuote(_))
@@ -1235,17 +1232,19 @@ fn find_end_simple(events: &[Event<'_>], start: usize, end_tag: TagEnd) -> usize
         match e {
             Event::Start(t) => {
                 if (idx == start || same_end_family(t.to_end(), end_tag))
-                    && (idx == start || t.to_end() == end_tag || list_family(t.to_end(), end_tag)) {
-                        depth += 1;
-                    }
+                    && (idx == start || t.to_end() == end_tag || list_family(t.to_end(), end_tag))
+                {
+                    depth += 1;
+                }
             }
             Event::End(t)
-                if (*t == end_tag || list_family(*t, end_tag) || heading_family(*t, end_tag)) => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return idx;
-                    }
+                if (*t == end_tag || list_family(*t, end_tag) || heading_family(*t, end_tag)) =>
+            {
+                depth -= 1;
+                if depth == 0 {
+                    return idx;
                 }
+            }
             _ => {}
         }
     }
@@ -1423,7 +1422,9 @@ mod tests {
             "expected horizontal borders: {lines:?}"
         );
         assert!(
-            lines.iter().any(|l| l.contains('┌') || l.contains('├') || l.contains('└')),
+            lines
+                .iter()
+                .any(|l| l.contains('┌') || l.contains('├') || l.contains('└')),
             "expected box corners: {lines:?}"
         );
     }
@@ -1458,6 +1459,9 @@ mod tests {
             );
         }
         let joined = lines.join(" ");
-        assert!(joined.contains("npm") || joined.contains("install"), "{joined}");
+        assert!(
+            joined.contains("npm") || joined.contains("install"),
+            "{joined}"
+        );
     }
 }

@@ -36,7 +36,11 @@ pub struct CompactionResult {
 
 /// Session-level event stream (19 variants, wire-compatible with pi 0.80.7).
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 #[allow(clippy::large_enum_variant)]
 pub enum AgentSessionEvent {
     AgentStart,

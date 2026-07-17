@@ -2,9 +2,9 @@
 #![allow(dead_code, unused_imports)]
 
 use pi_tui::autocomplete::{
-    AutocompleteItem, AutocompleteProvider, AutocompleteSuggestions, AppliedCompletion,
-    CancellationToken, CombinedAutocompleteProvider, CommandEntry, SlashCommand,
-    SuggestionOptions, SuggestionStart,
+    AppliedCompletion, AutocompleteItem, AutocompleteProvider, AutocompleteSuggestions,
+    CancellationToken, CombinedAutocompleteProvider, CommandEntry, SlashCommand, SuggestionOptions,
+    SuggestionStart,
 };
 use pi_tui::component::Component;
 use pi_tui::components::editor::{
@@ -108,15 +108,16 @@ fn paste_with_marker(editor: &mut Editor<'_>) -> String {
     editor.get_text()
 }
 
-
 #[test]
 fn creates_a_paste_marker_for_large_pastes() {
     let t = tui();
     let mut e = editor(&t);
     let text = paste_with_marker(&mut e);
-    assert!(regex::Regex::new(r"\[paste #\d+ \+\d+ lines\]")
-        .unwrap()
-        .is_match(&text));
+    assert!(
+        regex::Regex::new(r"\[paste #\d+ \+\d+ lines\]")
+            .unwrap()
+            .is_match(&text)
+    );
 }
 
 #[test]
@@ -220,14 +221,25 @@ fn expands_large_pasted_content_literally_in_getexpandedtext() {
     let t = tui();
     let mut e = editor(&t);
     let pasted = [
-        "line 1", "line 2", "line 3", "line 4", "line 5", "line 6", "line 7", "line 8",
-        "line 9", "line 10", "tokens $1 $2 $& $$ $` $' end",
+        "line 1",
+        "line 2",
+        "line 3",
+        "line 4",
+        "line 5",
+        "line 6",
+        "line 7",
+        "line 8",
+        "line 9",
+        "line 10",
+        "tokens $1 $2 $& $$ $` $' end",
     ]
     .join("\n");
     e.handle_input(&format!("\x1b[200~{pasted}\x1b[201~"));
-    assert!(regex::Regex::new(r"\[paste #\d+ \+\d+ lines\]")
-        .unwrap()
-        .is_match(&e.get_text()));
+    assert!(
+        regex::Regex::new(r"\[paste #\d+ \+\d+ lines\]")
+            .unwrap()
+            .is_match(&e.get_text())
+    );
     assert_eq!(e.get_expanded_text(), pasted);
 }
 
@@ -236,8 +248,17 @@ fn submits_large_pasted_content_literally() {
     let t = tui();
     let mut e = editor(&t);
     let pasted = [
-        "line 1", "line 2", "line 3", "line 4", "line 5", "line 6", "line 7", "line 8",
-        "line 9", "line 10", "tokens $1 $2 $& $$ $` $' end",
+        "line 1",
+        "line 2",
+        "line 3",
+        "line 4",
+        "line 5",
+        "line 6",
+        "line 7",
+        "line 8",
+        "line 9",
+        "line 10",
+        "tokens $1 $2 $& $$ $` $' end",
     ]
     .join("\n");
     let submitted = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
@@ -304,10 +325,7 @@ fn handles_multiple_paste_markers_in_same_line() {
     e.handle_input("\x1b[C");
     assert_eq!(e.get_cursor(), (0, markers[0].len() + 1));
     e.handle_input("\x1b[C");
-    assert_eq!(
-        e.get_cursor(),
-        (0, markers[0].len() + 1 + markers[1].len())
-    );
+    assert_eq!(e.get_cursor(), (0, markers[0].len() + 1 + markers[1].len()));
 }
 
 #[test]

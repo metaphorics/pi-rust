@@ -44,10 +44,7 @@ fn wrap_preserves_color_on_cjk() {
         wrapped[0],
         format!("{red}This is an example 中文汉字测试段落内容")
     );
-    assert_eq!(
-        wrapped[1],
-        format!("{red}中文汉字测试段落内容.{reset}")
-    );
+    assert_eq!(wrapped[1], format!("{red}中文汉字测试段落内容.{reset}"));
 }
 
 #[test]
@@ -91,7 +88,11 @@ fn wrap_trailing_whitespace_at_width_1() {
     assert!(!two.is_empty());
     // pi: each resulting line's visible width must be <= 1
     for line in &two {
-        assert!(visible_width(line) <= 1, "line too wide: {line:?} w={}", visible_width(line));
+        assert!(
+            visible_width(line) <= 1,
+            "line too wide: {line:?} w={}",
+            visible_width(line)
+        );
     }
 }
 

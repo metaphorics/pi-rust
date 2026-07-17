@@ -28,67 +28,71 @@ use super::{
 };
 
 fn bedrock_messages(context: &Context) -> Vec<Value> {
-    context.messages.iter().map(|message| match message {
-        Message::User(user) => {
-            let blocks = match &user.content {
-                UserContent::Text(text) => vec![json!({"text":text})],
-                UserContent::Blocks(content) => content
-                    .iter()
-                    .filter_map(|item| match item {
-                        Content::Text(text) => Some(json!({"text":text.text})),
-                        Content::Image(image) => Some(json!({
-                            "image":{
-                                "format":image.mime_type.rsplit('/').next().unwrap_or("png"),
-                                "source":{"bytes":image.data}
+    context
+        .messages
+        .iter()
+        .map(|message| match message {
+            Message::User(user) => {
+                let blocks = match &user.content {
+                    UserContent::Text(text) => vec![json!({"text":text})],
+                    UserContent::Blocks(content) => content
+                        .iter()
+                        .filter_map(|item| match item {
+                            Content::Text(text) => Some(json!({"text":text.text})),
+                            Content::Image(image) => Some(json!({
+                                "image":{
+                                    "format":image.mime_type.rsplit('/').next().unwrap_or("png"),
+                                    "source":{"bytes":image.data}
+                                }
+                            })),
+                            _ => None,
+                        })
+                        .collect(),
+                };
+                json!({"role":"user","content":blocks})
+            }
+            Message::Assistant(assistant) => json!({
+                "role":"assistant",
+                "content": assistant.content.iter().filter_map(|item| match item {
+                    Content::Text(text) => Some(json!({"text":text.text})),
+                    Content::Thinking(thinking) => Some(json!({
+                        "reasoningContent":{
+                            "reasoningText":{
+                                "text":thinking.thinking,
+                                "signature":thinking.thinking_signature
                             }
-                        })),
-                        _ => None,
-                    })
-                    .collect(),
-            };
-            json!({"role":"user","content":blocks})
-        }
-        Message::Assistant(assistant) => json!({
-            "role":"assistant",
-            "content": assistant.content.iter().filter_map(|item| match item {
-                Content::Text(text) => Some(json!({"text":text.text})),
-                Content::Thinking(thinking) => Some(json!({
-                    "reasoningContent":{
-                        "reasoningText":{
-                            "text":thinking.thinking,
-                            "signature":thinking.thinking_signature
                         }
+                    })),
+                    Content::ToolCall(call) => Some(json!({
+                        "toolUse":{
+                            "toolUseId":call.id,
+                            "name":call.name,
+                            "input":call.arguments
+                        }
+                    })),
+                    Content::Image(_) => None,
+                }).collect::<Vec<_>>()
+            }),
+            Message::ToolResult(result) => json!({
+                "role":"user",
+                "content":[{
+                    "toolResult":{
+                        "toolUseId":result.tool_call_id,
+                        "status": if result.is_error {"error"} else {"success"},
+                        "content":[{
+                            "text": result.content.iter().filter_map(|item| {
+                                if let Content::Text(text) = item {
+                                    Some(text.text.as_string())
+                                } else {
+                                    None
+                                }
+                            }).collect::<Vec<_>>().join("\n")
+                        }]
                     }
-                })),
-                Content::ToolCall(call) => Some(json!({
-                    "toolUse":{
-                        "toolUseId":call.id,
-                        "name":call.name,
-                        "input":call.arguments
-                    }
-                })),
-                Content::Image(_) => None,
-            }).collect::<Vec<_>>()
-        }),
-        Message::ToolResult(result) => json!({
-            "role":"user",
-            "content":[{
-                "toolResult":{
-                    "toolUseId":result.tool_call_id,
-                    "status": if result.is_error {"error"} else {"success"},
-                    "content":[{
-                        "text": result.content.iter().filter_map(|item| {
-                            if let Content::Text(text) = item {
-                                Some(text.text.as_string())
-                            } else {
-                                None
-                            }
-                        }).collect::<Vec<_>>().join("\n")
-                    }]
-                }
-            }]
-        }),
-    }).collect()
+                }]
+            }),
+        })
+        .collect()
 }
 
 pub fn build_request_body(model: &Model, context: &Context, options: &StreamOptions) -> Value {
@@ -158,10 +162,7 @@ pub fn build_headers_for_url(
 ) -> Vec<(String, String)> {
     let mut headers = common::merged_headers(model, options);
     headers.push(("content-type".into(), "application/json".into()));
-    headers.push((
-        "accept".into(),
-        "application/vnd.amazon.eventstream".into(),
-    ));
+    headers.push(("accept".into(), "application/vnd.amazon.eventstream".into()));
 
     if let Some(token) = bearer_token(options) {
         headers.push(("authorization".into(), format!("Bearer {token}")));
@@ -232,10 +233,7 @@ fn looks_like_eventstream(bytes: &[u8]) -> bool {
     }
 }
 
-fn decode_eventstream_bytes(
-    bytes: &[u8],
-    model: &Model,
-) -> ApiResult<Vec<AssistantMessageEvent>> {
+fn decode_eventstream_bytes(bytes: &[u8], model: &Model) -> ApiResult<Vec<AssistantMessageEvent>> {
     let mut decoder = EventStreamDecoder::default();
     let messages = decoder.push(bytes)?;
     decoder.finish()?;
@@ -290,7 +288,9 @@ fn spawn_eventstream(
             while let Some(chunk) = response.next().await {
                 let chunk = chunk.map_err(|error| error.to_string())?;
                 if mode.is_none() {
-                    mode = Some(looks_like_eventstream(&chunk) || !chunk.is_empty() && chunk[0] != b'{');
+                    mode = Some(
+                        looks_like_eventstream(&chunk) || !chunk.is_empty() && chunk[0] != b'{',
+                    );
                     // Prefer eventstream when accept header was set and body is binary.
                     if chunk.starts_with(b"{") || chunk.contains(&b'\n') {
                         // Could still be JSONL; re-check with full heuristics.
@@ -394,7 +394,10 @@ pub fn encode_jsonl_as_eventstream(jsonl: &[u8]) -> Result<Vec<u8>, String> {
             .ok_or_else(|| "empty bedrock fixture object".to_owned())?;
         let payload_json = serde_json::to_string(payload)
             .map_err(|error| format!("serialize bedrock payload: {error}"))?;
-        out.extend_from_slice(&aws_eventstream::encode_bedrock_event(event_type, &payload_json)?);
+        out.extend_from_slice(&aws_eventstream::encode_bedrock_event(
+            event_type,
+            &payload_json,
+        )?);
     }
     Ok(out)
 }

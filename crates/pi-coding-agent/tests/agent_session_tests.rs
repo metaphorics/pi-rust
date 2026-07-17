@@ -10,9 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 
-use pi_agent::{
-    AgentMessage, AgentThinkingLevel, AgentToolResult, StreamFn, ToolDefinition,
-};
+use pi_agent::{AgentMessage, AgentThinkingLevel, AgentToolResult, StreamFn, ToolDefinition};
 use pi_ai::{
     AssistantMessage, AssistantMessageEvent, Content, Message, Model, StopReason, TextContent,
     UserContent, UserMessage,
@@ -31,9 +29,7 @@ use pi_coding_agent::session::{
     PromptOptions, PromptTemplate, SessionToolDefinition, StreamingBehavior, convert_to_llm,
 };
 use pi_coding_agent::system_prompt::Skill;
-use pi_coding_agent::{
-    AuthStorage, ModelRegistry, SessionManager, Settings, SettingsManager,
-};
+use pi_coding_agent::{AuthStorage, ModelRegistry, SessionManager, Settings, SettingsManager};
 
 // ============================================================================
 // Fixtures
@@ -209,17 +205,15 @@ fn event_types(events: &[Value]) -> Vec<String> {
 async fn prompt_emits_wire_events_in_order_and_persists_entries() {
     // Build a probe fixture to learn the model, then the real one with a
     // scripted response.
-    let model = tokio::task::spawn_blocking(|| {
-        make_fixture(vec![], FixtureOptions::default()).model
-    })
-    .await
-    .expect("model");
+    let model =
+        tokio::task::spawn_blocking(|| make_fixture(vec![], FixtureOptions::default()).model)
+            .await
+            .expect("model");
     let reply = assistant_text_message(&model, "Hello back");
-    let fixture2 = tokio::task::spawn_blocking(move || {
-        make_fixture(vec![reply], FixtureOptions::default())
-    })
-    .await
-    .expect("fixture");
+    let fixture2 =
+        tokio::task::spawn_blocking(move || make_fixture(vec![reply], FixtureOptions::default()))
+            .await
+            .expect("fixture");
     let session = fixture2.session.clone();
 
     session
@@ -265,10 +259,9 @@ async fn prompt_emits_wire_events_in_order_and_persists_entries() {
     let roles: Vec<String> = entries
         .iter()
         .map(|e| match e {
-            pi_coding_agent::SessionEntry::Message { message, .. } => message["role"]
-                .as_str()
-                .unwrap_or("?")
-                .to_string(),
+            pi_coding_agent::SessionEntry::Message { message, .. } => {
+                message["role"].as_str().unwrap_or("?").to_string()
+            }
             other => panic!("unexpected entry {other:?}"),
         })
         .collect();
@@ -277,7 +270,10 @@ async fn prompt_emits_wire_events_in_order_and_persists_entries() {
     // Agent state mirrors the transcript.
     assert_eq!(session.messages().len(), 2);
     assert!(session.is_idle());
-    assert_eq!(session.get_last_assistant_text().as_deref(), Some("Hello back"));
+    assert_eq!(
+        session.get_last_assistant_text().as_deref(),
+        Some("Hello back")
+    );
 }
 
 // ============================================================================
@@ -300,7 +296,10 @@ fn wire_event_serde_matches_fixtures() {
     .expect("entry");
 
     let cases: Vec<(AgentSessionEvent, Value)> = vec![
-        (AgentSessionEvent::AgentStart, json!({"type": "agent_start"})),
+        (
+            AgentSessionEvent::AgentStart,
+            json!({"type": "agent_start"}),
+        ),
         (
             AgentSessionEvent::AgentEnd {
                 messages: vec![user.clone()],
@@ -710,9 +709,7 @@ fn noop_tool(name: &str) -> SessionToolDefinition {
             execution_mode: None,
             prepare_arguments: None,
             renderer: None,
-            execute: Arc::new(|_, _, _, _| {
-                Box::pin(async { Ok(AgentToolResult::text("ok")) })
-            }),
+            execute: Arc::new(|_, _, _, _| Box::pin(async { Ok(AgentToolResult::text("ok")) })),
         }),
         prompt_snippet: Some(format!("custom {name} snippet")),
         prompt_guidelines: vec![],
@@ -732,7 +729,10 @@ async fn tool_registry_defaults_filters_and_override_position() {
         .into_iter()
         .map(|t| t.name)
         .collect();
-    assert_eq!(names, vec!["read", "bash", "edit", "write", "grep", "find", "ls"]);
+    assert_eq!(
+        names,
+        vec!["read", "bash", "edit", "write", "grep", "find", "ls"]
+    );
     assert_eq!(
         fixture.session.get_active_tool_names(),
         vec!["read", "bash", "edit", "write"]
@@ -776,7 +776,10 @@ async fn tool_registry_defaults_filters_and_override_position() {
         .map(|t| t.name)
         .collect();
     assert_eq!(names, vec!["read", "write"]);
-    assert_eq!(fixture.session.get_active_tool_names(), vec!["read", "write"]);
+    assert_eq!(
+        fixture.session.get_active_tool_names(),
+        vec!["read", "write"]
+    );
 
     // Custom tool overriding a builtin keeps its insertion position; new
     // custom tools append and become active (includeAllExtensionTools).
@@ -795,7 +798,9 @@ async fn tool_registry_defaults_filters_and_override_position() {
     let names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
     assert_eq!(
         names,
-        vec!["read", "bash", "edit", "write", "grep", "find", "ls", "lint"]
+        vec![
+            "read", "bash", "edit", "write", "grep", "find", "ls", "lint"
+        ]
     );
     assert_eq!(tools[0].source, "sdk", "override replaces in place");
     assert_eq!(
@@ -1266,7 +1271,10 @@ async fn runtime_switch_new_and_fork_replace_sessions() {
     assert!(branched_file.exists(), "branch with assistant flushes");
     let entries = branched.with_session_manager(|sm| sm.get_entries());
     assert_eq!(entries.len(), 2);
-    assert!(entries[0].parent_id().as_option().is_none(), "re-chained root");
+    assert!(
+        entries[0].parent_id().as_option().is_none(),
+        "re-chained root"
+    );
     assert_eq!(
         entries[1].parent_id().as_option().map(String::as_str),
         entries[0].id()
@@ -1358,12 +1366,14 @@ async fn tool_loop_second_provider_call_receives_turn_history() {
             let fixture = make_fixture(vec![], options);
             // Call 1: assistant issues a tool call; call 2: plain text.
             let mut tool_call_reply = assistant_text_message(&fixture.model, "calling echo");
-            tool_call_reply.content.push(Content::ToolCall(pi_ai::ToolCall {
-                id: "call-1".to_string(),
-                name: "echo".to_string(),
-                arguments: serde_json::Map::new(),
-                thought_signature: None,
-            }));
+            tool_call_reply
+                .content
+                .push(Content::ToolCall(pi_ai::ToolCall {
+                    id: "call-1".to_string(),
+                    name: "echo".to_string(),
+                    arguments: serde_json::Map::new(),
+                    thought_signature: None,
+                }));
             tool_call_reply.stop_reason = StopReason::ToolUse;
             script.lock().push_back(tool_call_reply);
             script
@@ -1400,10 +1410,7 @@ async fn tool_loop_second_provider_call_receives_turn_history() {
         )),
         "call-2 history carries the original tool call"
     );
-    assert_eq!(
-        session.get_last_assistant_text().as_deref(),
-        Some("done")
-    );
+    assert_eq!(session.get_last_assistant_text().as_deref(), Some("done"));
 }
 
 /// agent_settled listeners must observe an idle session (oracle
@@ -1439,18 +1446,18 @@ async fn agent_settled_listener_observes_idle_session() {
     let listener_prompt_slot = listener_prompt.clone();
     let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let unsubscribe = session.subscribe(Arc::new(move |event: &AgentSessionEvent| {
-        if matches!(event, AgentSessionEvent::AgentSettled)
-            && !fired.swap(true, Ordering::SeqCst)
-        {
+        if matches!(event, AgentSessionEvent::AgentSettled) && !fired.swap(true, Ordering::SeqCst) {
             listener_observed.lock().push(listener_session.is_idle());
             // The user-visible contract: a listener can start the next
             // prompt the moment agent_settled fires.
             let prompt_session = listener_session.clone();
-            listener_prompt_slot.lock().replace(tokio::spawn(async move {
-                prompt_session
-                    .prompt("from listener", PromptOptions::default())
-                    .await
-            }));
+            listener_prompt_slot
+                .lock()
+                .replace(tokio::spawn(async move {
+                    prompt_session
+                        .prompt("from listener", PromptOptions::default())
+                        .await
+                }));
         }
     }));
     std::mem::forget(unsubscribe);
@@ -1562,5 +1569,9 @@ async fn concurrent_prompt_in_preflight_window_gets_verbatim_error() {
     let events = fixture.events.lock().clone();
     let agent_starts = events.iter().filter(|e| e["type"] == "agent_start").count();
     assert_eq!(agent_starts, 1, "exactly one run started");
-    assert_eq!(session.messages().len(), 2, "user 'first' + assistant reply");
+    assert_eq!(
+        session.messages().len(),
+        2,
+        "user 'first' + assistant reply"
+    );
 }

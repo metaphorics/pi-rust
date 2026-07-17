@@ -9,8 +9,8 @@ use std::sync::{
 use parking_lot::Mutex;
 use pi_agent::{
     AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentToolResult, CancellationToken,
-    ToolDefinition, ToolExecutionMode, collecting_sink, identity_convert_to_llm_fn,
-    run_agent_loop, run_agent_loop_continue, text_content,
+    ToolDefinition, ToolExecutionMode, collecting_sink, identity_convert_to_llm_fn, run_agent_loop,
+    run_agent_loop_continue, text_content,
 };
 use pi_ai::{
     Api, AssistantMessage, AssistantMessageEvent, Content, Context, Message, Model, ModelCost,
@@ -47,10 +47,7 @@ fn create_model() -> Model {
     }
 }
 
-fn create_assistant_message(
-    content: Vec<Content>,
-    stop_reason: StopReason,
-) -> AssistantMessage {
+fn create_assistant_message(content: Vec<Content>, stop_reason: StopReason) -> AssistantMessage {
     AssistantMessage {
         content,
         api: Api("openai-responses".into()),
@@ -87,25 +84,17 @@ fn text_block(text: &str) -> Content {
     text_content(text)
 }
 
-fn scripted_stream_fn(
-    scripts: Vec<Vec<AssistantMessageEvent>>,
-) -> pi_agent::StreamFn {
+fn scripted_stream_fn(scripts: Vec<Vec<AssistantMessageEvent>>) -> pi_agent::StreamFn {
     let call_index = Arc::new(AtomicUsize::new(0));
     let scripts = Arc::new(scripts);
     Arc::new(move |_model, _context, _options| {
         let idx = call_index.fetch_add(1, Ordering::SeqCst);
-        let events = scripts
-            .get(idx)
-            .cloned()
-            .unwrap_or_else(|| {
-                vec![AssistantMessageEvent::Done {
-                    reason: StopReason::Stop,
-                    message: create_assistant_message(
-                        vec![text_block("fallback")],
-                        StopReason::Stop,
-                    ),
-                }]
-            });
+        let events = scripts.get(idx).cloned().unwrap_or_else(|| {
+            vec![AssistantMessageEvent::Done {
+                reason: StopReason::Stop,
+                message: create_assistant_message(vec![text_block("fallback")], StopReason::Stop),
+            }]
+        });
         Box::pin(async move {
             let stream = create_assistant_message_event_stream();
             let stream2 = stream.clone();
@@ -132,9 +121,7 @@ fn object_schema(props: Value, required: &[&str]) -> Value {
     })
 }
 
-fn echo_tool(
-    executed: Arc<Mutex<Vec<String>>>,
-) -> Arc<ToolDefinition> {
+fn echo_tool(executed: Arc<Mutex<Vec<String>>>) -> Arc<ToolDefinition> {
     let executed2 = executed.clone();
     Arc::new(ToolDefinition {
         name: "echo".into(),
@@ -349,7 +336,11 @@ async fn handles_tool_calls_and_results() {
 
     assert_eq!(*executed.lock(), vec!["hello".to_string()]);
     let events = events.lock();
-    assert!(events.iter().any(|e| matches!(e, AgentEvent::ToolExecutionStart { .. })));
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ToolExecutionStart { .. }))
+    );
     let tool_end = events
         .iter()
         .find(|e| matches!(e, AgentEvent::ToolExecutionEnd { .. }));
@@ -820,10 +811,7 @@ async fn terminate_true_stops_after_tool_batch() {
     .await;
     assert_eq!(llm_calls.load(Ordering::SeqCst), 1);
     assert_eq!(
-        messages
-            .iter()
-            .map(AgentMessage::role)
-            .collect::<Vec<_>>(),
+        messages.iter().map(AgentMessage::role).collect::<Vec<_>>(),
         vec!["user", "assistant", "toolResult"]
     );
     assert_eq!(
@@ -974,10 +962,7 @@ async fn should_stop_after_turn_exits_before_follow_up() {
     assert_eq!(steering_polls.load(Ordering::SeqCst), 1);
     assert_eq!(follow_up_polls.load(Ordering::SeqCst), 0);
     assert_eq!(
-        messages
-            .iter()
-            .map(AgentMessage::role)
-            .collect::<Vec<_>>(),
+        messages.iter().map(AgentMessage::role).collect::<Vec<_>>(),
         vec!["user", "assistant", "toolResult"]
     );
     assert_eq!(
@@ -1220,11 +1205,7 @@ async fn injects_steering_messages_after_tools() {
 /// Progress tool: emits mid-execute updates via the on_update callback, then
 /// optionally delays so a missing Promise.all-style barrier would let
 /// tool_execution_end race ahead of the update emits.
-fn progress_tool(
-    name: &str,
-    updates: usize,
-    hold_ms: u64,
-) -> Arc<ToolDefinition> {
+fn progress_tool(name: &str, updates: usize, hold_ms: u64) -> Arc<ToolDefinition> {
     let name_owned = name.to_owned();
     Arc::new(ToolDefinition {
         name: name_owned.clone(),

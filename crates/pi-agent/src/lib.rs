@@ -9,7 +9,7 @@ pub mod tools;
 pub mod types;
 
 pub use agent_loop::{
-    collecting_sink, run_agent_loop, run_agent_loop_continue, unavailable_stream_fn, AgentLoopError,
+    AgentLoopError, collecting_sink, run_agent_loop, run_agent_loop_continue, unavailable_stream_fn,
 };
 pub use cancel::CancellationToken;
 pub use tools::{

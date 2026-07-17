@@ -373,8 +373,16 @@ fn empty_filter_array_disables_all_resources() {
     let (_temp, cwd, agent) = fixture();
     let package = cwd.join("pkg-empty-filter");
     fs::create_dir_all(package.join("extensions")).unwrap();
-    fs::write(package.join("extensions/foo.ts"), "export default () => {};").unwrap();
-    fs::write(package.join("extensions/bar.ts"), "export default () => {};").unwrap();
+    fs::write(
+        package.join("extensions/foo.ts"),
+        "export default () => {};",
+    )
+    .unwrap();
+    fs::write(
+        package.join("extensions/bar.ts"),
+        "export default () => {};",
+    )
+    .unwrap();
     let mut settings = Settings::new();
     settings.insert(
         "packages",
@@ -399,7 +407,11 @@ fn empty_filter_array_autoload_false_produces_nothing() {
     let (_temp, cwd, agent) = fixture();
     let package = cwd.join("pkg-delta-empty");
     fs::create_dir_all(package.join("extensions")).unwrap();
-    fs::write(package.join("extensions/foo.ts"), "export default () => {};").unwrap();
+    fs::write(
+        package.join("extensions/foo.ts"),
+        "export default () => {};",
+    )
+    .unwrap();
     let mut settings = Settings::new();
     settings.insert(
         "packages",
@@ -448,9 +460,21 @@ fn layered_manifest_and_user_filters() {
     let (_temp, cwd, agent) = fixture();
     let package = cwd.join("pkg-layered");
     fs::create_dir_all(package.join("extensions")).unwrap();
-    fs::write(package.join("extensions/foo.ts"), "export default () => {};").unwrap();
-    fs::write(package.join("extensions/bar.ts"), "export default () => {};").unwrap();
-    fs::write(package.join("extensions/baz.ts"), "export default () => {};").unwrap();
+    fs::write(
+        package.join("extensions/foo.ts"),
+        "export default () => {};",
+    )
+    .unwrap();
+    fs::write(
+        package.join("extensions/bar.ts"),
+        "export default () => {};",
+    )
+    .unwrap();
+    fs::write(
+        package.join("extensions/baz.ts"),
+        "export default () => {};",
+    )
+    .unwrap();
     fs::write(
         package.join("package.json"),
         serde_json::to_vec_pretty(&json!({

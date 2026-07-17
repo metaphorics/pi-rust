@@ -1,10 +1,12 @@
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Mutex, RwLock};
-use serde::{Deserialize, Serialize};
 
-use pi_ai::auth::{Credential, CredentialStoreError, FileCredentialStore, CredentialStore, ResolveAuthError};
 use crate::resolve_config_value::resolve_config_value;
+use pi_ai::auth::{
+    Credential, CredentialStore, CredentialStoreError, FileCredentialStore, ResolveAuthError,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuthStorageError {
@@ -84,9 +86,18 @@ impl AuthStorage {
     }
 
     /// Set credential for a provider.
-    pub async fn set(&self, provider: &str, credential: Credential) -> Result<(), AuthStorageError> {
+    pub async fn set(
+        &self,
+        provider: &str,
+        credential: Credential,
+    ) -> Result<(), AuthStorageError> {
         let cred = credential.clone();
-        self.store.modify(provider, Box::new(move |_| Box::pin(async move { Ok(Some(cred)) }))).await?;
+        self.store
+            .modify(
+                provider,
+                Box::new(move |_| Box::pin(async move { Ok(Some(cred)) })),
+            )
+            .await?;
         Ok(())
     }
 
@@ -97,7 +108,10 @@ impl AuthStorage {
     }
 
     /// Get provider-scoped environment values for an API key credential.
-    pub async fn get_provider_env(&self, provider: &str) -> Result<Option<HashMap<String, String>>, AuthStorageError> {
+    pub async fn get_provider_env(
+        &self,
+        provider: &str,
+    ) -> Result<Option<HashMap<String, String>>, AuthStorageError> {
         match self.store.read(provider).await? {
             Some(Credential::ApiKey(cred)) => Ok(cred.env),
             _ => Ok(None),
@@ -136,7 +150,10 @@ impl AuthStorage {
             });
         }
 
-        if let Some(first_key) = pi_ai::env_api_keys::find_env_keys(provider, None).as_ref().and_then(|keys| keys.first()) {
+        if let Some(first_key) = pi_ai::env_api_keys::find_env_keys(provider, None)
+            .as_ref()
+            .and_then(|keys| keys.first())
+        {
             return Ok(AuthStatus {
                 configured: false,
                 source: Some("environment".to_string()),
@@ -163,7 +180,10 @@ impl AuthStorage {
     }
 
     pub fn get_errors(&self) -> Vec<String> {
-        self.errors.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
+        self.errors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     fn record_error(&self, error: &impl std::fmt::Display) {
@@ -174,7 +194,11 @@ impl AuthStorage {
     }
 
     /// Get API key for a provider.
-    pub async fn get_api_key(&self, provider_id: &str, include_fallback: bool) -> Result<Option<String>, AuthStorageError> {
+    pub async fn get_api_key(
+        &self,
+        provider_id: &str,
+        include_fallback: bool,
+    ) -> Result<Option<String>, AuthStorageError> {
         if let Some(key) = self.runtime_override(provider_id) {
             return Ok(Some(key));
         }
@@ -191,16 +215,22 @@ impl AuthStorage {
             provider_id,
             oauth.as_deref(),
             ambient_key,
-        ).await {
+        )
+        .await
+        {
             Ok(Some(res)) => res,
             Ok(None) => return Ok(None),
             Err(ResolveAuthError::Store(CredentialStoreError::Update(message))) => {
                 self.record_error(&message);
-                return self.recover_after_oauth_refresh_failure(provider_id, oauth.as_deref()).await;
+                return self
+                    .recover_after_oauth_refresh_failure(provider_id, oauth.as_deref())
+                    .await;
             }
             Err(ResolveAuthError::OAuth(error)) => {
                 self.record_error(&error);
-                return self.recover_after_oauth_refresh_failure(provider_id, oauth.as_deref()).await;
+                return self
+                    .recover_after_oauth_refresh_failure(provider_id, oauth.as_deref())
+                    .await;
             }
             Err(error) => return Err(AuthStorageError::Resolve(error)),
         };

@@ -242,7 +242,6 @@ pub trait AutocompleteProvider {
     }
 }
 
-
 /// Command entry accepted by CombinedAutocompleteProvider.
 #[derive(Debug, Clone)]
 pub enum CommandEntry {

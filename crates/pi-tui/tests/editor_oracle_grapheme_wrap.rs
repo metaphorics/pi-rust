@@ -2,9 +2,9 @@
 #![allow(dead_code, unused_imports)]
 
 use pi_tui::autocomplete::{
-    AutocompleteItem, AutocompleteProvider, AutocompleteSuggestions, AppliedCompletion,
-    CancellationToken, CombinedAutocompleteProvider, CommandEntry, SlashCommand,
-    SuggestionOptions, SuggestionStart,
+    AppliedCompletion, AutocompleteItem, AutocompleteProvider, AutocompleteSuggestions,
+    CancellationToken, CombinedAutocompleteProvider, CommandEntry, SlashCommand, SuggestionOptions,
+    SuggestionStart,
 };
 use pi_tui::component::Component;
 use pi_tui::components::editor::{
@@ -107,7 +107,6 @@ fn paste_with_marker(editor: &mut Editor<'_>) -> String {
     editor.handle_input(&format!("\x1b[200~{big}\x1b[201~"));
     editor.get_text()
 }
-
 
 #[test]
 fn wraps_lines_correctly_when_text_contains_wide_emojis() {

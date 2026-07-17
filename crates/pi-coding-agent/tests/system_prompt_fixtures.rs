@@ -34,12 +34,7 @@ fn sample_skill() -> Skill {
 /// (1) default prompt with tools read/bash/edit/write + snippets.
 #[test]
 fn default_prompt_with_core_tools() {
-    let tools = vec![
-        "read".into(),
-        "bash".into(),
-        "edit".into(),
-        "write".into(),
-    ];
+    let tools = vec!["read".into(), "bash".into(), "edit".into(), "write".into()];
     let opts = BuildSystemPromptOptions {
         selected_tools: Some(tools),
         tool_snippets: default_snippets(),
@@ -81,7 +76,9 @@ Current working directory: C:/work/proj"
     );
 
     assert_eq!(prompt, expected);
-    assert!(prompt.contains("You are an expert coding assistant operating inside pi, a coding agent harness."));
+    assert!(prompt.contains(
+        "You are an expert coding assistant operating inside pi, a coding agent harness."
+    ));
     assert!(prompt.contains("- Be concise in your responses"));
     assert!(prompt.contains("- Show file paths clearly when working with files"));
 }

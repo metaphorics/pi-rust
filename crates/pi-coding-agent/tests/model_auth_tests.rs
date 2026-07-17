@@ -2,16 +2,14 @@ use std::collections::HashMap;
 use std::fs;
 use tempfile::TempDir;
 
-use pi_coding_agent::{
-    AuthStorage, ModelRegistry,
-    ProviderConfigInput, ModelDefinition,
-    clear_config_value_cache,
-};
+use pi_ai::auth::{ApiKeyCredential, Credential, OAuthCredential};
 use pi_coding_agent::resolve_config_value::{
-    resolve_config_value, resolve_config_value_uncached, resolve_config_value_or_throw,
+    resolve_config_value, resolve_config_value_or_throw, resolve_config_value_uncached,
     resolve_headers,
 };
-use pi_ai::auth::{Credential, ApiKeyCredential, OAuthCredential};
+use pi_coding_agent::{
+    AuthStorage, ModelDefinition, ModelRegistry, ProviderConfigInput, clear_config_value_cache,
+};
 
 static ENV_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -58,7 +56,10 @@ async fn test_precedence_and_runtime_overrides() {
     unsafe {
         std::env::remove_var("ANTHROPIC_API_KEY");
     }
-    assert_eq!(auth_storage.get_api_key("anthropic", true).await.unwrap(), None);
+    assert_eq!(
+        auth_storage.get_api_key("anthropic", true).await.unwrap(),
+        None
+    );
 
     // 2. Fallback to Env var
     unsafe {
@@ -69,7 +70,10 @@ async fn test_precedence_and_runtime_overrides() {
         Some("env-key-value".to_string())
     );
     // If include_fallback is false, env should be ignored
-    assert_eq!(auth_storage.get_api_key("anthropic", false).await.unwrap(), None);
+    assert_eq!(
+        auth_storage.get_api_key("anthropic", false).await.unwrap(),
+        None
+    );
 
     // 3. Stored API key (in auth.json) takes precedence over Env var
     let credential = Credential::ApiKey(ApiKeyCredential {
@@ -193,7 +197,9 @@ async fn test_custom_model_decode_and_overrides() {
     let registry = ModelRegistry::create(std::sync::Arc::new(auth_storage), models_json_path);
 
     // 1. Verify custom model is decoded correctly
-    let custom_model = registry.find("custom-ollama", "llama3").expect("should find custom model");
+    let custom_model = registry
+        .find("custom-ollama", "llama3")
+        .expect("should find custom model");
     assert_eq!(custom_model.name, "Llama 3 Custom");
     assert_eq!(custom_model.base_url, "http://localhost:11434");
     assert_eq!(custom_model.api.0, "openai-completions");
@@ -202,7 +208,9 @@ async fn test_custom_model_decode_and_overrides() {
     assert!(custom_model.reasoning);
 
     // 2. Verify model overrides are applied
-    let overridden_model = registry.find("openai", "gpt-4o").expect("should find built-in model");
+    let overridden_model = registry
+        .find("openai", "gpt-4o")
+        .expect("should find built-in model");
     assert_eq!(overridden_model.name, "GPT-4o Overridden");
     assert_eq!(overridden_model.context_window, 250000);
     assert_eq!(overridden_model.cost.input, 1.25);
@@ -320,28 +328,39 @@ async fn test_model_resolution() {
     let registry = ModelRegistry::in_memory(std::sync::Arc::new(auth_storage));
 
     // 1. Resolve exact match
-    let res = registry.resolve(Some("anthropic"), Some("claude-opus-4-8"), None).await;
+    let res = registry
+        .resolve(Some("anthropic"), Some("claude-opus-4-8"), None)
+        .await;
     assert_eq!(res.error, None);
     let matched = res.model.unwrap();
     assert_eq!(matched.provider, "anthropic");
     assert_eq!(matched.id, "claude-opus-4-8");
 
     // 2. Resolve fuzzy match (substring) scoped to provider to avoid collisions
-    let res_fuzzy = registry.resolve(Some("anthropic"), Some("sonnet-5"), None).await;
+    let res_fuzzy = registry
+        .resolve(Some("anthropic"), Some("sonnet-5"), None)
+        .await;
     assert_eq!(res_fuzzy.error, None);
     let matched_fuzzy = res_fuzzy.model.unwrap();
     assert_eq!(matched_fuzzy.id, "claude-sonnet-5");
 
     // 3. Resolve thinking level suffix in model pattern (scoped to provider)
-    let res_thinking = registry.resolve(Some("anthropic"), Some("claude-opus-4-8:high"), None).await;
+    let res_thinking = registry
+        .resolve(Some("anthropic"), Some("claude-opus-4-8:high"), None)
+        .await;
     assert_eq!(res_thinking.error, None);
-    assert_eq!(res_thinking.thinking_level, Some(pi_ai::types::ModelThinkingLevel::High));
+    assert_eq!(
+        res_thinking.thinking_level,
+        Some(pi_ai::types::ModelThinkingLevel::High)
+    );
     assert_eq!(res_thinking.model.unwrap().id, "claude-opus-4-8");
 
     // 3b. Test all thinking levels resolve correctly
     for level_str in &["off", "minimal", "low", "medium", "high", "xhigh", "max"] {
         let pattern = format!("claude-opus-4-8:{}", level_str);
-        let res_lvl = registry.resolve(Some("anthropic"), Some(&pattern), None).await;
+        let res_lvl = registry
+            .resolve(Some("anthropic"), Some(&pattern), None)
+            .await;
         assert_eq!(res_lvl.error, None);
         let expected_lvl = match *level_str {
             "off" => pi_ai::types::ModelThinkingLevel::Off,
@@ -357,7 +376,9 @@ async fn test_model_resolution() {
     }
 
     // 4. Fallback custom model when not found but provider is valid
-    let res_fallback = registry.resolve(Some("openai"), Some("gpt-nonexistent"), None).await;
+    let res_fallback = registry
+        .resolve(Some("openai"), Some("gpt-nonexistent"), None)
+        .await;
     assert_eq!(res_fallback.error, None);
     let fallback = res_fallback.model.unwrap();
     assert_eq!(fallback.provider, "openai");
@@ -365,11 +386,20 @@ async fn test_model_resolution() {
     assert!(res_fallback.warning.unwrap().contains("gpt-nonexistent"));
 
     // 5. Unknown provider error
-    let res_unknown_provider = registry.resolve(Some("invalid-provider"), Some("llama3"), None).await;
-    assert!(res_unknown_provider.error.unwrap().contains("Unknown provider"));
+    let res_unknown_provider = registry
+        .resolve(Some("invalid-provider"), Some("llama3"), None)
+        .await;
+    assert!(
+        res_unknown_provider
+            .error
+            .unwrap()
+            .contains("Unknown provider")
+    );
 
     // 6. Unknown model error (when provider not matched/inferred)
-    let res_unknown_model = registry.resolve(None, Some("nonexistent-model-completely-random"), None).await;
+    let res_unknown_model = registry
+        .resolve(None, Some("nonexistent-model-completely-random"), None)
+        .await;
     assert!(res_unknown_model.error.unwrap().contains("not found"));
 
     // 7. Resolve Unicode model ID
@@ -397,10 +427,15 @@ async fn test_model_resolution() {
         }]),
     };
 
-    let mut registry_with_unicode = ModelRegistry::in_memory(std::sync::Arc::new(AuthStorage::new(auth_path.clone())));
-    registry_with_unicode.register_provider("custom-korean".to_string(), custom_config).unwrap();
+    let mut registry_with_unicode =
+        ModelRegistry::in_memory(std::sync::Arc::new(AuthStorage::new(auth_path.clone())));
+    registry_with_unicode
+        .register_provider("custom-korean".to_string(), custom_config)
+        .unwrap();
 
-    let res_unicode = registry_with_unicode.resolve(Some("custom-korean"), Some("모델-id-🚀"), None).await;
+    let res_unicode = registry_with_unicode
+        .resolve(Some("custom-korean"), Some("모델-id-🚀"), None)
+        .await;
     assert_eq!(res_unicode.error, None);
     let matched_unicode = res_unicode.model.unwrap();
     assert_eq!(matched_unicode.id, "모델-id-🚀");
@@ -430,9 +465,17 @@ async fn test_custom_model_rejections() {
     }"#;
 
     fs::write(&models_json_path, content_invalid_oauth).unwrap();
-    let registry = ModelRegistry::create(std::sync::Arc::new(AuthStorage::new(auth_path.clone())), models_json_path.clone());
+    let registry = ModelRegistry::create(
+        std::sync::Arc::new(AuthStorage::new(auth_path.clone())),
+        models_json_path.clone(),
+    );
     assert!(registry.get_error().is_some());
-    assert!(registry.get_error().unwrap().contains("unknown variant `invalid_oauth_type`"));
+    assert!(
+        registry
+            .get_error()
+            .unwrap()
+            .contains("unknown variant `invalid_oauth_type`")
+    );
 
     // 2. Partial/incomplete cost configuration in custom model definition (missing output)
     // 2. Partial/incomplete cost configuration in custom model definition (missing output)
@@ -455,9 +498,17 @@ async fn test_custom_model_rejections() {
     }"#;
 
     fs::write(&models_json_path, content_partial_cost).unwrap();
-    let registry2 = ModelRegistry::create(std::sync::Arc::new(AuthStorage::new(auth_path.clone())), models_json_path.clone());
+    let registry2 = ModelRegistry::create(
+        std::sync::Arc::new(AuthStorage::new(auth_path.clone())),
+        models_json_path.clone(),
+    );
     assert!(registry2.get_error().is_some());
-    assert!(registry2.get_error().unwrap().contains("missing field `output`"));
+    assert!(
+        registry2
+            .get_error()
+            .unwrap()
+            .contains("missing field `output`")
+    );
 
     // 3. Block comments /* ... */ are not stripped and fail to parse
     let content_block_comment = r#"{
@@ -476,9 +527,11 @@ async fn test_custom_model_rejections() {
     }"#;
 
     fs::write(&models_json_path, content_block_comment).unwrap();
-    let registry3 = ModelRegistry::create(std::sync::Arc::new(AuthStorage::new(auth_path)), models_json_path);
+    let registry3 = ModelRegistry::create(
+        std::sync::Arc::new(AuthStorage::new(auth_path)),
+        models_json_path,
+    );
     assert!(registry3.get_error().is_some());
-
 }
 
 #[tokio::test]
@@ -553,13 +606,18 @@ fn oauth_credential(access: &str, expires: i64, extra: serde_json::Value) -> Cre
         access: access.to_owned(),
         refresh: "refresh-token".to_owned(),
         expires,
-        extra: extra.as_object().expect("OAuth extra must be an object").iter()
-            .map(|(key, value)| (key.clone(), value.clone())).collect(),
+        extra: extra
+            .as_object()
+            .expect("OAuth extra must be an object")
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
     })
 }
 
 fn write_credentials(path: &std::path::Path, credentials: &[(&str, Credential)]) {
-    let values = credentials.iter()
+    let values = credentials
+        .iter()
         .map(|(provider, credential)| ((*provider).to_owned(), credential.clone()))
         .collect::<HashMap<_, _>>();
     fs::write(path, serde_json::to_vec_pretty(&values).unwrap()).unwrap();
@@ -572,10 +630,16 @@ fn oauth_credentials_transform_builtin_catalogs_after_merge() {
     let models_path = temp_dir.path().join("models.json");
     fs::write(&models_path, r#"{"providers": {}}"#).unwrap();
 
-    let baseline = ModelRegistry::create(std::sync::Arc::new(AuthStorage::new(auth_path.clone())), models_path.clone());
-    let copilot_ids = baseline.get_all().iter()
+    let baseline = ModelRegistry::create(
+        std::sync::Arc::new(AuthStorage::new(auth_path.clone())),
+        models_path.clone(),
+    );
+    let copilot_ids = baseline
+        .get_all()
+        .iter()
         .filter(|model| model.provider == "github-copilot")
-        .map(|model| model.id.clone()).collect::<Vec<_>>();
+        .map(|model| model.id.clone())
+        .collect::<Vec<_>>();
     assert!(copilot_ids.len() > 1);
     let kept_copilot_id = copilot_ids[0].clone();
 
@@ -588,17 +652,34 @@ fn oauth_credentials_transform_builtin_catalogs_after_merge() {
     let copilot_extra = serde_json::json!({
         "enterpriseUrl": "ghe.example.com", "availableModelIds": [kept_copilot_id]
     });
-    write_credentials(&auth_path, &[
-        ("radius", oauth_credential("radius-token", i64::MAX, radius_extra)),
-        ("github-copilot", oauth_credential("copilot-token", i64::MAX, copilot_extra)),
-    ]);
+    write_credentials(
+        &auth_path,
+        &[
+            (
+                "radius",
+                oauth_credential("radius-token", i64::MAX, radius_extra),
+            ),
+            (
+                "github-copilot",
+                oauth_credential("copilot-token", i64::MAX, copilot_extra),
+            ),
+        ],
+    );
 
-    let registry = ModelRegistry::create(std::sync::Arc::new(AuthStorage::new(auth_path)), models_path);
-    let radius = registry.find("radius", "radius-dynamic").expect("Radius catalog model");
+    let registry = ModelRegistry::create(
+        std::sync::Arc::new(AuthStorage::new(auth_path)),
+        models_path,
+    );
+    let radius = registry
+        .find("radius", "radius-dynamic")
+        .expect("Radius catalog model");
     assert_eq!(radius.api.as_ref(), "pi-messages");
     assert_eq!(radius.base_url, "https://radius.example/v1");
-    let copilot = registry.get_all().iter()
-        .filter(|model| model.provider == "github-copilot").collect::<Vec<_>>();
+    let copilot = registry
+        .get_all()
+        .iter()
+        .filter(|model| model.provider == "github-copilot")
+        .collect::<Vec<_>>();
     assert_eq!(copilot.len(), 1);
     assert_eq!(copilot[0].id, copilot_ids[0]);
     assert_eq!(copilot[0].base_url, "https://copilot-api.ghe.example.com");
@@ -609,20 +690,37 @@ fn custom_radius_oauth_registers_before_catalog_mutation() {
     let temp_dir = TempDir::new().unwrap();
     let auth_path = temp_dir.path().join("auth.json");
     let models_path = temp_dir.path().join("models.json");
-    fs::write(&models_path, r#"{"providers":{"radius-corp":{
+    fs::write(
+        &models_path,
+        r#"{"providers":{"radius-corp":{
         "name":"Corporate Radius","baseUrl":"https://gateway.example/v1","oauth":"radius"
-    }}}"#).unwrap();
-    write_credentials(&auth_path, &[("radius-corp", oauth_credential("corp-token", i64::MAX,
-        serde_json::json!({"gatewayConfig": {"baseUrl": "https://gateway.example/v1", "models": [{
-            "id": "corp-model", "name": "Corp Model", "reasoning": false, "input": ["text", "image"],
-            "cost": {"input": 0.1, "output": 0.2, "cacheRead": 0.0, "cacheWrite": 0.0},
-            "contextWindow": 32000, "maxTokens": 2048
-        }]}})
-    ))]);
+    }}}"#,
+    )
+    .unwrap();
+    write_credentials(
+        &auth_path,
+        &[(
+            "radius-corp",
+            oauth_credential(
+                "corp-token",
+                i64::MAX,
+                serde_json::json!({"gatewayConfig": {"baseUrl": "https://gateway.example/v1", "models": [{
+                    "id": "corp-model", "name": "Corp Model", "reasoning": false, "input": ["text", "image"],
+                    "cost": {"input": 0.1, "output": 0.2, "cacheRead": 0.0, "cacheWrite": 0.0},
+                    "contextWindow": 32000, "maxTokens": 2048
+                }]}}),
+            ),
+        )],
+    );
 
-    let registry = ModelRegistry::create(std::sync::Arc::new(AuthStorage::new(auth_path)), models_path);
+    let registry = ModelRegistry::create(
+        std::sync::Arc::new(AuthStorage::new(auth_path)),
+        models_path,
+    );
     assert!(pi_ai::oauth::get_oauth_login_provider("radius-corp").is_some());
-    let model = registry.find("radius-corp", "corp-model").expect("custom Radius catalog model");
+    let model = registry
+        .find("radius-corp", "corp-model")
+        .expect("custom Radius catalog model");
     assert_eq!(model.base_url, "https://gateway.example/v1");
     assert_eq!(model.provider, "radius-corp");
 }
@@ -634,16 +732,27 @@ async fn oauth_refresh_failure_is_recorded_and_returns_unavailable() {
     let provider_id = "radius-refresh-soft-fail";
     let provider = std::sync::Arc::new(pi_ai::oauth::radius::create_radius_oauth_provider(
         pi_ai::oauth::radius::RadiusOAuthProviderOptions {
-            id: provider_id.to_owned(), name: "Refresh failure".to_owned(), gateway: "http://127.0.0.1:9".to_owned(),
+            id: provider_id.to_owned(),
+            name: "Refresh failure".to_owned(),
+            gateway: "http://127.0.0.1:9".to_owned(),
         },
     ));
     pi_ai::oauth::register_oauth_login_provider(provider_id, provider);
-    write_credentials(&auth_path, &[(provider_id, oauth_credential("expired", 0, serde_json::json!({})))]);
+    write_credentials(
+        &auth_path,
+        &[(
+            provider_id,
+            oauth_credential("expired", 0, serde_json::json!({})),
+        )],
+    );
 
     let storage = AuthStorage::new(auth_path);
     assert_eq!(storage.get_api_key(provider_id, false).await.unwrap(), None);
     assert!(!storage.get_errors().is_empty());
-    assert!(matches!(storage.get(provider_id).await.unwrap(), Some(Credential::OAuth(_))));
+    assert!(matches!(
+        storage.get(provider_id).await.unwrap(),
+        Some(Credential::OAuth(_))
+    ));
 }
 
 #[tokio::test]
@@ -660,21 +769,36 @@ async fn oauth_refresh_failure_reloads_a_concurrently_refreshed_credential() {
         let (mut stream, _) = listener.accept().unwrap();
         let mut request = [0_u8; 4096];
         let _ = stream.read(&mut request).unwrap();
-        write_credentials(&refreshed_auth_path, &[(
-            provider_id, oauth_credential("fresh-access", i64::MAX, serde_json::json!({})),
-        )]);
+        write_credentials(
+            &refreshed_auth_path,
+            &[(
+                provider_id,
+                oauth_credential("fresh-access", i64::MAX, serde_json::json!({})),
+            )],
+        );
         stream.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
     });
     let provider = std::sync::Arc::new(pi_ai::oauth::radius::create_radius_oauth_provider(
         pi_ai::oauth::radius::RadiusOAuthProviderOptions {
-            id: provider_id.to_owned(), name: "Refresh race".to_owned(), gateway,
+            id: provider_id.to_owned(),
+            name: "Refresh race".to_owned(),
+            gateway,
         },
     ));
     pi_ai::oauth::register_oauth_login_provider(provider_id, provider);
-    write_credentials(&auth_path, &[(provider_id, oauth_credential("expired", 0, serde_json::json!({})))]);
+    write_credentials(
+        &auth_path,
+        &[(
+            provider_id,
+            oauth_credential("expired", 0, serde_json::json!({})),
+        )],
+    );
 
     let storage = AuthStorage::new(auth_path);
-    assert_eq!(storage.get_api_key(provider_id, false).await.unwrap(), Some("fresh-access".to_owned()));
+    assert_eq!(
+        storage.get_api_key(provider_id, false).await.unwrap(),
+        Some("fresh-access".to_owned())
+    );
     assert!(!storage.get_errors().is_empty());
     server.join().unwrap();
 }
@@ -687,8 +811,14 @@ fn model_overrides_ignore_unsupported_transport_fields() {
 
     // Build baseline registry first to get the default model definition.
     let baseline_path = temp_dir.path().join("empty.json");
-    let baseline = ModelRegistry::create(std::sync::Arc::new(AuthStorage::new(auth_path.clone())), baseline_path);
-    let original_model = baseline.find("openai", "gpt-4o").expect("should find default gpt-4o").clone();
+    let baseline = ModelRegistry::create(
+        std::sync::Arc::new(AuthStorage::new(auth_path.clone())),
+        baseline_path,
+    );
+    let original_model = baseline
+        .find("openai", "gpt-4o")
+        .expect("should find default gpt-4o")
+        .clone();
 
     // Write a models.json containing unknown/unsupported fields in modelOverrides.
     // Also include a valid override field (like name) to prove it still applies.
@@ -707,7 +837,10 @@ fn model_overrides_ignore_unsupported_transport_fields() {
     }"#;
     fs::write(&models_path, config_content).unwrap();
 
-    let registry = ModelRegistry::create(std::sync::Arc::new(AuthStorage::new(auth_path)), models_path);
+    let registry = ModelRegistry::create(
+        std::sync::Arc::new(AuthStorage::new(auth_path)),
+        models_path,
+    );
 
     // Validation must pass, get_error() must be None
     assert!(
@@ -717,7 +850,9 @@ fn model_overrides_ignore_unsupported_transport_fields() {
     );
 
     // Valid override (name) must be applied
-    let overridden_model = registry.find("openai", "gpt-4o").expect("should find gpt-4o");
+    let overridden_model = registry
+        .find("openai", "gpt-4o")
+        .expect("should find gpt-4o");
     assert_eq!(overridden_model.name, "GPT-4o Inert Override");
 
     // Inert fields (api, baseUrl) must NOT alter the model's api or base_url

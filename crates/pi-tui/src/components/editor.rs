@@ -245,9 +245,25 @@ struct PendingAutocomplete {
     started: bool,
 }
 
+/// How the editor reaches its host TUI: borrowed (tests, embedding hosts) or
+/// shared ownership (long-lived component trees; see [`Editor::with_shared_tui`]).
+enum TuiHandle<'a> {
+    Borrowed(&'a dyn EditorTui),
+    Shared(std::rc::Rc<dyn EditorTui>),
+}
+
+impl TuiHandle<'_> {
+    fn get(&self) -> &dyn EditorTui {
+        match self {
+            TuiHandle::Borrowed(t) => *t,
+            TuiHandle::Shared(rc) => rc.as_ref(),
+        }
+    }
+}
+
 /// Grapheme-aware multiline terminal editor.
 pub struct Editor<'a> {
-    tui: &'a dyn EditorTui,
+    tui: TuiHandle<'a>,
     state: State,
     focused: bool,
     padding_x: usize,
@@ -289,9 +305,21 @@ impl<'a> Editor<'a> {
     }
     pub fn with_options(
         tui: &'a dyn EditorTui,
-        _theme: EditorTheme,
+        theme: EditorTheme,
         options: EditorOptions,
     ) -> Self {
+        Self::with_tui_handle(TuiHandle::Borrowed(tui), theme, options)
+    }
+    /// Construct an editor that co-owns its host handle, freeing the editor
+    /// from the host's lifetime (mountable in a `'static` component tree).
+    pub fn with_shared_tui(
+        tui: std::rc::Rc<dyn EditorTui>,
+        theme: EditorTheme,
+        options: EditorOptions,
+    ) -> Editor<'static> {
+        Editor::with_tui_handle(TuiHandle::Shared(tui), theme, options)
+    }
+    fn with_tui_handle(tui: TuiHandle<'a>, _theme: EditorTheme, options: EditorOptions) -> Self {
         Self {
             tui,
             state: State {
@@ -411,7 +439,15 @@ impl<'a> Editor<'a> {
     }
     pub fn set_padding_x(&mut self, x: usize) {
         self.padding_x = x;
-        self.tui.request_render();
+        self.tui.get().request_render();
+    }
+
+    pub fn set_autocomplete_max_visible(&mut self, max_visible: usize) {
+        self.autocomplete_max_visible = max_visible.clamp(3, 20);
+        if self.autocomplete.is_some() {
+            self.cancel_autocomplete();
+        }
+        self.tui.get().request_render();
     }
 
     fn line(&self) -> &str {
@@ -430,7 +466,7 @@ impl<'a> Editor<'a> {
         if let Some(cb) = &mut self.on_change {
             cb(text);
         }
-        self.tui.request_render();
+        self.tui.get().request_render();
     }
     fn exit_history(&mut self) {
         self.history_index = -1;
@@ -798,7 +834,8 @@ impl<'a> Editor<'a> {
         let prefix = self.state.lines[start_line]
             [..utf16_to_byte(&self.state.lines[start_line], start_col)]
             .to_owned();
-        let suffix = self.state.lines[end_line][utf16_to_byte(&self.state.lines[end_line], end_col)..]
+        let suffix = self.state.lines[end_line]
+            [utf16_to_byte(&self.state.lines[end_line], end_col)..]
             .to_owned();
         self.state
             .lines
@@ -880,7 +917,7 @@ impl<'a> Editor<'a> {
     }
     fn page_scroll(&mut self, down: bool) {
         self.last_action = None;
-        let rows = self.tui.terminal_rows() as usize;
+        let rows = self.tui.get().terminal_rows() as usize;
         let page = (rows * 3 / 10).max(5);
         let visual_lines = self.build_visual_line_map(self.last_width);
         if visual_lines.is_empty() {
@@ -1289,7 +1326,11 @@ impl<'a> Editor<'a> {
                             {
                                 return;
                             }
-                            self.apply_suggestion_result(result, pending.force, pending.explicit_tab);
+                            self.apply_suggestion_result(
+                                result,
+                                pending.force,
+                                pending.explicit_tab,
+                            );
                         }
                         Err(std::sync::mpsc::TryRecvError::Empty) => {
                             // Still waiting; nothing else to do.
@@ -1378,12 +1419,12 @@ impl<'a> Editor<'a> {
     ) {
         let Some(s) = result else {
             self.cancel_autocomplete();
-            self.tui.request_render();
+            self.tui.get().request_render();
             return;
         };
         if s.items.is_empty() {
             self.cancel_autocomplete();
-            self.tui.request_render();
+            self.tui.get().request_render();
             return;
         }
         if force && explicit_tab && s.items.len() == 1 {
@@ -1423,7 +1464,7 @@ impl<'a> Editor<'a> {
         self.autocomplete = Some(list);
         self.autocomplete_prefix = s.prefix;
         self.autocomplete_force = force;
-        self.tui.request_render();
+        self.tui.get().request_render();
     }
     fn apply_completion(&mut self, item: &AutocompleteItem, prefix: &str) {
         let Some(provider) = self.provider.as_ref() else {
@@ -1573,14 +1614,14 @@ impl<'a> Editor<'a> {
         } else if self.autocomplete.is_some() && kb.matches(data, "tui.select.cancel") {
             self.cancel_autocomplete_request();
             self.cancel_autocomplete();
-            self.tui.request_render();
+            self.tui.get().request_render();
         } else if self.autocomplete.is_some()
             && (kb.matches(data, "tui.select.up") || kb.matches(data, "tui.select.down"))
         {
             if let Some(list) = self.autocomplete.as_mut() {
                 list.handle_input(data);
             }
-            self.tui.request_render();
+            self.tui.get().request_render();
         } else if kb.matches(data, "tui.input.tab") {
             if let Some(list) = &self.autocomplete {
                 if let Some(selected) = list.get_selected_item() {
@@ -1601,16 +1642,16 @@ impl<'a> Editor<'a> {
             if let Some(list) = &self.autocomplete
                 && let Some(selected) = list.get_selected_item()
             {
-                    let item = AutocompleteItem {
-                        value: selected.value.clone(),
-                        label: selected.label.clone(),
-                        description: selected.description.clone(),
-                    };
-                    let prefix = self.autocomplete_prefix.clone();
-                    self.apply_completion(&item, &prefix);
-                    if is_slash {
-                        self.submit();
-                    }
+                let item = AutocompleteItem {
+                    value: selected.value.clone(),
+                    label: selected.label.clone(),
+                    description: selected.description.clone(),
+                };
+                let prefix = self.autocomplete_prefix.clone();
+                self.apply_completion(&item, &prefix);
+                if is_slash {
+                    self.submit();
+                }
             }
         } else if kb.matches(data, "tui.input.newLine") {
             self.newline();

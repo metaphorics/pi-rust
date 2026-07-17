@@ -160,7 +160,7 @@ impl Line {
             .position(|c| c.token.code == CURSOR_MARKER)?;
         let index = self.controls[pos].index;
         self.controls.remove(pos);
-                let mut prefix = String::new();
+        let mut prefix = String::new();
         for cell in self.cells.iter().take(index) {
             prefix.push_str(&cell.value);
         }

@@ -1,9 +1,10 @@
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::process::Command;
 use std::sync::LazyLock;
-use parking_lot::Mutex;
 
-static COMMAND_CACHE: LazyLock<Mutex<HashMap<String, Option<String>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static COMMAND_CACHE: LazyLock<Mutex<HashMap<String, Option<String>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Clear the command execution cache.
 pub fn clear_config_value_cache() {
@@ -19,7 +20,9 @@ fn execute_command(command: &str) -> Option<String> {
 
     let result = execute_command_uncached(command);
 
-    COMMAND_CACHE.lock().insert(command.to_string(), result.clone());
+    COMMAND_CACHE
+        .lock()
+        .insert(command.to_string(), result.clone());
     result
 }
 
@@ -33,13 +36,9 @@ fn execute_command_uncached(command: &str) -> Option<String> {
     };
 
     let output = if cfg!(target_os = "windows") {
-        Command::new("cmd")
-            .args(["/C", cmd])
-            .output()
+        Command::new("cmd").args(["/C", cmd]).output()
     } else {
-        Command::new("/bin/sh")
-            .args(["-c", cmd])
-            .output()
+        Command::new("/bin/sh").args(["-c", cmd]).output()
     };
 
     match output {
@@ -155,7 +154,10 @@ pub fn resolve_config_value(config: &str, env: Option<&HashMap<String, String>>)
 }
 
 /// Resolve a configuration value without caching.
-pub fn resolve_config_value_uncached(config: &str, env: Option<&HashMap<String, String>>) -> Option<String> {
+pub fn resolve_config_value_uncached(
+    config: &str,
+    env: Option<&HashMap<String, String>>,
+) -> Option<String> {
     if config.starts_with('!') {
         return execute_command_uncached(config);
     }
@@ -173,15 +175,25 @@ pub fn resolve_config_value_or_throw(
     }
 
     if let Some(stripped) = config.strip_prefix('!') {
-        return Err(format!("Failed to resolve {} from shell command: {}", description, stripped));
+        return Err(format!(
+            "Failed to resolve {} from shell command: {}",
+            description, stripped
+        ));
     }
 
     let missing = get_missing_config_value_env_var_names(config, env);
     if missing.len() == 1 {
-        return Err(format!("Failed to resolve {} from environment variable: {}", description, missing[0]));
+        return Err(format!(
+            "Failed to resolve {} from environment variable: {}",
+            description, missing[0]
+        ));
     }
     if missing.len() > 1 {
-        return Err(format!("Failed to resolve {} from environment variables: {}", description, missing.join(", ")));
+        return Err(format!(
+            "Failed to resolve {} from environment variables: {}",
+            description,
+            missing.join(", ")
+        ));
     }
 
     Err(format!("Failed to resolve {}", description))
@@ -247,7 +259,10 @@ pub fn get_config_value_env_var_names(config: &str) -> Vec<String> {
 }
 
 /// Get missing referenced environment variable names.
-pub fn get_missing_config_value_env_var_names(config: &str, env: Option<&HashMap<String, String>>) -> Vec<String> {
+pub fn get_missing_config_value_env_var_names(
+    config: &str,
+    env: Option<&HashMap<String, String>>,
+) -> Vec<String> {
     get_config_value_env_var_names(config)
         .into_iter()
         .filter(|name| get_env_var(name, env).is_none())
@@ -289,7 +304,8 @@ pub fn resolve_headers_or_throw(
     };
     let mut resolved = HashMap::new();
     for (k, v) in headers {
-        let resolved_val = resolve_config_value_or_throw(v, &format!("{} header \"{}\"", description, k), env)?;
+        let resolved_val =
+            resolve_config_value_or_throw(v, &format!("{} header \"{}\"", description, k), env)?;
         resolved.insert(k.clone(), resolved_val);
     }
     if resolved.is_empty() {

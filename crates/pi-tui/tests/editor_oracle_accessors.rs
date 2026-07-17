@@ -2,9 +2,9 @@
 #![allow(dead_code, unused_imports)]
 
 use pi_tui::autocomplete::{
-    AutocompleteItem, AutocompleteProvider, AutocompleteSuggestions, AppliedCompletion,
-    CancellationToken, CombinedAutocompleteProvider, CommandEntry, SlashCommand,
-    SuggestionOptions, SuggestionStart,
+    AppliedCompletion, AutocompleteItem, AutocompleteProvider, AutocompleteSuggestions,
+    CancellationToken, CombinedAutocompleteProvider, CommandEntry, SlashCommand, SuggestionOptions,
+    SuggestionStart,
 };
 use pi_tui::component::Component;
 use pi_tui::components::editor::{
@@ -108,7 +108,6 @@ fn paste_with_marker(editor: &mut Editor<'_>) -> String {
     editor.get_text()
 }
 
-
 #[test]
 fn returns_cursor_position() {
     let t = tui();
@@ -124,8 +123,10 @@ fn returns_cursor_position() {
 fn returns_lines_as_a_defensive_copy() {
     let t = tui();
     let mut e = editor(&t);
-    e.set_text("a
-b");
+    e.set_text(
+        "a
+b",
+    );
     let mut lines = e.get_lines();
     assert_eq!(lines, vec!["a".to_string(), "b".to_string()]);
     lines[0] = "x".into();

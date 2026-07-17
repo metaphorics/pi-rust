@@ -1,7 +1,7 @@
 //! Global keybinding registry — port of packages/tui/src/keybindings.ts.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use crate::keys::matches_key;
 
@@ -274,11 +274,12 @@ impl KeybindingsManager {
     }
 }
 
-static GLOBAL_KEYBINDINGS: LazyLock<Mutex<KeybindingsManager>> =
-    LazyLock::new(|| Mutex::new(KeybindingsManager::with_defaults()));
+static GLOBAL_KEYBINDINGS: LazyLock<Mutex<Arc<KeybindingsManager>>> =
+    LazyLock::new(|| Mutex::new(Arc::new(KeybindingsManager::with_defaults())));
 
 /// Replace the process-global keybindings manager.
 pub fn set_keybindings(keybindings: KeybindingsManager) {
+    let keybindings = Arc::new(keybindings);
     match GLOBAL_KEYBINDINGS.lock() {
         Ok(mut guard) => {
             *guard = keybindings;
@@ -290,11 +291,16 @@ pub fn set_keybindings(keybindings: KeybindingsManager) {
     }
 }
 
-/// Process-global keybindings manager (creates defaults on first use).
-pub fn get_keybindings() -> std::sync::MutexGuard<'static, KeybindingsManager> {
+/// Process-global keybindings manager snapshot (creates defaults on first
+/// use).
+///
+/// Returned as an `Arc` snapshot — never a held guard — so nested
+/// `handle_input` chains (SettingsList search → Input, Editor autocomplete →
+/// SelectList) cannot deadlock on the registry lock.
+pub fn get_keybindings() -> Arc<KeybindingsManager> {
     match GLOBAL_KEYBINDINGS.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
+        Ok(guard) => Arc::clone(&guard),
+        Err(poisoned) => Arc::clone(&poisoned.into_inner()),
     }
 }
 
