@@ -46,9 +46,9 @@ pub use export_html::{
 };
 pub use extension_bridge::{
     BeforeCompactDecision, CompactHooks, CompactionOverride, DiscoveredExtensions, ExtensionBridge,
-    ExtensionUiHost, ForkPosition, HookOutcome, NoopExtensionBridge, NotifyType, RegisteredCommand,
-    SessionLifecycleEvent, SessionShutdownReason, SessionStartReason, UiDialogOptions,
-    WidgetPlacement,
+    ExtensionUiHost, ForkPosition, HookOutcome, MessageHooks, NoopExtensionBridge, NotifyType,
+    RegisteredCommand, SessionLifecycleEvent, SessionShutdownReason, SessionStartReason,
+    ThemeCatalogItem, UiDialogOptions, WidgetPlacement,
 };
 pub use extensions::actions::{ActionServerConfig, HostActions, NotificationSink};
 pub use extensions::binding::{
@@ -57,6 +57,9 @@ pub use extensions::binding::{
 pub use extensions::events::{
     DEFAULT_HOOK_TIMEOUT, EmitError, EventForwarder, ExtensionErrorSink, StateOverlay, StateSource,
     agent_thinking_level, session_state_block, wire_thinking_level,
+};
+pub use extensions::frames::{
+    BridgedLeaf, FrameHub, HubEvent, SlotSnapshot, UiOutbound, UiOutboundSender, noop_outbound,
 };
 pub use extensions::session_sync::{SessionSync, session_file_string};
 pub use extensions::{

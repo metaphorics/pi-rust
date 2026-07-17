@@ -118,6 +118,14 @@ pub struct UiDialogOptions {
     pub signal: Option<CancellationToken>,
 }
 
+/// Theme catalog entry served to `ui/getAllThemes` (`path: None` = embedded
+/// builtin; the sidecar resolves those from its own npm copy).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThemeCatalogItem {
+    pub name: String,
+    pub path: Option<PathBuf>,
+}
+
 /// Host-side UI provider extensions call INTO (oracle `ExtensionUIContext`
 /// subset that crosses the mode boundary; rpc-mode.ts:108-299).
 ///
@@ -171,6 +179,45 @@ pub trait ExtensionUiHost: Send + Sync {
 
     /// Fire-and-forget editor text replacement.
     fn set_editor_text(&self, text: String);
+
+    /// Host a `ui.custom` component dialog: the sidecar renders the
+    /// component under `slot` (frames); the host mounts it (editor swap or
+    /// overlay) and resolves once `ui/done` arrives or the request is
+    /// cancelled. Default: resolve immediately (UI-less hosts — the
+    /// component never becomes visible, matching pi's no-op UI).
+    fn custom(
+        &self,
+        _slot: String,
+        _overlay: bool,
+        _overlay_options: Option<serde_json::Value>,
+        _cancel: CancellationToken,
+    ) -> BoxFuture<'static, ()> {
+        Box::pin(std::future::ready(()))
+    }
+
+    /// Host theme catalog (`ui/getAllThemes`). Default: empty (sidecar
+    /// falls back to its local catalog).
+    fn get_all_themes(&self) -> Vec<ThemeCatalogItem> {
+        Vec::new()
+    }
+
+    /// Resolved `(name, theme JSON)` by name (`ui/getTheme`).
+    fn get_theme_json(&self, _name: &str) -> Option<(String, serde_json::Value)> {
+        None
+    }
+}
+
+/// Blocking `message_end` hook (oracle `emitMessageEnd` +
+/// `_replaceMessageInPlace`, agent-session.ts:709-727): runs BEFORE the
+/// finalized message reaches agent state, listeners, or session
+/// persistence; a `Some` return replaces the message everywhere.
+pub trait MessageHooks: Send + Sync {
+    /// Returns the replacement message (same role, already validated and
+    /// normalized by the implementation) or `None` to keep the original.
+    fn on_message_end(
+        &self,
+        message: pi_agent::AgentMessage,
+    ) -> BoxFuture<'static, Option<pi_agent::AgentMessage>>;
 }
 
 /// Host-side extension runtime surface.

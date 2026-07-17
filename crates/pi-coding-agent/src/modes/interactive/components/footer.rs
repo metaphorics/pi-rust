@@ -124,6 +124,11 @@ impl FooterComponent {
         self.auto_compact_enabled = enabled;
     }
 
+    /// Mutable data-provider access (extension statuses bind post-construction).
+    pub fn data_mut(&mut self) -> &mut FooterData {
+        &mut self.data
+    }
+
     /// Read a branch or detached commit directly from `.git/HEAD`.
     #[must_use]
     pub fn read_git_branch(cwd: &Path) -> Option<String> {

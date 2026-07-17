@@ -372,6 +372,9 @@ struct SessionInner {
     /// Phase 6 extension slash-command hooks (`_tryExecuteExtensionCommand`
     /// dispatch, agent-session.ts:1228); `None` = zero extensions.
     command_hooks: Mutex<Option<Arc<dyn crate::extension_bridge::ExtensionCommandHooks>>>,
+    /// Phase 6 blocking `message_end` hook (replacement applied before
+    /// state/listeners/persistence); `None` = zero extensions.
+    message_hooks: Mutex<Option<Arc<dyn crate::extension_bridge::MessageHooks>>>,
 }
 
 impl SessionInner {
@@ -613,6 +616,7 @@ impl AgentSession {
                 active_rx,
                 compact_hooks: Mutex::new(None),
                 command_hooks: Mutex::new(None),
+                message_hooks: Mutex::new(None),
             }),
         }
     }
@@ -648,6 +652,16 @@ impl AgentSession {
         hooks: Option<Arc<dyn crate::extension_bridge::ExtensionCommandHooks>>,
     ) {
         *self.inner.command_hooks.lock() = hooks;
+    }
+
+    /// Bind (or clear) the Phase 6 blocking `message_end` hook. Bound by
+    /// the extension binding; the agent-event sink awaits it before a
+    /// finalized message reaches state, listeners, or persistence.
+    pub fn bind_message_hooks(
+        &self,
+        hooks: Option<Arc<dyn crate::extension_bridge::MessageHooks>>,
+    ) {
+        *self.inner.message_hooks.lock() = hooks;
     }
 
     // =====================================================================
@@ -1427,10 +1441,22 @@ impl AgentSession {
     fn event_sink(&self) -> pi_agent::AgentEventSink {
         let inner = self.inner.clone();
         let session = self.clone();
-        Arc::new(move |event: AgentEvent| {
+        Arc::new(move |mut event: AgentEvent| {
             let inner = inner.clone();
             let session = session.clone();
             Box::pin(async move {
+                // Phase 6 F10 (oracle agent-session.ts:709-727): the
+                // blocking message_end hook runs BEFORE agent-state
+                // reduction, listener emission, and persistence; a
+                // replacement swaps the message for all three consumers.
+                if let AgentEvent::MessageEnd { message } = &mut event {
+                    let hooks = inner.message_hooks.lock().clone();
+                    if let Some(hooks) = hooks
+                        && let Some(replacement) = hooks.on_message_end(message.clone()).await
+                    {
+                        *message = replacement;
+                    }
+                }
                 session.handle_agent_event(&inner, event);
             })
         })

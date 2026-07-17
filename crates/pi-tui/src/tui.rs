@@ -592,6 +592,33 @@ impl Tui {
         self.request_render(false);
     }
 
+    /// Replace an overlay's live layout/capture options without changing its
+    /// identity. Extension `overlayOptions` factories are re-evaluated on
+    /// host resize, so the compositor must not freeze the mount-time layout.
+    pub fn set_overlay_options(&mut self, id: u64, options: OverlayOptions) {
+        let Some(entry) = self.overlays.iter_mut().find(|entry| entry.id == id) else {
+            return;
+        };
+        entry.options = options;
+        let hidden = entry.hidden;
+        let non_capturing = entry.options.non_capturing;
+        let pre = entry.pre_focus;
+
+        let width = self.terminal.columns() as usize;
+        let height = self.terminal.rows() as usize;
+        let visible = self
+            .overlays
+            .iter()
+            .find(|entry| entry.id == id)
+            .is_some_and(|entry| Self::overlay_entry_visible(entry, width, height));
+        if self.focused == Some(FocusTarget::Overlay(id)) && (hidden || non_capturing || !visible) {
+            let top = self.get_topmost_visible_overlay_id();
+            let next = top.map(FocusTarget::Overlay).or(pre);
+            self.set_focus_internal(next, OverlayFocusRestorePolicy::Clear);
+        }
+        self.request_render(false);
+    }
+
     /// Handle one raw input sequence (after terminal segmentation).
     pub fn handle_input(&mut self, mut data: String) {
         if self.stopped {
@@ -807,15 +834,18 @@ impl Tui {
                 continue;
             }
             let is_focused = focused_overlay_id == Some(entry.id);
-            let layout =
-                resolve_overlay_layout(&entry.options, term_height, term_width, term_height);
-            let ov_lines = entry.component.render(layout.width as u16);
+            // Oracle resolves width first, renders, then resolves row/col
+            // from the actual (possibly max-height-truncated) line count.
+            let initial_layout = resolve_overlay_layout(&entry.options, 0, term_width, term_height);
+            let ov_lines = entry.component.render(initial_layout.width as u16);
             let mut strings: Vec<String> = ov_lines.iter().map(Line::to_ansi).collect();
-            if let Some(max_h) = layout.max_height
+            if let Some(max_h) = initial_layout.max_height
                 && strings.len() > max_h
             {
                 strings.truncate(max_h);
             }
+            let layout =
+                resolve_overlay_layout(&entry.options, strings.len(), term_width, term_height);
             // Extract CURSOR_MARKER from overlay composite (finding #3).
             if is_focused
                 && let Some(local) = extract_cursor_from_ansi_lines(&mut strings, term_height)
@@ -964,7 +994,7 @@ struct OverlayLayout {
 
 fn resolve_overlay_layout(
     opt: &OverlayOptions,
-    _overlay_height_hint: usize,
+    overlay_height: usize,
     term_width: usize,
     term_height: usize,
 ) -> OverlayLayout {
@@ -976,57 +1006,70 @@ fn resolve_overlay_layout(
     let mut width = opt
         .width
         .map(|s| s.resolve(term_width))
-        .unwrap_or(avail_w.min(60));
+        .unwrap_or(avail_w.min(80));
     if let Some(min_w) = opt.min_width {
         width = width.max(min_w);
     }
-    width = width.min(avail_w);
+    width = width.clamp(1, avail_w);
 
-    let max_height = opt.max_height.map(|s| s.resolve(term_height).min(avail_h));
+    let max_height = opt
+        .max_height
+        .map(|s| s.resolve(term_height).clamp(1, avail_h));
+    let effective_height = max_height
+        .map_or(overlay_height, |max| overlay_height.min(max))
+        .min(avail_h);
 
-    // Default center placement
-    let (mut row, mut col) = match opt.anchor {
-        OverlayAnchor::Center => {
-            let r = opt.margin_top + avail_h.saturating_sub(max_height.unwrap_or(avail_h / 2)) / 2;
-            let c = opt.margin_left + avail_w.saturating_sub(width) / 2;
-            (r, c)
+    let anchored_row = match opt.anchor {
+        OverlayAnchor::TopLeft | OverlayAnchor::TopRight | OverlayAnchor::TopCenter => {
+            opt.margin_top
         }
-        OverlayAnchor::TopLeft => (opt.margin_top, opt.margin_left),
-        OverlayAnchor::TopRight => (
-            opt.margin_top,
-            term_width.saturating_sub(opt.margin_right + width),
-        ),
-        OverlayAnchor::BottomLeft => (
-            term_height.saturating_sub(opt.margin_bottom + max_height.unwrap_or(1)),
-            opt.margin_left,
-        ),
-        OverlayAnchor::BottomRight => (
-            term_height.saturating_sub(opt.margin_bottom + max_height.unwrap_or(1)),
-            term_width.saturating_sub(opt.margin_right + width),
-        ),
-        OverlayAnchor::TopCenter => (
-            opt.margin_top,
-            opt.margin_left + avail_w.saturating_sub(width) / 2,
-        ),
-        OverlayAnchor::BottomCenter => (
-            term_height.saturating_sub(opt.margin_bottom + max_height.unwrap_or(1)),
-            opt.margin_left + avail_w.saturating_sub(width) / 2,
-        ),
-        OverlayAnchor::LeftCenter => (opt.margin_top + avail_h / 2, opt.margin_left),
-        OverlayAnchor::RightCenter => (
-            opt.margin_top + avail_h / 2,
-            term_width.saturating_sub(opt.margin_right + width),
-        ),
+        OverlayAnchor::BottomLeft | OverlayAnchor::BottomRight | OverlayAnchor::BottomCenter => {
+            opt.margin_top + avail_h.saturating_sub(effective_height)
+        }
+        OverlayAnchor::Center | OverlayAnchor::LeftCenter | OverlayAnchor::RightCenter => {
+            opt.margin_top + avail_h.saturating_sub(effective_height) / 2
+        }
+    };
+    let anchored_col = match opt.anchor {
+        OverlayAnchor::TopLeft | OverlayAnchor::BottomLeft | OverlayAnchor::LeftCenter => {
+            opt.margin_left
+        }
+        OverlayAnchor::TopRight | OverlayAnchor::BottomRight | OverlayAnchor::RightCenter => {
+            opt.margin_left + avail_w.saturating_sub(width)
+        }
+        OverlayAnchor::Center | OverlayAnchor::TopCenter | OverlayAnchor::BottomCenter => {
+            opt.margin_left + avail_w.saturating_sub(width) / 2
+        }
     };
 
-    if let Some(r) = opt.row {
-        row = r.resolve(term_height);
-    }
-    if let Some(c) = opt.col {
-        col = c.resolve(term_width);
-    }
-    row = (row as i32 + opt.offset_y).max(0) as usize;
-    col = (col as i32 + opt.offset_x).max(0) as usize;
+    let row = match opt.row {
+        Some(SizeValue::Abs(row)) => row,
+        Some(SizeValue::Percent(percent)) => {
+            opt.margin_top
+                + ((avail_h.saturating_sub(effective_height) as f64) * percent / 100.0).floor()
+                    as usize
+        }
+        None => anchored_row,
+    };
+    let col = match opt.col {
+        Some(SizeValue::Abs(col)) => col,
+        Some(SizeValue::Percent(percent)) => {
+            opt.margin_left
+                + ((avail_w.saturating_sub(width) as f64) * percent / 100.0).floor() as usize
+        }
+        None => anchored_col,
+    };
+
+    let row_lower = opt.margin_top as i64;
+    let row_upper = term_height.saturating_sub(opt.margin_bottom + effective_height) as i64;
+    let row = (row as i64 + i64::from(opt.offset_y))
+        .min(row_upper)
+        .max(row_lower) as usize;
+    let col_lower = opt.margin_left as i64;
+    let col_upper = term_width.saturating_sub(opt.margin_right + width) as i64;
+    let col = (col as i64 + i64::from(opt.offset_x))
+        .min(col_upper)
+        .max(col_lower) as usize;
 
     OverlayLayout {
         width,
@@ -1297,6 +1340,7 @@ mod tests {
             for h in &handles {
                 t_all.add_child(LiveText::new(h.borrow().clone()).0);
             }
+
             t_all.request_render(true);
             t_all.do_render();
             assert_eq!(
@@ -1336,6 +1380,34 @@ mod tests {
         tui.request_render(true);
         tui.do_render();
         assert_eq!(tui.focused, Some(FocusTarget::Overlay(id)));
+    }
+
+    #[test]
+    fn overlay_options_update_live_layout_without_remounting() {
+        let mut tui = Tui::new(VirtualTerminal::new(100, 30));
+        let id = tui.show_overlay(
+            Text::with_text("overlay"),
+            OverlayOptions {
+                width: Some(SizeValue::Abs(80)),
+                anchor: OverlayAnchor::Center,
+                ..Default::default()
+            },
+        );
+        tui.set_overlay_options(
+            id,
+            OverlayOptions {
+                width: Some(SizeValue::Abs(60)),
+                anchor: OverlayAnchor::TopRight,
+                ..Default::default()
+            },
+        );
+        let entry = tui
+            .overlays
+            .iter()
+            .find(|entry| entry.id == id)
+            .expect("overlay remains mounted");
+        assert_eq!(entry.options.width, Some(SizeValue::Abs(60)));
+        assert_eq!(entry.options.anchor, OverlayAnchor::TopRight);
     }
 
     #[test]

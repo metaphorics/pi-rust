@@ -138,6 +138,19 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("open-custom-void", {
+		handler: async (_args, ctx) => {
+			await ctx.ui.custom<void>((_tui, _theme, _keybindings, done) => ({
+				focused: false,
+				render: () => ["void custom"],
+				handleInput: (data: string) => {
+					if (data === "\r") done();
+				},
+				invalidate: () => {},
+			}));
+		},
+	});
+
 	pi.registerCommand("notify-things", {
 		handler: async (_args, ctx) => {
 			ctx.ui.notify("hello there", "warning");
@@ -148,6 +161,12 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.setEditorText("drafted");
 			ctx.ui.setToolsExpanded(true);
 			pi.appendEntry("editor-text", { text: ctx.ui.getEditorText(), expanded: ctx.ui.getToolsExpanded() });
+		},
+	});
+
+	pi.registerCommand("read-editor", {
+		handler: async (_args, ctx) => {
+			pi.appendEntry("editor-read", { text: ctx.ui.getEditorText() });
 		},
 	});
 

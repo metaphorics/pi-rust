@@ -6,6 +6,7 @@
 pub mod app_keybindings;
 pub mod components;
 pub mod dispatch;
+pub mod extension_ui;
 pub mod interactive_mode;
 pub mod shared;
 #[cfg(test)]

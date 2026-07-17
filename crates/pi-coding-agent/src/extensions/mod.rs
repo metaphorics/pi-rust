@@ -26,6 +26,7 @@ pub mod binding;
 pub mod client;
 pub mod detect;
 pub mod events;
+pub mod frames;
 pub mod provider;
 pub mod session_sync;
 pub mod spawn;

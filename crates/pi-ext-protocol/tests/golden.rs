@@ -35,14 +35,17 @@ macro_rules! result_fixture {
 
 fn get_method_direction(method: &str) -> &'static str {
     match method {
-        "lifecycle/init" | "event/emit" | "ui/terminal_input" | "tool/execute"
-        | "provider/stream" | "command/execute" | "shortcut/invoke" | "session/setup"
-        | "session/sync" | "state/update" => "rust-to-sidecar",
+        "lifecycle/init" | "event/emit" | "ui/terminal_input" | "ui/focus" | "ui/resize"
+        | "tool/execute" | "provider/stream" | "command/execute" | "shortcut/invoke"
+        | "session/setup" | "session/sync" | "state/update" => "rust-to-sidecar",
 
         "lifecycle/initialized"
         | "action/sendUserMessage"
         | "ui/getTheme"
         | "ui/getAllThemes"
+        | "ui/editorSubmit"
+        | "ui/editorChange"
+        | "ui/terminalInputActive"
         | "tool/update"
         | "provider/register"
         | "error/extension" => "sidecar-to-rust",
@@ -68,6 +71,23 @@ const METHOD_FIXTURES: &[MethodFixture] = &[
     fixture!("sidecar-to-rust-ui.json", "sidecar-to-rust", "ui"),
     fixture!(
         "sidecar-to-rust-ui-get-all-themes.json",
+        "sidecar-to-rust",
+        "ui"
+    ),
+    fixture!("rust-to-sidecar-ui-focus.json", "rust-to-sidecar", "ui"),
+    fixture!("rust-to-sidecar-ui-resize.json", "rust-to-sidecar", "ui"),
+    fixture!(
+        "sidecar-to-rust-ui-editor-submit.json",
+        "sidecar-to-rust",
+        "ui"
+    ),
+    fixture!(
+        "sidecar-to-rust-ui-editor-change.json",
+        "sidecar-to-rust",
+        "ui"
+    ),
+    fixture!(
+        "sidecar-to-rust-ui-terminal-input-active.json",
         "sidecar-to-rust",
         "ui"
     ),

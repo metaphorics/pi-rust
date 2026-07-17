@@ -315,11 +315,34 @@ async fn handle_request(
             },
             None => ok(Value::Null),
         },
-        // Custom component dialogs mount bridged frames (C8/F2).
-        Request::UiCustom(_) => ok(Value::Null),
-        // Theme catalog is interactive-mode surface (F8); empty until bound.
-        Request::UiGetAllThemes(_) => ok(json!([])),
-        Request::UiGetTheme(_) => ok(Value::Null),
+        // Custom component dialogs mount bridged frames (C8/F2). The
+        // response value is unused by the sidecar (the extension promise
+        // resolves through ui/done); it only finalizes the slot lifetime.
+        Request::UiCustom(params) => {
+            if let Some(ui) = ui {
+                ui.custom(params.slot, params.overlay, params.overlay_options, cancel)
+                    .await;
+            }
+            ok(Value::Null)
+        }
+        Request::UiGetAllThemes(_) => match ui {
+            Some(ui) => {
+                let catalog: Vec<pi_ext_protocol::ThemeCatalogEntry> = ui
+                    .get_all_themes()
+                    .into_iter()
+                    .map(|item| pi_ext_protocol::ThemeCatalogEntry {
+                        name: item.name,
+                        path: item.path.map(|p| p.to_string_lossy().into_owned()),
+                    })
+                    .collect();
+                ok(serde_json::to_value(catalog).unwrap_or_else(|_| json!([])))
+            }
+            None => ok(json!([])),
+        },
+        Request::UiGetTheme(params) => match ui.and_then(|ui| ui.get_theme_json(&params.name)) {
+            Some((name, theme_json)) => ok(json!({ "name": name, "json": theme_json })),
+            None => ok(Value::Null),
+        },
 
         Request::SessionSetup(_) => {
             err("session/setup is host-initiated; the sidecar never sends it")
@@ -418,6 +441,9 @@ async fn handle_notification(
         | Notification::UiDispose(_)
         | Notification::UiDone(_)
         | Notification::UiOverlay(_)
+        | Notification::UiEditorSubmit(_)
+        | Notification::UiEditorChange(_)
+        | Notification::UiTerminalInputActive(_)
         | Notification::UiSetWorkingMessage(_)
         | Notification::UiSetWorkingVisible(_)
         | Notification::UiSetWorkingIndicator(_)
@@ -431,8 +457,8 @@ async fn handle_notification(
         }
 
         // Control-plane notifications never reach the incoming queue
-        // (client.rs routes them inline); session/sync and ui/input are
-        // host→sidecar only.
+        // (client.rs routes them inline); session/sync, ui/input, ui/focus,
+        // and ui/resize are host→sidecar only.
         Notification::LifecycleHello(_)
         | Notification::LifecycleInitialized(_)
         | Notification::LifecyclePing(_)
@@ -440,6 +466,8 @@ async fn handle_notification(
         | Notification::EventNotify(_)
         | Notification::SessionSync(_)
         | Notification::StateUpdate(_)
-        | Notification::UiComponentInput(_) => {}
+        | Notification::UiComponentInput(_)
+        | Notification::UiFocus(_)
+        | Notification::UiResize(_) => {}
     }
 }

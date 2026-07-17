@@ -81,7 +81,7 @@ export class VirtualTerminal implements Terminal {
     this.progressActive = active;
   }
 
-  /** Host-driven dimension updates (from `ui/render` widths). */
+  /** Host-driven dimension updates (`lifecycle/init` and `ui/resize`). */
   resize(columns: number, rows?: number): void {
     if (columns === this._columns && (rows === undefined || rows === this._rows)) return;
     this._columns = columns;

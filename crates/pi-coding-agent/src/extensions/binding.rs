@@ -80,6 +80,9 @@ pub struct BindOptions {
     pub mode: ExtensionMode,
     pub has_ui: bool,
     pub flag_values: BTreeMap<String, FlagValue>,
+    /// Initial interactive grid, carried in lifecycle/init so UI factories
+    /// cannot observe the headless terminal's 80×24 default before resize.
+    pub terminal_size: Option<pi_ext_protocol::ResizeParams>,
     /// Mode-owned state-block fields, updated in place by the mode (theme,
     /// editor text, commands, footer, trust).
     pub overlay: Arc<parking_lot::Mutex<StateOverlay>>,
@@ -123,6 +126,7 @@ impl BindOptions {
             mode: ExtensionMode::Rpc,
             has_ui: false,
             flag_values: BTreeMap::new(),
+            terminal_size: None,
             overlay: Arc::new(parking_lot::Mutex::new(StateOverlay::default())),
             error_sink,
             actions,
@@ -142,6 +146,8 @@ pub struct ExtensionBinding {
     forwarder: Arc<EventForwarder>,
     shared: Arc<SharedSessionState>,
     config: Arc<ActionServerConfig>,
+    /// Live host grid replayed on sidecar respawn.
+    terminal_size: Arc<parking_lot::Mutex<Option<pi_ext_protocol::ResizeParams>>>,
     paths: Vec<PathBuf>,
     queue_task: JoinHandle<()>,
     server_task: JoinHandle<()>,
@@ -176,6 +182,7 @@ pub fn bind_extensions(
 
     let shared = Arc::new(SharedSessionState::new(session.clone()));
     let overlay = options.overlay.clone();
+    let terminal_size = Arc::new(parking_lot::Mutex::new(options.terminal_size));
     let state_source: StateSource = {
         let shared = shared.clone();
         let overlay = overlay.clone();
@@ -195,6 +202,7 @@ pub fn bind_extensions(
         let mode = options.mode;
         let has_ui = options.has_ui;
         let flag_values = options.flag_values.clone();
+        let init_terminal_size = terminal_size.clone();
         let overlay = overlay.clone();
         Arc::new(move || {
             // Hoisted on purpose: a guard temporary inside the struct
@@ -203,6 +211,7 @@ pub fn bind_extensions(
             let theme = overlay.lock().theme.clone();
             let session = shared.snapshot();
             let state = (state_source)();
+            let terminal_size = *init_terminal_size.lock();
             InitParams {
                 cwd: cwd.to_string_lossy().into_owned(),
                 agent_dir: agent_dir.to_string_lossy().into_owned(),
@@ -212,6 +221,7 @@ pub fn bind_extensions(
                 has_ui,
                 flag_values: flag_values.clone(),
                 theme,
+                terminal_size,
                 session,
                 state,
             }
@@ -309,6 +319,7 @@ pub fn bind_extensions(
         forwarder,
         shared,
         config,
+        terminal_size,
         paths: options.extension_paths,
         queue_task,
         server_task,
@@ -478,6 +489,9 @@ impl ExtensionBinding {
         session.bind_command_hooks(Some(Arc::new(BindingCommandHooks {
             binding: Arc::downgrade(self),
         })));
+        session.bind_message_hooks(Some(Arc::new(ForwarderMessageHooks {
+            forwarder: self.forwarder.clone(),
+        })));
     }
 
     /// Registered extension CLI flags in the shape the CLI help consumes
@@ -550,6 +564,129 @@ impl ExtensionBinding {
                 super::ClientError::Remote(remote) => remote.message,
                 other => other.to_string(),
             })
+    }
+
+    /// `ui/terminal_input` round trip with the 50ms reply budget (plan §2,
+    /// deviation R4). Timeout / dead sidecar ⇒ not-consumed.
+    pub async fn terminal_input(&self, data: &str) -> pi_ext_protocol::TerminalInputResult {
+        let Some(connection) = self.host.current_connection().await else {
+            return pi_ext_protocol::TerminalInputResult::default();
+        };
+        let request =
+            pi_ext_protocol::Request::UiTerminalInput(pi_ext_protocol::TerminalInputParams {
+                data: data.to_string(),
+            });
+        match tokio::time::timeout(Duration::from_millis(50), connection.request(request)).await {
+            Ok(Ok(value)) => serde_json::from_value(value).unwrap_or_default(),
+            _ => pi_ext_protocol::TerminalInputResult::default(),
+        }
+    }
+
+    /// Push a `state/update` patch (theme changes, footer data, ...).
+    pub async fn notify_state(&self, patch: pi_ext_protocol::StateUpdate) {
+        if let Some(connection) = self.host.current_connection().await {
+            let _ = connection
+                .notify(pi_ext_protocol::Notification::StateUpdate(Box::new(patch)))
+                .await;
+        }
+    }
+
+    /// Build the TUI-thread outbound sender for bridged frames (C8).
+    ///
+    /// Messages are relayed through one ordered queue task (key input MUST
+    /// NOT reorder); `ui/render` responses land back in `hub` guarded by
+    /// revision + request generation. MUST be called from within a tokio
+    /// runtime context; the sender itself never blocks and is safe to call
+    /// from the TUI thread.
+    pub fn ui_outbound(
+        self: &Arc<Self>,
+        hub: &Arc<super::frames::FrameHub>,
+    ) -> super::frames::UiOutboundSender {
+        use super::frames::UiOutbound;
+        let (tx, mut rx) = mpsc::unbounded_channel::<UiOutbound>();
+        let binding = Arc::downgrade(self);
+        let hub = hub.clone();
+        let terminal_size = self.terminal_size.clone();
+        tokio::spawn(async move {
+            while let Some(message) = rx.recv().await {
+                let Some(binding) = binding.upgrade() else {
+                    return;
+                };
+                let Some(connection) = binding.host.current_connection().await else {
+                    continue; // Sidecar down; frames are gone anyway.
+                };
+                match message {
+                    UiOutbound::Render {
+                        slot,
+                        width,
+                        revision,
+                        generation,
+                    } => {
+                        // Detached: a slow render must not stall key input
+                        // behind it. Concurrent responses for one slot are
+                        // resolved by the revision+generation guard.
+                        let hub = hub.clone();
+                        let connection = connection.clone();
+                        tokio::spawn(async move {
+                            let request =
+                                pi_ext_protocol::Request::UiRender(pi_ext_protocol::RenderParams {
+                                    slot: slot.clone(),
+                                    width,
+                                });
+                            if let Ok(value) = connection.request(request).await
+                                && let Ok(lines) = serde_json::from_value::<Vec<String>>(value)
+                            {
+                                hub.apply_render_response(&slot, revision, generation, lines);
+                            }
+                        });
+                    }
+                    UiOutbound::Input { slot, data } => {
+                        let _ = connection
+                            .notify(pi_ext_protocol::Notification::UiComponentInput(
+                                pi_ext_protocol::ComponentInputParams { slot, data },
+                            ))
+                            .await;
+                    }
+                    UiOutbound::Focus { slot, focused } => {
+                        let _ = connection
+                            .notify(pi_ext_protocol::Notification::UiFocus(
+                                pi_ext_protocol::FocusParams { slot, focused },
+                            ))
+                            .await;
+                    }
+                    UiOutbound::Resize { width, height } => {
+                        let _ = connection
+                            .notify(pi_ext_protocol::Notification::UiResize(
+                                pi_ext_protocol::ResizeParams { width, height },
+                            ))
+                            .await;
+                    }
+                    UiOutbound::Dispose { slot } => {
+                        let _ = connection
+                            .notify(pi_ext_protocol::Notification::UiDispose(
+                                pi_ext_protocol::SlotParams { slot },
+                            ))
+                            .await;
+                    }
+                    UiOutbound::EditorSetText { text } => {
+                        let _ = connection
+                            .notify(pi_ext_protocol::Notification::UiSetEditorText(
+                                pi_ext_protocol::TextParams { text },
+                            ))
+                            .await;
+                    }
+                }
+            }
+        });
+        Arc::new(move |message| {
+            if let UiOutbound::Resize { width, height } = &message {
+                *terminal_size.lock() = Some(pi_ext_protocol::ResizeParams {
+                    width: *width,
+                    height: *height,
+                });
+            }
+            let _ = tx.send(message);
+        })
     }
 
     /// Graceful teardown: flush the queue, then bounded sidecar shutdown.
@@ -655,6 +792,80 @@ impl CompactHooks for ForwarderCompactHooks {
             forwarder
                 .session_compact(compaction_entry, from_extension, reason, will_retry)
                 .await;
+        })
+    }
+}
+
+/// [`crate::extension_bridge::MessageHooks`] routed through the forwarder
+/// (F10: blocking `message_end` with replacement application).
+struct ForwarderMessageHooks {
+    forwarder: Arc<EventForwarder>,
+}
+
+impl ForwarderMessageHooks {
+    /// Parse + normalize a `message_end` result. Untyped extension handlers
+    /// can return messages with null/missing content; the oracle normalizes
+    /// to `[]` before it enters state or history (agent-session.ts:716-725).
+    fn parse_replacement(
+        &self,
+        original_role: &str,
+        result: Value,
+    ) -> Option<pi_agent::AgentMessage> {
+        let mut message = result.get("message")?.clone();
+        if let Some(object) = message.as_object_mut() {
+            let role = object.get("role").and_then(Value::as_str).unwrap_or("");
+            if matches!(role, "user" | "assistant" | "toolResult" | "custom")
+                && object.get("content").is_none_or(Value::is_null)
+            {
+                object.insert("content".to_string(), Value::Array(Vec::new()));
+            }
+        }
+        let replacement: pi_agent::AgentMessage = match serde_json::from_value(message) {
+            Ok(replacement) => replacement,
+            Err(error) => {
+                (self.forwarder.error_sink())(pi_ext_protocol::ExtensionError {
+                    extension_path: "<bridge>".to_string(),
+                    event: "message_end".to_string(),
+                    error: format!("malformed replacement message: {error}"),
+                    stack: None,
+                });
+                return None;
+            }
+        };
+        // The sidecar runner already rejects per-handler role changes
+        // (runner.ts:804); this guards the aggregate result.
+        if replacement.role() != original_role {
+            (self.forwarder.error_sink())(pi_ext_protocol::ExtensionError {
+                extension_path: "<bridge>".to_string(),
+                event: "message_end".to_string(),
+                error: "message_end handlers must return a message with the same role".to_string(),
+                stack: None,
+            });
+            return None;
+        }
+        Some(replacement)
+    }
+}
+
+impl crate::extension_bridge::MessageHooks for ForwarderMessageHooks {
+    fn on_message_end(
+        &self,
+        message: pi_agent::AgentMessage,
+    ) -> BoxFuture<'static, Option<pi_agent::AgentMessage>> {
+        let forwarder = self.forwarder.clone();
+        let hooks = ForwarderMessageHooks {
+            forwarder: self.forwarder.clone(),
+        };
+        Box::pin(async move {
+            // Order: everything enqueued before this message dispatches
+            // first (same barrier as the compact hooks).
+            forwarder.flush().await;
+            let original_role = message.role().to_string();
+            let event = pi_ext_protocol::ExtensionEvent::MessageEnd {
+                message: super::events::wire_message(message),
+            };
+            let result = forwarder.emit_blocking_or_default(event, None).await?;
+            hooks.parse_replacement(&original_role, result)
         })
     }
 }

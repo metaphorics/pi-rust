@@ -731,9 +731,10 @@ impl EventForwarder {
                 message: wire_message(message),
                 assistant_message_event: Box::new(assistant_message_event),
             }),
-            AgentSessionEvent::MessageEnd { message } => Some(ExtensionEvent::MessageEnd {
-                message: wire_message(message),
-            }),
+            // message_end is a blocking hook applied at the session's
+            // persistence boundary (ForwarderMessageHooks, F10); the
+            // observer stream only refreshes the mirror for it.
+            AgentSessionEvent::MessageEnd { .. } => None,
             AgentSessionEvent::ToolExecutionStart {
                 tool_call_id,
                 tool_name,
@@ -794,9 +795,9 @@ impl EventForwarder {
             Some(wire) => {
                 let boundary = matches!(wire, ExtensionEvent::AgentStart {});
                 if wire.is_blocking() {
-                    // message_end is the only blocking kind reaching this
-                    // path; its result application lives at the P5 call
-                    // sites (F10) — forwarding preserves order + timeout.
+                    // Defensive: no blocking kind maps through this path
+                    // (message_end routes through MessageHooks); keep the
+                    // ordered forward for any future mapping.
                     let _ = self.emit_blocking_or_default(wire, None).await;
                 } else {
                     self.notify_wire(wire, boundary, false).await;
@@ -907,7 +908,7 @@ fn wire_compact_reason(reason: CompactionReason) -> CompactReason {
     }
 }
 
-fn wire_message(message: pi_agent::AgentMessage) -> pi_ext_protocol::AgentMessage {
+pub(super) fn wire_message(message: pi_agent::AgentMessage) -> pi_ext_protocol::AgentMessage {
     match message {
         pi_agent::AgentMessage::Standard(message) => {
             pi_ext_protocol::AgentMessage::Standard(Box::new(message))
