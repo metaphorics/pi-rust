@@ -26,9 +26,11 @@ pub mod binding;
 pub mod client;
 pub mod detect;
 pub mod events;
+pub mod provider;
 pub mod session_sync;
 pub mod spawn;
 pub mod state;
+pub mod tools;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -232,6 +234,20 @@ impl ExtensionHost {
     /// across respawns; take it before the first [`ensure_ready`](Self::ensure_ready).
     pub fn take_incoming(&self) -> Option<mpsc::Receiver<Incoming>> {
         self.incoming_rx.lock().take()
+    }
+
+    /// Ordering fence over the inbound frame stream: resolves once every
+    /// inbound frame enqueued before this call has been fully handled by
+    /// the action server (which processes notifications serially, in
+    /// arrival order). Call AFTER receiving a response to guarantee the
+    /// notifications the sidecar sent before that response took effect.
+    /// Resolves immediately when no consumer is attached (receiver dropped
+    /// or channel closed) — ordering is then moot.
+    pub async fn barrier(&self) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self.incoming_tx.send(Incoming::Barrier(tx)).await.is_ok() {
+            let _ = rx.await;
+        }
     }
 
     /// The live connection, if any (no spawn, no respawn).

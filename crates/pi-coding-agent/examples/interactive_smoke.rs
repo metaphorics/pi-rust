@@ -116,6 +116,7 @@ async fn make_runtime(
                 prompt_snippet: None,
                 prompt_guidelines: Vec::new(),
                 source: "sdk",
+                source_info: None,
             };
 
             let was_tool_call_stream = was_tool_call.clone();

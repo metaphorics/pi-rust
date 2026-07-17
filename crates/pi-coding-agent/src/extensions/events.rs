@@ -56,6 +56,9 @@ pub type StateSource = Arc<dyn Fn() -> StateBlock + Send + Sync>;
 /// banner, RPC line, or stderr — mode-owned).
 pub type ExtensionErrorSink = Arc<dyn Fn(ExtensionError) + Send + Sync>;
 
+/// Observer for registration-snapshot changes (C7 tool/command rebuilds).
+pub type RegistrationsListener = Arc<dyn Fn(&Registrations) + Send + Sync>;
+
 /// Mode-owned pieces of the state block the session cannot provide.
 #[derive(Clone, Debug)]
 pub struct StateOverlay {
@@ -111,19 +114,45 @@ pub fn agent_thinking_level(level: ModelThinkingLevel) -> AgentThinkingLevel {
     }
 }
 
-/// Build the session-derived portion of a [`StateBlock`] (oracle: runner
-/// state resolved at call time, runner.ts:634 — here at event granularity).
-pub fn session_state_block(session: &AgentSession, overlay: &StateOverlay) -> StateBlock {
-    let all_tools = session
+/// Wire `allTools` block for a session (real provenance for extension
+/// tools; synthetic like pi's `createSyntheticSourceInfo` otherwise).
+pub fn state_block_all_tools(session: &AgentSession) -> Vec<pi_ext_protocol::ToolInfo> {
+    session
         .get_all_tools()
         .into_iter()
         .map(|tool| pi_ext_protocol::ToolInfo {
-            source_info: pi_ext_protocol::SourceInfo {
-                path: tool.name.clone(),
-                source: tool.source.to_string(),
-                scope: pi_ext_protocol::SourceScope::Temporary,
-                origin: pi_ext_protocol::SourceOrigin::TopLevel,
-                base_dir: None,
+            source_info: match &tool.source_info {
+                // Extension tools carry their real provenance verbatim.
+                Some(info) => pi_ext_protocol::SourceInfo {
+                    path: info.path.clone(),
+                    source: info.source.clone(),
+                    scope: match info.scope {
+                        crate::source_info::SourceScope::User => pi_ext_protocol::SourceScope::User,
+                        crate::source_info::SourceScope::Project => {
+                            pi_ext_protocol::SourceScope::Project
+                        }
+                        crate::source_info::SourceScope::Temporary => {
+                            pi_ext_protocol::SourceScope::Temporary
+                        }
+                    },
+                    origin: match info.origin {
+                        crate::source_info::SourceOrigin::Package => {
+                            pi_ext_protocol::SourceOrigin::Package
+                        }
+                        crate::source_info::SourceOrigin::TopLevel => {
+                            pi_ext_protocol::SourceOrigin::TopLevel
+                        }
+                    },
+                    base_dir: info.base_dir.clone(),
+                },
+                // Built-ins/SDK: synthetic, like pi's createSyntheticSourceInfo.
+                None => pi_ext_protocol::SourceInfo {
+                    path: tool.name.clone(),
+                    source: tool.source.to_string(),
+                    scope: pi_ext_protocol::SourceScope::Temporary,
+                    origin: pi_ext_protocol::SourceOrigin::TopLevel,
+                    base_dir: None,
+                },
             },
             name: tool.name,
             description: tool.description,
@@ -134,7 +163,13 @@ pub fn session_state_block(session: &AgentSession, overlay: &StateOverlay) -> St
                 Some(tool.prompt_guidelines.join("\n"))
             },
         })
-        .collect();
+        .collect()
+}
+
+/// Build the session-derived portion of a [`StateBlock`] (oracle: runner
+/// state resolved at call time, runner.ts:634 — here at event granularity).
+pub fn session_state_block(session: &AgentSession, overlay: &StateOverlay) -> StateBlock {
+    let all_tools = state_block_all_tools(session);
     StateBlock {
         session_name: session.session_name(),
         model: session.model(),
@@ -229,6 +264,11 @@ pub struct EventForwarder {
     /// Monotonic turn index fed into `turn_start`/`turn_end` wire events.
     turn_index: AtomicU64,
     last_thinking: parking_lot::Mutex<AgentThinkingLevel>,
+    /// Invoked (outside the lock) whenever the registration snapshot
+    /// changes: initial load, `lifecycle/load`, reload re-init, respawn
+    /// replay, and `action/refreshTools` payloads. The binding rebuilds the
+    /// session's extension tool registry from it (C7).
+    registrations_listener: parking_lot::Mutex<Option<RegistrationsListener>>,
 }
 
 /// Outcome of one blocking emit.
@@ -269,6 +309,7 @@ impl EventForwarder {
             queue_tx,
             turn_index: AtomicU64::new(0),
             last_thinking: parking_lot::Mutex::new(last_thinking),
+            registrations_listener: parking_lot::Mutex::new(None),
         }
     }
 
@@ -343,9 +384,28 @@ impl EventForwarder {
     /// or reload re-init).
     pub fn apply_initialized(&self, initialized: &InitializedParams) {
         *self.subscribed.write() = initialized.subscribed_events.clone();
-        *self.registrations.lock() = initialized.registrations.clone();
+        self.update_registrations(initialized.registrations.clone());
         for error in &initialized.errors {
             (self.error_sink)(error.clone());
+        }
+    }
+
+    /// Install the registration-change listener. MUST be wired before the
+    /// first `ensure_ready`/`start()` so no `initialized` snapshot can be
+    /// missed; there is deliberately no replay of the (default-empty)
+    /// pre-load snapshot — an empty replay would consume the session's
+    /// construction-equivalent first application (include-all semantics).
+    pub fn set_registrations_listener(&self, listener: RegistrationsListener) {
+        *self.registrations_listener.lock() = Some(listener);
+    }
+
+    /// Store a new registration snapshot and notify the listener (called
+    /// with no forwarder locks held).
+    pub fn update_registrations(&self, registrations: Registrations) {
+        *self.registrations.lock() = registrations.clone();
+        let listener = self.registrations_listener.lock().clone();
+        if let Some(listener) = listener {
+            listener(&registrations);
         }
     }
 

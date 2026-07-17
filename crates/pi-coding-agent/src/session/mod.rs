@@ -179,8 +179,13 @@ pub struct SessionToolDefinition {
     pub definition: Arc<ToolDefinition>,
     pub prompt_snippet: Option<String>,
     pub prompt_guidelines: Vec<String>,
-    /// `"builtin"` / `"sdk"` (oracle sourceInfo synthetic label).
+    /// `"builtin"` / `"sdk"` / `"extension"` (oracle sourceInfo synthetic
+    /// label; extension tools carry their real provenance below).
     pub source: &'static str,
+    /// Real provenance for extension tools (oracle `RegisteredTool.
+    /// sourceInfo`); `None` for built-ins/SDK tools (synthesized on the
+    /// wire like pi's `createSyntheticSourceInfo`).
+    pub source_info: Option<crate::source_info::SourceInfo>,
 }
 
 /// Read-only tool info (oracle `getAllTools`).
@@ -192,6 +197,9 @@ pub struct ToolInfo {
     pub parameters: Value,
     pub prompt_guidelines: Vec<String>,
     pub source: &'static str,
+    /// Real provenance for extension tools; `None` for built-ins/SDK.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_info: Option<crate::source_info::SourceInfo>,
 }
 
 /// Context window usage (oracle `ContextUsage`; `null` fields stay `null`).
@@ -298,6 +306,17 @@ struct SessionState {
     active_tool_names: Vec<String>,
     /// Insertion-ordered (built-ins first, then custom) like the oracle Map.
     tool_registry: Vec<SessionToolDefinition>,
+    /// Built-in partition of the registry (oracle `_baseToolDefinitions`),
+    /// kept for `refresh_extension_tools` rebuilds.
+    base_tools: Vec<SessionToolDefinition>,
+    /// SDK custom tools (oracle `_customTools`); merged after extension
+    /// tools on every rebuild, so an SDK tool wins a name collision.
+    sdk_tools: Vec<SessionToolDefinition>,
+    /// Extension tools from the current sidecar registration snapshot.
+    extension_tools: Vec<SessionToolDefinition>,
+    /// Whether a registration snapshot was ever applied to this session
+    /// (first application = construction-equivalent, include-all).
+    extension_tools_applied: bool,
     // Queues (typed messages drained by the loop + display texts).
     steering_queue: Vec<AgentMessage>,
     follow_up_queue: Vec<AgentMessage>,
@@ -350,6 +369,9 @@ struct SessionInner {
     /// Phase 6 blocking compaction hooks (sidecar `session_before_compact` /
     /// `session_compact`); `None` = zero extensions, zero overhead.
     compact_hooks: Mutex<Option<Arc<dyn crate::extension_bridge::CompactHooks>>>,
+    /// Phase 6 extension slash-command hooks (`_tryExecuteExtensionCommand`
+    /// dispatch, agent-session.ts:1228); `None` = zero extensions.
+    command_hooks: Mutex<Option<Arc<dyn crate::extension_bridge::ExtensionCommandHooks>>>,
 }
 
 impl SessionInner {
@@ -466,7 +488,6 @@ impl AgentSession {
             },
         );
 
-        let mut tool_registry: Vec<SessionToolDefinition> = Vec::new();
         let allowed: Option<Vec<String>> = config.allowed_tool_names.clone();
         let excluded: Option<Vec<String>> = config.excluded_tool_names.clone();
         let is_allowed = |name: &str| -> bool {
@@ -475,12 +496,13 @@ impl AgentSession {
                     .as_ref()
                     .is_some_and(|e| e.iter().any(|n| n == name))
         };
+        let mut base_tools: Vec<SessionToolDefinition> = Vec::new();
         for tool in builtins {
             if !is_allowed(&tool.name) {
                 continue;
             }
             let name = tool.name.clone();
-            tool_registry.push(SessionToolDefinition {
+            base_tools.push(SessionToolDefinition {
                 definition: Arc::new(tool),
                 prompt_snippet: builtin_prompt_snippet(&name).map(str::to_string),
                 prompt_guidelines: builtin_prompt_guidelines(&name)
@@ -488,21 +510,15 @@ impl AgentSession {
                     .map(|s| s.to_string())
                     .collect(),
                 source: "builtin",
+                source_info: None,
             });
         }
-        for tool in config.custom_tools {
-            if !is_allowed(&tool.definition.name) {
-                continue;
-            }
-            // JS Map.set: an existing key keeps its insertion position.
-            match tool_registry
-                .iter_mut()
-                .find(|t| t.definition.name == tool.definition.name)
-            {
-                Some(existing) => *existing = tool,
-                None => tool_registry.push(tool),
-            }
-        }
+        let sdk_tools: Vec<SessionToolDefinition> = config
+            .custom_tools
+            .into_iter()
+            .filter(|tool| is_allowed(&tool.definition.name))
+            .collect();
+        let tool_registry = merge_tool_registry(&base_tools, &[], &sdk_tools);
 
         // Initial active tools: explicit list or default four, filtered to
         // the registry; plus all custom tools (includeAllExtensionTools).
@@ -536,6 +552,10 @@ impl AgentSession {
             messages: Vec::new(),
             active_tool_names: active,
             tool_registry,
+            base_tools,
+            sdk_tools,
+            extension_tools: Vec::new(),
+            extension_tools_applied: false,
             steering_queue: Vec::new(),
             follow_up_queue: Vec::new(),
             steering_mode,
@@ -592,6 +612,7 @@ impl AgentSession {
                 active_tx,
                 active_rx,
                 compact_hooks: Mutex::new(None),
+                command_hooks: Mutex::new(None),
             }),
         }
     }
@@ -619,10 +640,19 @@ impl AgentSession {
         *self.inner.compact_hooks.lock() = hooks;
     }
 
+    /// Bind (or clear) the Phase 6 extension slash-command hooks. Bound by
+    /// the extension binding; `prompt()` dispatches `/name args` to them
+    /// before anything else (oracle agent-session.ts:1084-1092).
+    pub fn bind_command_hooks(
+        &self,
+        hooks: Option<Arc<dyn crate::extension_bridge::ExtensionCommandHooks>>,
+    ) {
+        *self.inner.command_hooks.lock() = hooks;
+    }
+
     // =====================================================================
     // Read-only state access
     // =====================================================================
-
     pub fn cwd(&self) -> &PathBuf {
         &self.inner.cwd
     }
@@ -831,6 +861,25 @@ impl AgentSession {
         options: PromptOptions,
     ) -> Result<Option<(Vec<AgentMessage>, RunGuard)>, String> {
         let expand = options.expand_prompt_templates.unwrap_or(true);
+
+        // Extension commands execute immediately — even during streaming —
+        // and never start a turn (oracle prompt(), agent-session.ts:
+        // 1084-1092; extension commands drive their own LLM interaction via
+        // pi.sendMessage()).
+        if expand && text.starts_with('/') {
+            let hooks = self.inner.command_hooks.lock().clone();
+            if let Some(hooks) = hooks {
+                let rest = &text[1..];
+                let (name, args) = match rest.find(' ') {
+                    Some(space) => (&rest[..space], &rest[space + 1..]),
+                    None => (rest, ""),
+                };
+                if hooks.has_command(name) {
+                    hooks.execute(name.to_string(), args.to_string()).await;
+                    return Ok(None);
+                }
+            }
+        }
 
         let mut expanded_text = text.to_string();
         if expand {
@@ -1659,6 +1708,28 @@ fn find_tool<'a>(state: &'a SessionState, name: &str) -> Option<&'a SessionToolD
         .tool_registry
         .iter()
         .find(|t| t.definition.name == name)
+}
+
+/// Rebuild the tool registry from its partitions with JS `Map.set`
+/// semantics: built-ins first, then extension tools, then SDK customs; an
+/// existing name keeps its insertion position but takes the new definition
+/// (oracle `_refreshToolRegistry`, agent-session.ts:2397-2466).
+fn merge_tool_registry(
+    base: &[SessionToolDefinition],
+    extension: &[SessionToolDefinition],
+    sdk: &[SessionToolDefinition],
+) -> Vec<SessionToolDefinition> {
+    let mut registry: Vec<SessionToolDefinition> = base.to_vec();
+    for tool in extension.iter().chain(sdk.iter()) {
+        match registry
+            .iter_mut()
+            .find(|t| t.definition.name == tool.definition.name)
+        {
+            Some(existing) => *existing = tool.clone(),
+            None => registry.push(tool.clone()),
+        }
+    }
+    registry
 }
 
 fn retry_settings(settings: &Arc<Mutex<SettingsManager>>) -> (bool, u32, u64) {
@@ -2563,6 +2634,7 @@ impl AgentSession {
                 parameters: tool.definition.parameters.clone(),
                 prompt_guidelines: tool.prompt_guidelines.clone(),
                 source: tool.source,
+                source_info: tool.source_info.clone(),
             })
             .collect()
     }
@@ -2586,6 +2658,97 @@ impl AgentSession {
             .system_prompt_override
             .clone()
             .unwrap_or_else(|| state.base_system_prompt.clone());
+    }
+
+    /// Replace the extension-tool partition and rebuild the registry
+    /// (oracle `_refreshToolRegistry`, agent-session.ts:2397-2488):
+    /// previously-active names survive the allow/deny filter, and the final
+    /// list is deduplicated before `set_active_tools_by_name` semantics
+    /// (filter-to-registry + system prompt rebuild) apply.
+    ///
+    /// The FIRST application on a session is construction-equivalent (pi
+    /// loads extensions during session construction with
+    /// `includeAllExtensionTools`; pi-rust binds after): every custom tool
+    /// becomes active even when it shadows an existing inactive name. Later
+    /// applications (`refreshTools`) use plain "newly-appeared names become
+    /// active" semantics.
+    pub fn refresh_extension_tools(&self, extension_tools: Vec<SessionToolDefinition>) {
+        let mut state = self.inner.state.lock();
+        let include_all_extension_tools = !state.extension_tools_applied;
+        state.extension_tools_applied = true;
+        let is_allowed = |state: &SessionState, name: &str| -> bool {
+            state
+                .allowed_tool_names
+                .as_ref()
+                .is_none_or(|allow| allow.iter().any(|n| n == name))
+                && !state
+                    .excluded_tool_names
+                    .as_ref()
+                    .is_some_and(|deny| deny.iter().any(|n| n == name))
+        };
+
+        let previous_names: std::collections::HashSet<String> = state
+            .tool_registry
+            .iter()
+            .map(|t| t.definition.name.clone())
+            .collect();
+        let previous_active = state.active_tool_names.clone();
+
+        state.extension_tools = extension_tools
+            .into_iter()
+            .filter(|tool| is_allowed(&state, &tool.definition.name))
+            .collect();
+        state.tool_registry =
+            merge_tool_registry(&state.base_tools, &state.extension_tools, &state.sdk_tools);
+
+        let mut next_active: Vec<String> = previous_active
+            .into_iter()
+            .filter(|name| is_allowed(&state, name))
+            .collect();
+        if state.allowed_tool_names.is_some() {
+            // Allowlist present: every allowed registry tool becomes active
+            // (oracle allowedToolNames branch).
+            for tool in &state.tool_registry {
+                if is_allowed(&state, &tool.definition.name) {
+                    next_active.push(tool.definition.name.clone());
+                }
+            }
+        } else if include_all_extension_tools {
+            // Oracle includeAllExtensionTools branch: all custom tools
+            // (extension + sdk) activate, shadows included.
+            for tool in &state.extension_tools {
+                next_active.push(tool.definition.name.clone());
+            }
+            for tool in &state.sdk_tools {
+                next_active.push(tool.definition.name.clone());
+            }
+        } else {
+            // Default branch: tools that newly appeared become active.
+            for tool in &state.tool_registry {
+                if !previous_names.contains(&tool.definition.name) {
+                    next_active.push(tool.definition.name.clone());
+                }
+            }
+        }
+
+        // `[...new Set(...)]` + setActiveToolsByName (filter to registry).
+        let mut seen = std::collections::HashSet::new();
+        let valid: Vec<String> = next_active
+            .into_iter()
+            .filter(|name| seen.insert(name.clone()) && find_tool(&state, name).is_some())
+            .collect();
+        state.active_tool_names = valid;
+        rebuild_system_prompt(&mut state, &self.inner.cwd);
+        state.effective_system_prompt = state
+            .system_prompt_override
+            .clone()
+            .unwrap_or_else(|| state.base_system_prompt.clone());
+    }
+
+    /// Shared model registry handle (extension provider registration
+    /// mutates the catalog at runtime, oracle `registerProvider` binding).
+    pub fn model_registry(&self) -> Arc<tokio::sync::RwLock<ModelRegistry>> {
+        self.inner.registry.clone()
     }
 
     /// Whether a tool name passes the allow/deny registry filters.

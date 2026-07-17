@@ -37,6 +37,7 @@ export class StateMirror {
     if (update.idle !== undefined) this.state.idle = update.idle;
     if (update.thinkingLevel !== undefined) this.state.thinkingLevel = update.thinkingLevel;
     if (update.activeTools !== undefined) this.state.activeTools = update.activeTools;
+    if (update.allTools !== undefined) this.state.allTools = update.allTools;
     if (update.contextUsage !== undefined) this.state.contextUsage = update.contextUsage;
     if (update.systemPrompt !== undefined) this.state.systemPrompt = update.systemPrompt;
     if (update.footer !== undefined) this.state.footer = update.footer;

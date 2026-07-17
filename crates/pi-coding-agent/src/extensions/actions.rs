@@ -14,9 +14,9 @@ use pi_agent::CancellationToken;
 use pi_ai::Model;
 use pi_ext_protocol::{
     AppendEntryParams, CancelledResult, CompactParams, ForkParams, NavigateTreeParams,
-    NewSessionParams, Notification, ProtocolError, Request, RequestId, ResponseResult,
-    SendMessageParams, SendUserMessageParams, SetLabelParams, SetThinkingLevelParams,
-    SwitchSessionParams,
+    NewSessionParams, Notification, ProtocolError, RefreshToolsParams, Request, RequestId,
+    ResponseResult, SendMessageParams, SendUserMessageParams, SetLabelParams,
+    SetThinkingLevelParams, SwitchSessionParams,
 };
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -57,7 +57,9 @@ pub trait HostActions: Send + Sync {
     fn set_active_tools(&self, _tool_names: Vec<String>) -> BoxFuture<'static, ()> {
         ready(())
     }
-    fn refresh_tools(&self) -> BoxFuture<'static, ()> {
+    /// `refreshTools()` — the params carry the sidecar's current
+    /// registration snapshot (late `pi.registerTool` calls).
+    fn refresh_tools(&self, _params: RefreshToolsParams) -> BoxFuture<'static, ()> {
         ready(())
     }
     fn set_thinking_level(&self, _params: SetThinkingLevelParams) -> BoxFuture<'static, ()> {
@@ -123,6 +125,19 @@ pub trait HostActions: Send + Sync {
     fn replaced_send_user_message(&self, _params: SendUserMessageParams) -> BoxFuture<'static, ()> {
         ready(())
     }
+    /// `pi.registerProvider` at runtime (load-time registrations arrive in
+    /// the `initialized`/`refreshTools` snapshots). Ordered: the serve loop
+    /// awaits it before the next inbound frame.
+    fn provider_register(
+        &self,
+        _registration: pi_ext_protocol::ProviderRegistration,
+    ) -> BoxFuture<'static, ()> {
+        ready(())
+    }
+    /// `pi.unregisterProvider` at runtime.
+    fn provider_unregister(&self, _name: String) -> BoxFuture<'static, ()> {
+        ready(())
+    }
 }
 
 /// Frames C6 has no consumer for yet (`ui/frame`, `tool/update`,
@@ -168,6 +183,11 @@ pub fn spawn_action_server(
                     if let Some(token) = in_flight.remove(&id.get()) {
                         token.cancel();
                     }
+                }
+                Incoming::Barrier(done) => {
+                    // Everything enqueued before the fence has been handled
+                    // (notifications are awaited serially above).
+                    let _ = done.send(());
                 }
             }
         }
@@ -339,7 +359,7 @@ async fn handle_notification(
         Notification::ActionSetActiveTools(params) => {
             config.actions.set_active_tools(params.tool_names).await;
         }
-        Notification::ActionRefreshTools(_) => config.actions.refresh_tools().await,
+        Notification::ActionRefreshTools(params) => config.actions.refresh_tools(params).await,
         Notification::ActionSetThinkingLevel(params) => {
             config.actions.set_thinking_level(params).await;
         }
@@ -381,11 +401,18 @@ async fn handle_notification(
             }
         }
 
-        // Provider registrations mutate the reported registration set; the
-        // runtime model-catalog merge is C7 (F9).
-        Notification::ProviderRegister(_)
-        | Notification::ProviderUnregister(_)
-        | Notification::ProviderEvent(_)
+        // Runtime provider registration mutates the host model catalog
+        // (C7/F9); ordered through the serve loop like other actions.
+        Notification::ProviderRegister(registration) => {
+            config.actions.provider_register(registration).await;
+        }
+        Notification::ProviderUnregister(params) => {
+            config.actions.provider_unregister(params.name).await;
+        }
+
+        // `provider/event` streams + frames route through the composed
+        // fallback sink (C7 providers, C8 frames).
+        Notification::ProviderEvent(_)
         | Notification::ToolUpdate(_)
         | Notification::UiFrame(_)
         | Notification::UiDispose(_)

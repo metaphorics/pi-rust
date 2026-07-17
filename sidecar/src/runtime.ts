@@ -227,6 +227,7 @@ export async function bootRuntime(options: BootOptions): Promise<SidecarRuntime>
     cwd: init.cwd,
     getCommands: commandCatalog,
     createCommandContext: () => runner.createCommandContext(),
+    getRegistrations: () => toWire(registrations()),
   });
   bridged.turnSignal.setIdle(init.state.idle);
 
@@ -234,7 +235,11 @@ export async function bootRuntime(options: BootOptions): Promise<SidecarRuntime>
     registerProvider: (name: string, config: ProviderConfig) => {
       providers.set(name, { config });
       modelRegistry.registerProvider(name, config);
-      peer.notify("provider/register", { name, configDto: sanitizeProviderConfig(config) });
+      peer.notify("provider/register", {
+        name,
+        configDto: sanitizeProviderConfig(config),
+        ...(config.streamSimple !== undefined ? { hasStreamSimple: true } : {}),
+      });
     },
     unregisterProvider: (name: string) => {
       providers.delete(name);
@@ -268,6 +273,7 @@ export async function bootRuntime(options: BootOptions): Promise<SidecarRuntime>
     providers: [...providers.entries()].map(([name, provider]) => ({
       name,
       configDto: sanitizeProviderConfig(provider.config),
+      ...(provider.config.streamSimple !== undefined ? { hasStreamSimple: true } : {}),
       ...(provider.extensionPath !== undefined ? { extensionPath: provider.extensionPath } : {}),
     })),
   });
@@ -391,6 +397,7 @@ function toolRegistration(tool: RegisteredTool) {
     label: definition.label,
     description: definition.description,
     parameters: JSON.parse(JSON.stringify(definition.parameters)) as JsonValue,
+    ...(definition.promptSnippet !== undefined ? { promptSnippet: definition.promptSnippet } : {}),
     ...(definition.promptGuidelines !== undefined
       ? { promptGuidelines: definition.promptGuidelines.join("\n") }
       : {}),

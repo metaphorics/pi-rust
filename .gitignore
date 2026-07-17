@@ -9,6 +9,9 @@ node_modules/
 .npm
 dist/
 
+# Sidecar integration-test scratch extensions (bridge_providers.rs)
+sidecar/.test-ext-*/
+
 # Local reference material (never commit)
 /.references/
 /.outline/

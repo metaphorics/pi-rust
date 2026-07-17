@@ -215,6 +215,22 @@ pub trait ExtensionBridge: Send + Sync {
     fn bind_ui(&self, _ui: Arc<dyn ExtensionUiHost>) {}
 }
 
+/// Extension slash-command dispatch bound into
+/// [`crate::session::AgentSession`] (oracle `_tryExecuteExtensionCommand`,
+/// agent-session.ts:1228): `prompt("/name args")` executes the command —
+/// even during streaming — instead of starting a turn.
+pub trait ExtensionCommandHooks: Send + Sync {
+    /// Whether an extension registered `name` (oracle
+    /// `extensionRunner.getCommand(name)` truthiness).
+    fn has_command(&self, name: &str) -> bool;
+
+    /// Execute the command. Handler failures are reported through the
+    /// extension error channel (oracle emitError with `command:<name>`),
+    /// never surfaced to the prompt caller — the command counts as handled
+    /// either way.
+    fn execute(&self, name: String, args: String) -> BoxFuture<'static, ()>;
+}
+
 /// Decision returned by the `session_before_compact` hook.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub enum BeforeCompactDecision {
