@@ -1,5 +1,9 @@
 pub mod args;
+pub mod history;
+pub mod initial_message;
+pub mod model_select;
 pub mod session_picker;
+pub mod session_select;
 pub mod startup_ui;
 
 pub use args::{
