@@ -546,6 +546,63 @@ pub fn get_package_command_help(command: PackageCommand) -> String {
         ),
     }
 }
+/// Oracle `CONFIG_COMMAND_USAGE` (package-manager-cli.ts:90).
+pub fn get_config_command_usage() -> String {
+    format!("{APP_NAME} config [-l] [--approve|--no-approve]")
+}
+
+/// Oracle `printConfigCommandHelp` (package-manager-cli.ts:92-105), SGR
+/// stripped like every other package-command help in this module.
+pub fn get_config_command_help() -> String {
+    format!(
+        "Usage:\n  {}\n\nOpen the resource configuration TUI to enable or disable package resources.\nWithout -l, starts in global settings (~/{CONFIG_DIR_NAME}/agent/settings.json).\nPress Tab in the TUI to switch between global and project-local modes.\n\nOptions:\n  -l, --local       Edit project overrides ({CONFIG_DIR_NAME}/settings.json)\n  -a, --approve     Trust project-local files for this command with -l\n  -na, --no-approve Ignore project-local files for this command with -l\n",
+        get_config_command_usage()
+    )
+}
+
+/// Parsed `pi config` invocation (oracle handleConfigCommand:557-587).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ConfigCommandOptions {
+    pub help: bool,
+    pub local: bool,
+    pub project_trust_override: Option<bool>,
+    pub invalid_option: Option<String>,
+    pub invalid_argument: Option<String>,
+}
+
+/// `None` unless the first argument is `config`. Mirrors the oracle: the
+/// help check wins over everything; the first invalid token stops parsing.
+pub fn parse_config_command<S: AsRef<str>>(args: &[S]) -> Option<ConfigCommandOptions> {
+    if args.first()?.as_ref() != "config" {
+        return None;
+    }
+    let rest = &args[1..];
+    let mut options = ConfigCommandOptions::default();
+    if rest
+        .iter()
+        .any(|arg| matches!(arg.as_ref(), "-h" | "--help"))
+    {
+        options.help = true;
+        return Some(options);
+    }
+    for arg in rest {
+        let arg = arg.as_ref();
+        match arg {
+            "-l" | "--local" => options.local = true,
+            "-a" | "--approve" => options.project_trust_override = Some(true),
+            "-na" | "--no-approve" => options.project_trust_override = Some(false),
+            _ if arg.starts_with('-') => {
+                options.invalid_option = Some(arg.to_string());
+                break;
+            }
+            _ => {
+                options.invalid_argument = Some(arg.to_string());
+                break;
+            }
+        }
+    }
+    Some(options)
+}
 
 pub fn parse_package_command<S: AsRef<str>>(args: &[S]) -> Option<PackageCommandOptions> {
     let raw = args.first()?.as_ref();

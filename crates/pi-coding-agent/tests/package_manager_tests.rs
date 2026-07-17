@@ -840,6 +840,48 @@ fn cli_parser_preserves_aliases_conflicts_and_help() {
     assert!(help.contains("pi install git:git@github.com:user/repo"));
     assert!(help.ends_with('\n'));
 }
+/// Oracle handleConfigCommand parsing (package-manager-cli.ts:557-587):
+/// help wins over anything else, flags accumulate, the first invalid token
+/// stops parsing, non-`config` argv is not a config invocation.
+#[test]
+fn config_parser_matches_oracle_precedence() {
+    use pi_coding_agent::{get_config_command_help, get_config_command_usage, parse_config_command};
+
+    assert!(parse_config_command(&["install", "x"]).is_none());
+    assert!(parse_config_command(&[] as &[&str]).is_none());
+
+    let options = parse_config_command(&["config"]).unwrap();
+    assert_eq!(options, pi_coding_agent::ConfigCommandOptions::default());
+
+    // Help wins even after an invalid option.
+    let options = parse_config_command(&["config", "-bogus", "--help"]).unwrap();
+    assert!(options.help);
+    assert!(options.invalid_option.is_none());
+
+    let options = parse_config_command(&["config", "-l", "-a"]).unwrap();
+    assert!(options.local);
+    assert_eq!(options.project_trust_override, Some(true));
+
+    let options = parse_config_command(&["config", "--local", "-na"]).unwrap();
+    assert!(options.local);
+    assert_eq!(options.project_trust_override, Some(false));
+
+    let options = parse_config_command(&["config", "-x", "extra"]).unwrap();
+    assert_eq!(options.invalid_option.as_deref(), Some("-x"));
+    assert!(options.invalid_argument.is_none());
+
+    let options = parse_config_command(&["config", "extra", "-x"]).unwrap();
+    assert_eq!(options.invalid_argument.as_deref(), Some("extra"));
+    assert!(options.invalid_option.is_none());
+
+    assert_eq!(
+        get_config_command_usage(),
+        "pi config [-l] [--approve|--no-approve]"
+    );
+    let help = get_config_command_help();
+    assert!(help.starts_with("Usage:\n  pi config [-l] [--approve|--no-approve]\n"));
+    assert!(help.ends_with("with -l\n"));
+}
 
 #[test]
 fn binary_independent_install_list_remove_smoke() {

@@ -71,10 +71,11 @@ pub use package_manager::{
     ResolvedPaths, ResolvedResource, ResourceOrigin, ResourceType, apply_patterns, parse_source,
 };
 pub use package_manager_cli::{
-    InstallMethod, LatestRelease, PackageCommand, PackageCommandOptions, PackageCommandOutput,
-    ProcessSelfUpdater, SelfUpdateOutcome, SelfUpdater, UpdateTarget, detect_install_method,
+    ConfigCommandOptions, InstallMethod, LatestRelease, PackageCommand, PackageCommandOptions,
+    PackageCommandOutput, ProcessSelfUpdater, SelfUpdateOutcome, SelfUpdater, UpdateTarget,
+    detect_install_method, get_config_command_help, get_config_command_usage,
     get_package_command_help, get_package_command_usage, handle_package_command,
-    handle_package_command_with_self_updater, parse_package_command,
+    handle_package_command_with_self_updater, parse_config_command, parse_package_command,
 };
 pub use resource_loader::{
     DefaultResourceLoader, DiscoveredResources, ResourceLoaderOptions, ResourcePath,

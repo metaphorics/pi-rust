@@ -293,3 +293,60 @@ fn no_extensions_still_binds_explicit_extension_paths() {
         "-ne alone must never resolve Bun: {err}"
     );
 }
+
+// ============================================================================
+// `pi config` (oracle handleConfigCommand, package-manager-cli.ts:553-624)
+// ============================================================================
+
+const CONFIG_HELP: &str = "Usage:\n  pi config [-l] [--approve|--no-approve]\n\nOpen the resource configuration TUI to enable or disable package resources.\nWithout -l, starts in global settings (~/.pi/agent/settings.json).\nPress Tab in the TUI to switch between global and project-local modes.\n\nOptions:\n  -l, --local       Edit project overrides (.pi/settings.json)\n  -a, --approve     Trust project-local files for this command with -l\n  -na, --no-approve Ignore project-local files for this command with -l\n";
+
+#[test]
+fn config_help_prints_usage_and_exits_zero() {
+    let bin = Bin::new();
+    for flags in [&["config", "--help"][..], &["config", "-h"][..]] {
+        let output = bin.run(flags);
+        assert!(output.status.success());
+        assert_eq!(stdout(&output), CONFIG_HELP, "{flags:?}");
+        assert_eq!(stderr(&output), "", "{flags:?}");
+    }
+}
+
+#[test]
+fn config_rejects_unknown_option_and_argument() {
+    let bin = Bin::new();
+    let output = bin.run(&["config", "-x"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        stderr(&output),
+        "Unknown option -x for \"config\".\nUse \"pi --help\" or \"pi config [-l] [--approve|--no-approve]\".\n"
+    );
+    assert_eq!(stdout(&output), "");
+
+    let output = bin.run(&["config", "bogus"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        stderr(&output),
+        "Unexpected argument bogus.\nUsage: pi config [-l] [--approve|--no-approve]\n"
+    );
+    assert_eq!(stdout(&output), "");
+}
+
+/// `-l` requires project trust: with trust-requiring project resources,
+/// no saved decision, and no TTY the project resolves untrusted; `-na`
+/// forces the same refusal.
+#[test]
+fn config_local_refuses_untrusted_project() {
+    let bin = Bin::new();
+    std::fs::create_dir_all(bin.project_dir.join(".pi")).expect("project config dir");
+    std::fs::write(bin.project_dir.join(".pi/settings.json"), "{}").expect("project settings");
+    for flags in [&["config", "-l"][..], &["config", "-l", "-na"][..]] {
+        let output = bin.run(flags);
+        assert_eq!(output.status.code(), Some(1), "{flags:?}");
+        assert_eq!(
+            stderr(&output),
+            "Project is not trusted. Use --approve to modify local resource config.\n",
+            "{flags:?}"
+        );
+        assert_eq!(stdout(&output), "", "{flags:?}");
+    }
+}

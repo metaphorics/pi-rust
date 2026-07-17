@@ -55,7 +55,13 @@ use pi_coding_agent::session::{
 };
 use pi_coding_agent::settings_manager::SettingsManager;
 use pi_coding_agent::system_prompt::load_project_context_files;
-use pi_coding_agent::{AuthStorage, DefaultPackageManager, handle_package_command};
+use pi_coding_agent::modes::interactive::components::config_selector::{
+    ConfigSelectorComponent, ConfigWriteScope, ScopedResolvedPaths,
+};
+use pi_coding_agent::{
+    AuthStorage, DefaultPackageManager, get_config_command_help, get_config_command_usage,
+    handle_package_command, parse_config_command,
+};
 
 fn eprintln_red(message: &str) {
     eprintln!("\x1b[31m{message}\x1b[39m");
@@ -199,6 +205,162 @@ fn resolve_project_trusted(
         ]);
     }
     trusted
+}
+/// Oracle `selectConfig` (cli/config-selector.ts:20-56): standalone TUI
+/// hosting the config selector; returns when the selector is closed (Esc)
+/// or exited (q) — both exit the process with code 0 afterwards.
+fn select_config(
+    resolved_paths: &ScopedResolvedPaths,
+    settings_manager: Arc<Mutex<SettingsManager>>,
+    cwd: &Path,
+    agent_dir: &Path,
+    write_scope: ConfigWriteScope,
+    project_mode_available: bool,
+) {
+    let theme_name = settings_manager.lock().get_theme().map(str::to_owned);
+    init_theme(theme_name.as_deref(), true);
+    // Esc/Tab/confirm dispatch through the app keybinding catalog (the
+    // startup TUI installs the same set).
+    pi_tui::keybindings::set_keybindings(
+        pi_coding_agent::modes::interactive::app_keybindings::create_app_keybindings(agent_dir),
+    );
+    let mut ui = pi_tui::Tui::new(pi_tui::terminal::ProcessTerminal::new());
+    let rows = ui.terminal().rows();
+    let done = std::rc::Rc::new(std::cell::Cell::new(false));
+    let close_flag = done.clone();
+    let exit_flag = done.clone();
+    let selector = ConfigSelectorComponent::new(
+        resolved_paths,
+        settings_manager,
+        cwd,
+        agent_dir,
+        Box::new(move || close_flag.set(true)),
+        Box::new(move || exit_flag.set(true)),
+        // The loop below repaints every tick; explicit render requests are
+        // satisfied by the next iteration.
+        Box::new(|| {}),
+        Some(rows),
+        write_scope,
+        project_mode_available,
+    );
+    ui.add_child(selector);
+    ui.set_focus_child(Some(0));
+    ui.start_render_loop_hooks();
+    while !done.get() {
+        ui.poll_terminal();
+        ui.do_render();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    ui.stop();
+    pi_coding_agent::modes::interactive::theme::watcher::stop_theme_watcher();
+}
+
+/// Oracle `handleConfigCommand` (package-manager-cli.ts:553-624). Runs
+/// before general arg parsing; `Some(exit_code)` when the first argument
+/// is `config`.
+fn handle_config_command(raw_args: &[String], cwd: &Path, agent_dir: &Path) -> Option<i32> {
+    let options = parse_config_command(raw_args)?;
+    if options.help {
+        print!("{}", get_config_command_help());
+        return Some(0);
+    }
+    if let Some(arg) = &options.invalid_option {
+        eprintln!("Unknown option {arg} for \"config\".");
+        eprintln!(
+            "Use \"{} --help\" or \"{}\".",
+            pi_coding_agent::config::APP_NAME,
+            get_config_command_usage()
+        );
+        return Some(1);
+    }
+    if let Some(arg) = &options.invalid_argument {
+        eprintln!("Unexpected argument {arg}.");
+        eprintln!("Usage: {}", get_config_command_usage());
+        return Some(1);
+    }
+
+    // Oracle `createCommandSettingsManager`: the command settings manager
+    // starts untrusted (`{ projectTrusted: false }` — no project settings
+    // loaded) and receives the resolved trust afterwards. Trust is prompted
+    // interactively only when both stdio ends are TTYs
+    // (`getCommandAppMode`, package-manager-cli.ts:495-497).
+    let startup_settings = {
+        let mut settings = SettingsManager::create(cwd, Some(agent_dir.to_path_buf()));
+        settings.set_project_trusted(false);
+        Arc::new(Mutex::new(settings))
+    };
+    let default_project_trust = startup_settings
+        .lock()
+        .get_default_project_trust()
+        .to_string();
+    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let trusted = resolve_project_trusted(
+        cwd,
+        agent_dir,
+        options.project_trust_override,
+        &default_project_trust,
+        interactive.then_some(&startup_settings),
+    );
+    // Oracle sets projectTrusted on the command settings manager before
+    // anything reads it (createCommandSettingsManager): untrusted managers
+    // hold no project settings and surface no project parse errors.
+    startup_settings.lock().set_project_trusted(trusted);
+    if options.local && !trusted {
+        eprintln!("Project is not trusted. Use --approve to modify local resource config.");
+        return Some(1);
+    }
+    // Oracle `reportSettingsErrors(settingsManager, "config command")`.
+    for (scope, error) in startup_settings.lock().load_errors() {
+        eprintln_yellow(&format!(
+            "Warning (config command, {scope} settings): {error}"
+        ));
+    }
+
+    let mut global_settings = SettingsManager::create(cwd, Some(agent_dir.to_path_buf()));
+    global_settings.set_project_trusted(false);
+    let mut global_manager = DefaultPackageManager::new(cwd, agent_dir, global_settings);
+    let global_paths = match global_manager.resolve() {
+        Ok(paths) => paths,
+        Err(error) => {
+            eprintln_red(&format!("Error: {error}"));
+            return Some(1);
+        }
+    };
+    let project_paths = if trusted {
+        let mut settings = SettingsManager::create(cwd, Some(agent_dir.to_path_buf()));
+        settings.set_project_trusted(true);
+        match DefaultPackageManager::new(cwd, agent_dir, settings).resolve() {
+            Ok(paths) => paths,
+            Err(error) => {
+                eprintln_red(&format!("Error: {error}"));
+                return Some(1);
+            }
+        }
+    } else {
+        global_paths.clone()
+    };
+
+    let selector_settings = {
+        let mut settings = SettingsManager::create(cwd, Some(agent_dir.to_path_buf()));
+        settings.set_project_trusted(trusted);
+        Arc::new(Mutex::new(settings))
+    };
+    select_config(
+        &ScopedResolvedPaths {
+            global: global_paths,
+            project: project_paths,
+        },
+        selector_settings,
+        cwd,
+        agent_dir,
+        if options.local {
+            ConfigWriteScope::Project
+        } else {
+            ConfigWriteScope::Global
+        },
+        trusted,
+    );
+    Some(0)
 }
 
 /// CLI flags consumed inside the runtime factory (cloned once; `messages`
@@ -592,6 +754,10 @@ async fn main() {
             }
             std::process::exit(output.exit_code);
         }
+    }
+    // `pi config` runs before general arg parsing (main.ts:504-506).
+    if let Some(exit_code) = handle_config_command(&raw_args, &cwd, &agent_dir) {
+        std::process::exit(exit_code);
     }
 
     let mut parsed = cli::parse_args(&raw_args);

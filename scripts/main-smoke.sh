@@ -294,6 +294,67 @@ if command -v tmux >/dev/null 2>&1; then
     sleep 0.25
   done
   tmux kill-session -t pi-main-smoke 2>/dev/null
+  # ---------------------------------------------------- pi config (tmux)
+  # Non-interactive surfaces first: help text and error exits.
+  out=$("$BIN" config --help); rc=$?
+  check "config --help exit" 0 "$rc"
+  check_contains "config --help usage" "pi config [-l] [--approve|--no-approve]" "$out"
+  err=$("$BIN" config -x 2>&1 >/dev/null); rc=$?
+  check "config unknown option exit" 1 "$rc"
+  check_contains "config unknown option text" 'Unknown option -x for "config".' "$err"
+
+  # Interactive selector: reinstall the local package so a resource row
+  # exists, open the TUI, toggle it off with Space, close with Esc.
+  "$BIN" install "$WORK/local-pkg" >/dev/null 2>&1
+  tmux kill-session -t pi-config-smoke 2>/dev/null
+  tmux new-session -d -s pi-config-smoke -x 100 -y 30 \
+    "env PI_CODING_AGENT_DIR='$AGENT' PI_OFFLINE=1 '$BIN' config; echo config-exit=\$?; sleep 30"
+  cfg_ok=0
+  for _ in $(seq 1 40); do
+    if tmux capture-pane -t pi-config-smoke -p 2>/dev/null | grep -q "Global Resources"; then cfg_ok=1; break; fi
+    sleep 0.25
+  done
+  check "config TUI shows Global Resources" 1 "$cfg_ok"
+  tmux capture-pane -t pi-config-smoke -p 2>/dev/null | grep -q "demo" && cfg_demo=1 || cfg_demo=0
+  check "config TUI lists installed skill" 1 "$cfg_demo"
+  tmux send-keys -t pi-config-smoke Space
+  sleep 0.5
+  tmux send-keys -t pi-config-smoke Escape
+  cfg_exit=""
+  for _ in $(seq 1 20); do
+    cfg_exit=$(tmux capture-pane -t pi-config-smoke -p 2>/dev/null | sed -n 's/.*config-exit=\([0-9]*\).*/\1/p' | tail -1)
+    [ -n "$cfg_exit" ] && break
+    sleep 0.25
+  done
+  check "config Esc exits 0" 0 "$cfg_exit"
+  check_contains "config toggle persisted disable pattern" '"-skills/demo/SKILL.md"' "$(cat "$AGENT/settings.json")"
+  tmux kill-session -t pi-config-smoke 2>/dev/null
+  # -l -a: project write scope — header starts in project mode, Space pins
+  # an unload override into $PROJ/.pi/settings.json (global file untouched).
+  GLOBAL_BEFORE=$(cat "$AGENT/settings.json")
+  tmux new-session -d -s pi-config-smoke -x 100 -y 30 \
+    "env PI_CODING_AGENT_DIR='$AGENT' PI_OFFLINE=1 '$BIN' config -l -a; echo config-exit=\$?; sleep 30"
+  cfg_local=0
+  for _ in $(seq 1 40); do
+    if tmux capture-pane -t pi-config-smoke -p 2>/dev/null | grep -q "Project Local Resources"; then cfg_local=1; break; fi
+    sleep 0.25
+  done
+  check "config -l shows Project Local Resources" 1 "$cfg_local"
+  tmux send-keys -t pi-config-smoke Space
+  sleep 0.5
+  tmux send-keys -t pi-config-smoke Escape
+  cfg_exit=""
+  for _ in $(seq 1 20); do
+    cfg_exit=$(tmux capture-pane -t pi-config-smoke -p 2>/dev/null | sed -n 's/.*config-exit=\([0-9]*\).*/\1/p' | tail -1)
+    [ -n "$cfg_exit" ] && break
+    sleep 0.25
+  done
+  check "config -l Esc exits 0" 0 "$cfg_exit"
+  check_contains "config -l writes project override" '"+skills/demo/SKILL.md"' "$(cat "$PROJ/.pi/settings.json" 2>/dev/null)"
+  check "config -l leaves global settings untouched" "$GLOBAL_BEFORE" "$(cat "$AGENT/settings.json")"
+  tmux kill-session -t pi-config-smoke 2>/dev/null
+  rm -rf -- "${PROJ:?}/.pi"
+  "$BIN" remove "$WORK/local-pkg" >/dev/null 2>&1
 else
   echo "skip - interactive PTY smoke (tmux missing)"
 fi

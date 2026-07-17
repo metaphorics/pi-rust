@@ -445,6 +445,18 @@ impl SettingsManager {
     pub fn project_settings(&self) -> &Settings {
         &self.project_settings
     }
+    /// Settings-file parse failures captured at load, as `(scope, message)`
+    /// pairs (oracle `drainErrors` payload; non-destructive snapshot).
+    pub fn load_errors(&self) -> Vec<(&'static str, String)> {
+        let mut errors = Vec::new();
+        if let Some(error) = &self.global_settings_load_error {
+            errors.push(("global", error.clone()));
+        }
+        if let Some(error) = &self.project_settings_load_error {
+            errors.push(("project", error.clone()));
+        }
+        errors
+    }
 
     pub fn is_project_trusted(&self) -> bool {
         self.project_trusted
