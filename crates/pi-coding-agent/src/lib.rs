@@ -41,10 +41,20 @@ pub use config::{
     get_package_dir, get_sessions_dir, get_settings_path,
 };
 pub use extension_bridge::{
-    DiscoveredExtensions, ExtensionBridge, ExtensionUiHost, ForkPosition, HookOutcome,
-    NoopExtensionBridge, NotifyType, RegisteredCommand, SessionLifecycleEvent,
-    SessionShutdownReason, SessionStartReason, UiDialogOptions, WidgetPlacement,
+    BeforeCompactDecision, CompactHooks, CompactionOverride, DiscoveredExtensions,
+    ExtensionBridge, ExtensionUiHost, ForkPosition, HookOutcome, NoopExtensionBridge, NotifyType,
+    RegisteredCommand, SessionLifecycleEvent, SessionShutdownReason, SessionStartReason,
+    UiDialogOptions, WidgetPlacement,
 };
+pub use extensions::actions::{ActionServerConfig, HostActions, NotificationSink};
+pub use extensions::binding::{
+    BindOptions, ExtensionBinding, SessionHostActions, SidecarBridge, bind_extensions,
+};
+pub use extensions::events::{
+    DEFAULT_HOOK_TIMEOUT, EmitError, EventForwarder, ExtensionErrorSink, StateOverlay,
+    StateSource, agent_thinking_level, session_state_block, wire_thinking_level,
+};
+pub use extensions::session_sync::{SessionSync, session_file_string};
 pub use extensions::{
     BridgeState, BunEnvironment, ClientConfig, ClientError, DeadReason, DisabledReason,
     ExtensionHost, ExtensionHostConfig, ExtensionPathError, HostError, Incoming, LauncherSource,

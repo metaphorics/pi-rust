@@ -429,7 +429,11 @@ async fn handle_command(
                 Ok(p) => p,
                 Err(response) => return Some(*response),
             };
-            match runtime.new_session(p.parent_session).await {
+            // RPC requests have no cancel frames; a fresh token never fires.
+            match runtime
+                .new_session(p.parent_session, &pi_agent::CancellationToken::new())
+                .await
+            {
                 Ok(result) => Some(success(
                     id,
                     "new_session",
@@ -672,7 +676,11 @@ async fn handle_command(
                 Err(response) => return Some(*response),
             };
             match runtime
-                .switch_session(Path::new(&p.session_path), None)
+                .switch_session(
+                    Path::new(&p.session_path),
+                    None,
+                    &pi_agent::CancellationToken::new(),
+                )
                 .await
             {
                 Ok(result) => Some(success(
@@ -690,7 +698,11 @@ async fn handle_command(
                 Err(response) => return Some(*response),
             };
             match runtime
-                .fork(&p.entry_id, crate::extension_bridge::ForkPosition::Before)
+                .fork(
+                    &p.entry_id,
+                    crate::extension_bridge::ForkPosition::Before,
+                    &pi_agent::CancellationToken::new(),
+                )
                 .await
             {
                 Ok(result) => {
@@ -715,7 +727,11 @@ async fn handle_command(
                 ));
             };
             match runtime
-                .fork(&leaf_id, crate::extension_bridge::ForkPosition::At)
+                .fork(
+                    &leaf_id,
+                    crate::extension_bridge::ForkPosition::At,
+                    &pi_agent::CancellationToken::new(),
+                )
                 .await
             {
                 Ok(result) => Some(success(

@@ -347,6 +347,9 @@ struct SessionInner {
     /// `true` while an agent run (incl. post-run continuation) is active.
     active_tx: tokio::sync::watch::Sender<bool>,
     active_rx: tokio::sync::watch::Receiver<bool>,
+    /// Phase 6 blocking compaction hooks (sidecar `session_before_compact` /
+    /// `session_compact`); `None` = zero extensions, zero overhead.
+    compact_hooks: Mutex<Option<Arc<dyn crate::extension_bridge::CompactHooks>>>,
 }
 
 impl SessionInner {
@@ -588,6 +591,7 @@ impl AgentSession {
                 next_listener_id: AtomicU64::new(1),
                 active_tx,
                 active_rx,
+                compact_hooks: Mutex::new(None),
             }),
         }
     }
@@ -604,6 +608,15 @@ impl AgentSession {
         move || {
             inner.listeners.lock().retain(|(lid, _)| *lid != id);
         }
+    }
+
+    /// Bind (or clear) the Phase 6 compaction hooks. Bound once by the
+    /// extension binding right after session creation.
+    pub fn bind_compact_hooks(
+        &self,
+        hooks: Option<Arc<dyn crate::extension_bridge::CompactHooks>>,
+    ) {
+        *self.inner.compact_hooks.lock() = hooks;
     }
 
     // =====================================================================
@@ -708,8 +721,14 @@ impl AgentSession {
         f(&self.inner.state.lock().session_manager)
     }
 
-    /// Run a closure with mutable session-manager access (runtime fork path).
-    pub(crate) fn with_session_manager_mut<R>(
+    /// Whether two handles refer to the same live session.
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    /// Run a closure with mutable session-manager access (runtime fork path,
+    /// extension `appendEntry`/`setLabel` bindings, test seeding).
+    pub fn with_session_manager_mut<R>(
         &self,
         f: impl FnOnce(&mut SessionManager) -> R,
     ) -> R {
@@ -3439,6 +3458,63 @@ pub struct CompactionPreparation {
     pub settings: CompactionSettings,
 }
 
+/// Serialize a [`CompactionPreparation`] with the oracle's camelCase field
+/// names (compaction.ts:615-631) for the `session_before_compact` wire event.
+/// pi hands handlers real `Set` objects for `fileOps`; over the wire those
+/// become sorted arrays (the only JSON encoding of a set).
+pub fn preparation_to_value(preparation: &CompactionPreparation) -> Value {
+    let mut value = serde_json::Map::new();
+    value.insert(
+        "firstKeptEntryId".into(),
+        Value::String(preparation.first_kept_entry_id.clone()),
+    );
+    value.insert(
+        "messagesToSummarize".into(),
+        serde_json::to_value(&preparation.messages_to_summarize).unwrap_or(Value::Array(vec![])),
+    );
+    value.insert(
+        "turnPrefixMessages".into(),
+        serde_json::to_value(&preparation.turn_prefix_messages).unwrap_or(Value::Array(vec![])),
+    );
+    value.insert("isSplitTurn".into(), Value::Bool(preparation.is_split_turn));
+    value.insert("tokensBefore".into(), preparation.tokens_before.into());
+    if let Some(previous_summary) = &preparation.previous_summary {
+        value.insert(
+            "previousSummary".into(),
+            Value::String(previous_summary.clone()),
+        );
+    }
+    let set_to_value = |set: &std::collections::BTreeSet<String>| {
+        Value::Array(set.iter().cloned().map(Value::String).collect())
+    };
+    value.insert(
+        "fileOps".into(),
+        serde_json::json!({
+            "read": set_to_value(&preparation.file_ops.read),
+            "written": set_to_value(&preparation.file_ops.written),
+            "edited": set_to_value(&preparation.file_ops.edited),
+        }),
+    );
+    value.insert(
+        "settings".into(),
+        serde_json::json!({
+            "enabled": preparation.settings.enabled,
+            "reserveTokens": preparation.settings.reserve_tokens,
+            "keepRecentTokens": preparation.settings.keep_recent_tokens,
+        }),
+    );
+    Value::Object(value)
+}
+
+/// Serialize session entries for wire transport (byte-compatible field order
+/// comes from the `SessionEntry` serde impls).
+pub fn entries_to_values(entries: &[crate::session_types::SessionEntry]) -> Vec<Value> {
+    entries
+        .iter()
+        .filter_map(|entry| serde_json::to_value(entry).ok())
+        .collect()
+}
+
 /// Oracle `prepareCompaction` (compaction.ts:559-641).
 pub fn prepare_compaction(
     path_entries: &[crate::session_types::SessionEntry],
@@ -3857,37 +3933,91 @@ impl AgentSession {
             }
         };
 
-        let thinking_level = self.thinking_level();
-        let request = SummarizationRequest {
-            stream_fn: &self.inner.stream_fn,
-            model: &model,
-            thinking_level,
-            cancel,
+        // Phase 6 hook: oracle emits `session_before_compact` after
+        // preparation, before summarization (agent-session.ts:1765).
+        let hooks = self.inner.compact_hooks.lock().clone();
+        let mut from_extension = false;
+        let mut extension_compaction: Option<crate::extension_bridge::CompactionOverride> = None;
+        if let Some(hooks) = &hooks {
+            let decision = hooks
+                .session_before_compact(
+                    preparation_to_value(&preparation),
+                    entries_to_values(&path_entries),
+                    custom_instructions.map(str::to_string),
+                    CompactionReason::Manual,
+                    false,
+                    cancel.clone(),
+                )
+                .await;
+            match decision {
+                crate::extension_bridge::BeforeCompactDecision::Proceed => {}
+                crate::extension_bridge::BeforeCompactDecision::Cancel => {
+                    return Err(COMPACTION_CANCELLED.to_string());
+                }
+                crate::extension_bridge::BeforeCompactDecision::Replace(over) => {
+                    from_extension = true;
+                    extension_compaction = Some(over);
+                }
+            }
+        }
+
+        let mut result = match extension_compaction {
+            Some(over) => CompactionResult {
+                summary: over.summary,
+                first_kept_entry_id: over.first_kept_entry_id,
+                tokens_before: over.tokens_before,
+                estimated_tokens_after: None,
+                details: over.details,
+            },
+            None => {
+                let thinking_level = self.thinking_level();
+                let request = SummarizationRequest {
+                    stream_fn: &self.inner.stream_fn,
+                    model: &model,
+                    thinking_level,
+                    cancel,
+                };
+                compact_prepared(&request, &preparation, custom_instructions).await?
+            }
         };
-        let mut result = compact_prepared(&request, &preparation, custom_instructions).await?;
 
         if cancel.is_cancelled() {
             return Err(COMPACTION_CANCELLED.to_string());
         }
 
-        let estimated_tokens_after = {
+        let (estimated_tokens_after, compaction_entry) = {
             let mut state = self.inner.state.lock();
-            let _ = state.session_manager.append_compaction(
-                result.summary.clone(),
-                result.first_kept_entry_id.clone(),
-                result.tokens_before,
-                result.details.clone(),
-                Some(false),
-            );
+            let entry_id = state
+                .session_manager
+                .append_compaction(
+                    result.summary.clone(),
+                    result.first_kept_entry_id.clone(),
+                    result.tokens_before,
+                    result.details.clone(),
+                    Some(from_extension),
+                )
+                .ok();
+            let compaction_entry = entry_id
+                .and_then(|id| state.session_manager.get_entry(&id).cloned())
+                .and_then(|entry| serde_json::to_value(entry).ok());
             let session_context = state.session_manager.build_session_context();
             state.messages = session_context
                 .messages
                 .into_iter()
                 .filter_map(value_to_agent_message)
                 .collect();
-            estimate_context_tokens(&state.messages).tokens
+            (estimate_context_tokens(&state.messages).tokens, compaction_entry)
         };
         result.estimated_tokens_after = Some(estimated_tokens_after);
+
+        // Oracle emits `session_compact` before compact() resolves
+        // (agent-session.ts:1832); pending ctx.compact() callbacks in the
+        // sidecar settle off this event.
+        if let (Some(hooks), Some(entry)) = (&hooks, compaction_entry) {
+            hooks
+                .session_compact(entry, from_extension, CompactionReason::Manual, false)
+                .await;
+        }
         Ok(result)
     }
 
@@ -4037,14 +4167,63 @@ impl AgentSession {
         let cancel = CancellationToken::new();
         self.inner.state.lock().auto_compaction_cancel = Some(cancel.clone());
 
-        let thinking_level = self.thinking_level();
-        let request = SummarizationRequest {
-            stream_fn: &self.inner.stream_fn,
-            model: &model,
-            thinking_level,
-            cancel: &cancel,
+        // Phase 6 hook (oracle agent-session.ts:2032): after compaction_start
+        // and the abort controller, before summarization.
+        let hooks = self.inner.compact_hooks.lock().clone();
+        let mut from_extension = false;
+        let mut extension_compaction: Option<crate::extension_bridge::CompactionOverride> = None;
+        if let Some(hooks) = &hooks {
+            let decision = hooks
+                .session_before_compact(
+                    preparation_to_value(&preparation),
+                    entries_to_values(&path_entries),
+                    None,
+                    reason,
+                    will_retry,
+                    cancel.clone(),
+                )
+                .await;
+            match decision {
+                crate::extension_bridge::BeforeCompactDecision::Proceed => {}
+                crate::extension_bridge::BeforeCompactDecision::Cancel => {
+                    // Oracle: a cancelling handler aborts silently
+                    // (agent-session.ts:2043-2052).
+                    self.inner.state.lock().auto_compaction_cancel = None;
+                    self.inner.emit(&AgentSessionEvent::CompactionEnd {
+                        reason,
+                        result: None,
+                        aborted: true,
+                        will_retry: false,
+                        error_message: None,
+                    });
+                    return false;
+                }
+                crate::extension_bridge::BeforeCompactDecision::Replace(over) => {
+                    from_extension = true;
+                    extension_compaction = Some(over);
+                }
+            }
+        }
+
+        let compact_result = match extension_compaction {
+            Some(over) => Ok(CompactionResult {
+                summary: over.summary,
+                first_kept_entry_id: over.first_kept_entry_id,
+                tokens_before: over.tokens_before,
+                estimated_tokens_after: None,
+                details: over.details,
+            }),
+            None => {
+                let thinking_level = self.thinking_level();
+                let request = SummarizationRequest {
+                    stream_fn: &self.inner.stream_fn,
+                    model: &model,
+                    thinking_level,
+                    cancel: &cancel,
+                };
+                compact_prepared(&request, &preparation, None).await
+            }
         };
-        let compact_result = compact_prepared(&request, &preparation, None).await;
         self.inner.state.lock().auto_compaction_cancel = None;
 
         let mut result = match compact_result {
@@ -4088,25 +4267,38 @@ impl AgentSession {
             return false;
         }
 
-        let estimated_tokens_after = {
+        let (estimated_tokens_after, compaction_entry) = {
             let mut state = self.inner.state.lock();
-            let _ = state.session_manager.append_compaction(
-                result.summary.clone(),
-                result.first_kept_entry_id.clone(),
-                result.tokens_before,
-                result.details.clone(),
-                Some(false),
-            );
+            let entry_id = state
+                .session_manager
+                .append_compaction(
+                    result.summary.clone(),
+                    result.first_kept_entry_id.clone(),
+                    result.tokens_before,
+                    result.details.clone(),
+                    Some(from_extension),
+                )
+                .ok();
+            let compaction_entry = entry_id
+                .and_then(|id| state.session_manager.get_entry(&id).cloned())
+                .and_then(|entry| serde_json::to_value(entry).ok());
             let session_context = state.session_manager.build_session_context();
             state.messages = session_context
                 .messages
                 .into_iter()
                 .filter_map(value_to_agent_message)
                 .collect();
-            estimate_context_tokens(&state.messages).tokens
+            (estimate_context_tokens(&state.messages).tokens, compaction_entry)
         };
         result.estimated_tokens_after = Some(estimated_tokens_after);
 
+        // Oracle emits `session_compact` before compaction_end
+        // (agent-session.ts:2112-2119).
+        if let (Some(hooks), Some(entry)) = (&hooks, compaction_entry) {
+            hooks
+                .session_compact(entry, from_extension, reason, will_retry)
+                .await;
+        }
         self.inner.emit(&AgentSessionEvent::CompactionEnd {
             reason,
             result: Some(result),

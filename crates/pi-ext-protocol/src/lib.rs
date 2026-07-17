@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 
 use pi_ai::{
-    AssistantMessageEvent, Content, Context, Message, Model, ThinkingLevel, ToolResultMessage,
+    AssistantMessageEvent, Content, Context, Message, Model, ModelThinkingLevel, ToolResultMessage,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -772,8 +772,8 @@ pub enum ExtensionEvent {
         source: ModelSelectSource,
     },
     ThinkingLevelSelect {
-        level: ThinkingLevel,
-        previous_level: ThinkingLevel,
+        level: ModelThinkingLevel,
+        previous_level: ModelThinkingLevel,
     },
     UserBash {
         command: String,
@@ -935,7 +935,7 @@ pub struct StateBlock {
     pub active_tools: Vec<String>,
     pub all_tools: Vec<ToolInfo>,
     pub commands: Vec<CommandInfo>,
-    pub thinking_level: ThinkingLevel,
+    pub thinking_level: ModelThinkingLevel,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_usage: Option<ContextUsageDto>,
     pub system_prompt: String,
@@ -957,7 +957,7 @@ pub struct StateUpdate {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub idle: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub thinking_level: Option<ThinkingLevel>,
+    pub thinking_level: Option<ModelThinkingLevel>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_tools: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1208,7 +1208,7 @@ pub struct SetActiveToolsParams {
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SetThinkingLevelParams {
-    pub level: ThinkingLevel,
+    pub level: ModelThinkingLevel,
 }
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct CompactParams {
@@ -1561,7 +1561,7 @@ mod tests {
             active_tools: vec![],
             all_tools: vec![],
             commands: vec![],
-            thinking_level: ThinkingLevel::Minimal,
+            thinking_level: ModelThinkingLevel::Minimal,
             context_usage: None,
             system_prompt: String::new(),
             system_prompt_options: None,
@@ -1797,7 +1797,7 @@ mod tests {
             Notification::ActionShutdown(Empty {}),
             Notification::ActionAbort(Empty {}),
             Notification::ActionSetThinkingLevel(SetThinkingLevelParams {
-                level: ThinkingLevel::High,
+                level: ModelThinkingLevel::High,
             }),
             Notification::ActionCompact(CompactParams::default()),
             Notification::UiNotify(NotifyParams {
@@ -2019,8 +2019,8 @@ mod tests {
                 source: ModelSelectSource::Set,
             },
             ExtensionEvent::ThinkingLevelSelect {
-                level: ThinkingLevel::High,
-                previous_level: ThinkingLevel::Low,
+                level: ModelThinkingLevel::High,
+                previous_level: ModelThinkingLevel::Low,
             },
             ExtensionEvent::UserBash {
                 command: "true".into(),
@@ -2273,7 +2273,10 @@ mod tests {
         assert_eq!(serialized_new_str, expected_json_str);
 
         let result = ResponseResult::ok(&expected_new).unwrap();
-        assert_eq!(result.decode_ok::<ToolExecuteResult>().unwrap(), Some(expected_new));
+        assert_eq!(
+            result.decode_ok::<ToolExecuteResult>().unwrap(),
+            Some(expected_new)
+        );
     }
 
     #[test]

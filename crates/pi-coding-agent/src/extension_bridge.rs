@@ -185,10 +185,22 @@ pub trait ExtensionBridge: Send + Sync {
     /// Paths discovered by the resource loader (for diagnostics / spawn args).
     fn discovered_paths(&self) -> &[PathBuf];
 
-    /// Route a session lifecycle event through registered hooks. The default
-    /// (and `NoopExtensionBridge`) always continues.
-    fn emit_lifecycle(&self, _event: &SessionLifecycleEvent) -> HookOutcome {
-        HookOutcome::Continue
+    /// Route a session lifecycle event through registered hooks.
+    ///
+    /// Contract for implementations: non-blocking kinds (`session_start`,
+    /// `session_shutdown`) MUST be enqueued for delivery *before* the future
+    /// is returned, so a caller in a sync context (e.g. `dispose`) may drop
+    /// the future without losing the event. Only the blocking kinds
+    /// (`session_before_switch`, `session_before_fork`) carry a meaningful
+    /// outcome; `signal` (when provided) aborts an in-flight blocking hook
+    /// wait — implementations resolve to the pass-through default. The
+    /// default (and `NoopExtensionBridge`) always continues.
+    fn emit_lifecycle(
+        &self,
+        _event: SessionLifecycleEvent,
+        _signal: Option<CancellationToken>,
+    ) -> BoxFuture<'static, HookOutcome> {
+        Box::pin(std::future::ready(HookOutcome::Continue))
     }
 
     /// Extension-registered slash commands (RPC `get_commands`, interactive
@@ -201,6 +213,57 @@ pub trait ExtensionBridge: Send + Sync {
     /// sidecar routes extension `ctx.ui` calls to the bound host; without a
     /// sidecar there is nothing to route, so the default drops the handle.
     fn bind_ui(&self, _ui: Arc<dyn ExtensionUiHost>) {}
+}
+
+/// Decision returned by the `session_before_compact` hook.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum BeforeCompactDecision {
+    /// Run the built-in summarization (no handler contributed).
+    #[default]
+    Proceed,
+    /// A handler cancelled the compaction (oracle: "Compaction cancelled").
+    Cancel,
+    /// A handler supplied the compaction content (`fromExtension: true`).
+    Replace(CompactionOverride),
+}
+
+/// Extension-supplied compaction content (oracle `SessionBeforeCompactResult
+/// .compaction`, a `CompactionResult` subset).
+#[derive(Clone, Debug, PartialEq)]
+pub struct CompactionOverride {
+    pub summary: String,
+    pub first_kept_entry_id: String,
+    pub tokens_before: u64,
+    pub details: Option<serde_json::Value>,
+}
+
+/// Blocking compaction hooks bound into [`crate::session::AgentSession`]
+/// (oracle emit sites: agent-session.ts:1765 manual, :2032 auto).
+///
+/// `preparation` and `branch_entries`/`compaction_entry` cross as serialized
+/// JSON (camelCase, oracle shapes) because their schema is owned by the
+/// session layer and the sidecar parses them with pi's own code.
+pub trait CompactHooks: Send + Sync {
+    /// Fired after `prepareCompaction`, before summarization. `signal`
+    /// cancels in-flight handler work when the compaction is aborted.
+    fn session_before_compact(
+        &self,
+        preparation: serde_json::Value,
+        branch_entries: Vec<serde_json::Value>,
+        custom_instructions: Option<String>,
+        reason: crate::session::CompactionReason,
+        will_retry: bool,
+        signal: CancellationToken,
+    ) -> BoxFuture<'static, BeforeCompactDecision>;
+
+    /// Fired after the compaction entry is appended and agent state rebuilt.
+    fn session_compact(
+        &self,
+        compaction_entry: serde_json::Value,
+        from_extension: bool,
+        reason: crate::session::CompactionReason,
+        will_retry: bool,
+    ) -> BoxFuture<'static, ()>;
 }
 
 /// Placeholder bridge used until Phase 6.

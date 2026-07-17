@@ -1077,7 +1077,11 @@ impl ExtensionBridge for RecordingBridge {
     fn discovered_paths(&self) -> &[PathBuf] {
         &self.paths
     }
-    fn emit_lifecycle(&self, event: &SessionLifecycleEvent) -> HookOutcome {
+    fn emit_lifecycle(
+        &self,
+        event: SessionLifecycleEvent,
+        _signal: Option<pi_agent::CancellationToken>,
+    ) -> std::pin::Pin<Box<dyn Future<Output = HookOutcome> + Send + 'static>> {
         let tag = match event {
             SessionLifecycleEvent::SessionStart { .. } => "session_start",
             SessionLifecycleEvent::SessionBeforeSwitch { .. } => "session_before_switch",
@@ -1085,11 +1089,12 @@ impl ExtensionBridge for RecordingBridge {
             SessionLifecycleEvent::SessionShutdown { .. } => "session_shutdown",
         };
         self.log.lock().push(tag.to_string());
-        if self.cancel_next.swap(false, Ordering::SeqCst) {
+        let outcome = if self.cancel_next.swap(false, Ordering::SeqCst) {
             HookOutcome::Cancel
         } else {
             HookOutcome::Continue
-        }
+        };
+        Box::pin(std::future::ready(outcome))
     }
 }
 
@@ -1216,14 +1221,20 @@ async fn runtime_switch_new_and_fork_replace_sessions() {
     .expect("runtime");
 
     let original_session_id = runtime.session().session_id();
+    let never = pi_agent::CancellationToken::new();
 
     // Fork BEFORE a user message returns its text and replaces the session.
     let fork = runtime
-        .fork(&user_id, ForkPosition::Before)
+        .fork(&user_id, ForkPosition::Before, &never)
         .await
         .expect("fork");
     assert!(!fork.cancelled);
     assert_eq!(fork.selected_text.as_deref(), Some("hello"));
+    assert_eq!(
+        fork.previous_session_file.as_deref(),
+        Some(original_file.as_path()),
+        "fork reports the replaced session file"
+    );
     let forked_session = runtime.session();
     assert_ne!(forked_session.session_id(), original_session_id);
     // user message had no parent → brand-new session parented on the old file.
@@ -1240,7 +1251,7 @@ async fn runtime_switch_new_and_fork_replace_sessions() {
 
     // Switch back to the original session file.
     let switch = runtime
-        .switch_session(&original_file, None)
+        .switch_session(&original_file, None, &never)
         .await
         .expect("switch");
     assert!(!switch.cancelled);
@@ -1259,7 +1270,7 @@ async fn runtime_switch_new_and_fork_replace_sessions() {
 
     // Fork AT the assistant entry branches the file with re-chained entries.
     let fork = runtime
-        .fork(&assistant_id, ForkPosition::At)
+        .fork(&assistant_id, ForkPosition::At, &never)
         .await
         .expect("fork at");
     assert!(!fork.cancelled);
@@ -1284,14 +1295,31 @@ async fn runtime_switch_new_and_fork_replace_sessions() {
     // A cancelling hook aborts the switch and keeps the session.
     bridge.cancel_next.store(true, Ordering::SeqCst);
     let cancelled = runtime
-        .switch_session(&original_file, None)
+        .switch_session(&original_file, None, &never)
         .await
         .expect("cancelled switch");
     assert!(cancelled.cancelled);
+    assert_eq!(cancelled.previous_session_file, None);
     assert_eq!(runtime.session().session_id(), branched.session_id());
+    bridge.log.lock().clear();
+
+    // A pre-cancelled request token aborts the switch BEFORE any teardown:
+    // no hooks fire and the session is untouched.
+    let cancelled_token = pi_agent::CancellationToken::new();
+    cancelled_token.cancel();
+    let aborted = runtime
+        .switch_session(&original_file, None, &cancelled_token)
+        .await
+        .expect("token-cancelled switch");
+    assert!(aborted.cancelled);
+    assert_eq!(runtime.session().session_id(), branched.session_id());
+    assert!(
+        bridge.log.lock().is_empty(),
+        "a pre-cancelled token stops the replacement before any hook"
+    );
 
     // new_session replaces with a fresh persisted session.
-    let fresh = runtime.new_session(None).await.expect("new session");
+    let fresh = runtime.new_session(None, &never).await.expect("new session");
     assert!(!fresh.cancelled);
     assert_ne!(runtime.session().session_id(), branched.session_id());
     assert_eq!(
