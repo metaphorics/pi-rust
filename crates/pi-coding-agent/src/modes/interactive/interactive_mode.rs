@@ -1348,9 +1348,7 @@ impl InteractiveMode {
             }
             AppAction::MessageCopy => self.handle_copy_command(),
             AppAction::MessageFollowUp => self.handle_follow_up(),
-            AppAction::MessageDequeue => {
-                self.restore_queued_messages_to_editor(false);
-            }
+            AppAction::MessageDequeue => self.handle_dequeue(),
             AppAction::SessionNew => self.handle_clear_command(),
             AppAction::SessionTree => self.show_tree_selector(),
             AppAction::SessionFork => self.show_user_message_selector(),
@@ -3273,24 +3271,50 @@ impl InteractiveMode {
         }
     }
 
+    /// Oracle `handleFollowUp` (:3672-3702).
     fn handle_follow_up(&mut self) {
-        let text = self.editor.borrow().get_text();
+        let text = self.editor.borrow().get_expanded_text();
         let text = text.trim().to_owned();
         if text.is_empty() {
             return;
         }
-        if !self.session.is_streaming() && !self.session.is_compacting() {
-            return;
-        }
-        self.editor.borrow_mut().add_to_history(&text);
-        self.editor.borrow_mut().set_text("");
+        // Queue input during compaction (extension commands execute
+        // immediately, oracle :3677-3686).
         if self.session.is_compacting() {
-            self.queue_compaction_message(text, StreamingBehavior::FollowUp);
+            if self.dispatch_context().is_extension_command(&text) {
+                self.editor.borrow_mut().add_to_history(&text);
+                self.editor.borrow_mut().set_text("");
+                self.spawn_prompt(text);
+            } else {
+                self.queue_compaction_message(text, StreamingBehavior::FollowUp);
+            }
             return;
         }
-        self.session.follow_up(&text, Vec::new());
-        self.update_pending_messages_display();
-        self.tui.request_render(false);
+        // Streaming: queue a follow-up message (oracle :3690-3696).
+        if self.session.is_streaming() {
+            self.editor.borrow_mut().add_to_history(&text);
+            self.editor.borrow_mut().set_text("");
+            self.session.follow_up(&text, Vec::new());
+            self.update_pending_messages_display();
+            self.tui.request_render(false);
+            return;
+        }
+        // Idle: Alt+Enter acts like regular Enter (oracle :3697-3701).
+        self.editor.borrow_mut().set_text("");
+        self.on_submit(&text);
+    }
+
+    /// Oracle `handleDequeue` (:3704-3711).
+    fn handle_dequeue(&mut self) {
+        let restored = self.restore_queued_messages_to_editor(false);
+        if restored == 0 {
+            self.show_status("No queued messages to restore");
+        } else {
+            let plural = if restored > 1 { "s" } else { "" };
+            self.show_status(&format!(
+                "Restored {restored} queued message{plural} to editor"
+            ));
+        }
     }
 
     fn handle_session_command(&mut self) {

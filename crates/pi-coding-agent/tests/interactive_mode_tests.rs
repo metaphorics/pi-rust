@@ -1,16 +1,21 @@
 mod common;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use pi_agent::StreamFn;
-use pi_ai::{AssistantMessage, AssistantMessageEvent, Content, StopReason, TextContent, ToolCall};
+use pi_ai::{
+    AssistantMessage, AssistantMessageEvent, Content, Message, StopReason, TextContent, ToolCall,
+    UserContent,
+};
 use pi_coding_agent::modes::interactive::dispatch::{
     BuiltinCommand, DispatchAction, DispatchContext, dispatch_input,
 };
 use pi_coding_agent::modes::interactive::interactive_mode::{
     InteractiveMode, InteractiveModeOptions,
 };
+use pi_coding_agent::{ExtensionBridge, RegisteredCommand, SourceInfo};
 
 use common::vt_terminal::{VtHandle, VtTerminal};
 use common::{TestRuntimeOptions, assistant_text_message, make_runtime};
@@ -964,4 +969,344 @@ fn submit_dispatch_preserves_oracle_precedence() {
             excluded: true
         }
     );
+}
+
+// ============================================================================
+// Follow-up (Alt+Enter) / dequeue (Alt+Up) — oracle handleFollowUp (:3672)
+// and handleDequeue (:3704)
+// ============================================================================
+
+/// Kitty CSI-u encoding of Alt+Enter (matches independent of the global
+/// kitty-active flag, unlike legacy `\x1b\r`).
+const ALT_ENTER: &str = "\x1b[13;3u";
+/// CSI 1;3A — Alt+Up.
+const ALT_UP: &str = "\x1b[1;3A";
+
+#[tokio::test(flavor = "current_thread")]
+async fn idle_alt_enter_submits_like_enter() {
+    let seed = make_runtime(TestRuntimeOptions {
+        with_auth: true,
+        ..Default::default()
+    })
+    .await;
+    let response = assistant_text_message(&seed.model, "IDLE-FOLLOWUP-REPLY");
+    drop(seed);
+    let test = make_runtime(TestRuntimeOptions {
+        with_auth: true,
+        script: vec![response],
+        ..Default::default()
+    })
+    .await;
+    let (terminal, handle) = VtTerminal::new(80, 24);
+    let mut mode = InteractiveMode::new(
+        test.runtime.clone(),
+        terminal,
+        InteractiveModeOptions::default(),
+    );
+    mode.init();
+
+    send(&mut mode, &handle, "idle follow-up text");
+    send(&mut mode, &handle, ALT_ENTER);
+    let screen = pump_until(&mut mode, &handle, Duration::from_secs(2), |screen| {
+        screen.contains("IDLE-FOLLOWUP-REPLY")
+    })
+    .await;
+    // Submitted as a normal prompt: user message rendered, nothing queued.
+    assert!(screen.contains("idle follow-up text"));
+    assert!(!screen.contains("Follow-up:"), "{screen}");
+    assert!(test.runtime.session().get_follow_up_messages().is_empty());
+    assert_no_flicker(&handle);
+}
+
+/// Bridge that registers one extension command (`/ext`).
+struct CommandBridge;
+
+impl ExtensionBridge for CommandBridge {
+    fn needs_sidecar(&self) -> bool {
+        false
+    }
+
+    fn discovered_paths(&self) -> &[PathBuf] {
+        &[]
+    }
+
+    fn registered_commands(&self) -> Vec<RegisteredCommand> {
+        vec![RegisteredCommand {
+            invocation_name: "ext".to_owned(),
+            description: None,
+            source_info: SourceInfo::synthetic("test-ext", "test", None, None, None),
+        }]
+    }
+}
+
+fn last_user_text(messages: &[Message]) -> String {
+    messages
+        .iter()
+        .rev()
+        .find_map(|message| match message {
+            Message::User(user) => Some(match &user.content {
+                UserContent::Text(text) => text.clone(),
+                UserContent::Blocks(blocks) => blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        Content::Text(text) => Some(text.text.to_string()),
+                        _ => None,
+                    })
+                    .collect(),
+            }),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// Stream fn keyed on the EXACT latest user text: known prompts answer
+/// immediately, anything else (the compaction summarization request) stalls,
+/// holding `is_compacting()` true for the duration of the test.
+fn compaction_routing_stream_fn() -> StreamFn {
+    Arc::new(move |model, context, _options| {
+        Box::pin(async move {
+            let stream = pi_ai::create_assistant_message_event_stream();
+            let reply = match last_user_text(&context.messages).as_str() {
+                "seed please" => Some("SEED-DONE"),
+                "/ext go" => Some("EXT-RAN"),
+                _ => None,
+            };
+            if let Some(text) = reply {
+                let message = assistant_text_message(&model, text);
+                stream.push(AssistantMessageEvent::Done {
+                    reason: StopReason::Stop,
+                    message,
+                });
+            }
+            // else: no events — the summarization future stays pending.
+            stream
+        })
+    })
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn compaction_executes_extension_commands_and_queues_plain_text() {
+    let test = make_runtime(TestRuntimeOptions {
+        with_auth: true,
+        stream_fn: Some(compaction_routing_stream_fn()),
+        bridge: Some(Arc::new(CommandBridge)),
+        // Tiny keep-recent budget so the seeded exchanges are compactable.
+        global_settings: Some(serde_json::json!({
+            "compaction": { "keepRecentTokens": 1 }
+        })),
+        ..Default::default()
+    })
+    .await;
+    let session = test.runtime.session();
+    let (terminal, handle) = VtTerminal::new(100, 30);
+    let mut mode = InteractiveMode::new(
+        test.runtime.clone(),
+        terminal,
+        InteractiveModeOptions::default(),
+    );
+    mode.init();
+
+    // Seed two exchanges so prepare_compaction finds a cut point between
+    // turns, then start a compaction that never finishes (stalled
+    // summarization stream).
+    for _ in 0..2 {
+        send(&mut mode, &handle, "seed please");
+        send(&mut mode, &handle, "\r");
+        pump_until(&mut mode, &handle, Duration::from_secs(2), |screen| {
+            screen.contains("SEED-DONE")
+        })
+        .await;
+        pump_until(&mut mode, &handle, Duration::from_secs(2), |_| {
+            !test.runtime.session().is_streaming()
+        })
+        .await;
+    }
+    send(&mut mode, &handle, "/compact");
+    send(&mut mode, &handle, "\r");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while !session.is_compacting() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "compaction never started:\n{}",
+            handle.screen(|screen| screen.serialize())
+        );
+        mode.pump();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // Registered extension command: executes immediately via session.prompt.
+    send(&mut mode, &handle, "/ext go");
+    send(&mut mode, &handle, ALT_ENTER);
+    let screen = pump_until(&mut mode, &handle, Duration::from_secs(2), |screen| {
+        screen.contains("EXT-RAN")
+    })
+    .await;
+    assert!(
+        !screen.contains("Queued message for after compaction"),
+        "extension command was queued instead of executed:\n{screen}"
+    );
+    assert!(
+        session.is_compacting(),
+        "compaction should still be running"
+    );
+
+    // Plain text: queues for after compaction.
+    send(&mut mode, &handle, "plain queued text");
+    send(&mut mode, &handle, ALT_ENTER);
+    let screen = pump_until(&mut mode, &handle, Duration::from_secs(2), |screen| {
+        screen.contains("Queued message for after compaction")
+    })
+    .await;
+    assert!(screen.contains("Follow-up: plain queued text"), "{screen}");
+    assert_no_flicker(&handle);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dequeue_reports_zero_and_plural_restore_statuses() {
+    let test = make_runtime(TestRuntimeOptions {
+        with_auth: true,
+        stream_fn: Some(delayed_text_stream(
+            "SLOW-STREAM-BODY",
+            Duration::from_secs(5),
+        )),
+        ..Default::default()
+    })
+    .await;
+    let (terminal, handle) = VtTerminal::new(100, 30);
+    let mut mode = InteractiveMode::new(
+        test.runtime.clone(),
+        terminal,
+        InteractiveModeOptions::default(),
+    );
+    mode.init();
+
+    // Nothing queued: exact zero-restore status.
+    send(&mut mode, &handle, ALT_UP);
+    pump_until(&mut mode, &handle, Duration::from_secs(2), |screen| {
+        screen.contains("No queued messages to restore")
+    })
+    .await;
+
+    // Queue two follow-ups while streaming, then dequeue both.
+    send(&mut mode, &handle, "go now");
+    send(&mut mode, &handle, "\r");
+    pump_until(&mut mode, &handle, Duration::from_secs(2), |screen| {
+        screen.contains("SLOW-STREAM-BODY")
+    })
+    .await;
+    send(&mut mode, &handle, "first queued");
+    send(&mut mode, &handle, ALT_ENTER);
+    pump_until(&mut mode, &handle, Duration::from_secs(2), |screen| {
+        screen.contains("Follow-up: first queued")
+    })
+    .await;
+    send(&mut mode, &handle, "second queued");
+    send(&mut mode, &handle, ALT_ENTER);
+    pump_until(&mut mode, &handle, Duration::from_secs(2), |screen| {
+        screen.contains("Follow-up: second queued")
+    })
+    .await;
+    send(&mut mode, &handle, ALT_UP);
+    let screen = pump_until(&mut mode, &handle, Duration::from_secs(2), |screen| {
+        screen.contains("Restored 2 queued messages to editor")
+    })
+    .await;
+    // Both messages are back in the editor; queue display is gone.
+    assert!(screen.contains("first queued"));
+    assert!(screen.contains("second queued"));
+    assert!(!screen.contains("Follow-up: first queued"), "{screen}");
+    assert!(test.runtime.session().get_follow_up_messages().is_empty());
+    assert_no_flicker(&handle);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dequeue_reports_singular_restore_status() {
+    let test = make_runtime(TestRuntimeOptions {
+        with_auth: true,
+        stream_fn: Some(delayed_text_stream(
+            "SLOW-STREAM-BODY",
+            Duration::from_secs(5),
+        )),
+        ..Default::default()
+    })
+    .await;
+    let (terminal, handle) = VtTerminal::new(100, 30);
+    let mut mode = InteractiveMode::new(
+        test.runtime.clone(),
+        terminal,
+        InteractiveModeOptions::default(),
+    );
+    mode.init();
+
+    send(&mut mode, &handle, "go now");
+    send(&mut mode, &handle, "\r");
+    pump_until(&mut mode, &handle, Duration::from_secs(2), |screen| {
+        screen.contains("SLOW-STREAM-BODY")
+    })
+    .await;
+    send(&mut mode, &handle, "solo message");
+    send(&mut mode, &handle, ALT_ENTER);
+    pump_until(&mut mode, &handle, Duration::from_secs(2), |screen| {
+        screen.contains("Follow-up: solo message")
+    })
+    .await;
+    send(&mut mode, &handle, ALT_UP);
+    pump_until(&mut mode, &handle, Duration::from_secs(2), |screen| {
+        screen.contains("Restored 1 queued message to editor")
+    })
+    .await;
+    assert_no_flicker(&handle);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn follow_up_expands_large_paste_markers() {
+    let test = make_runtime(TestRuntimeOptions {
+        with_auth: true,
+        stream_fn: Some(delayed_text_stream(
+            "SLOW-STREAM-BODY",
+            Duration::from_secs(5),
+        )),
+        ..Default::default()
+    })
+    .await;
+    let session = test.runtime.session();
+    let (terminal, handle) = VtTerminal::new(100, 30);
+    let mut mode = InteractiveMode::new(
+        test.runtime.clone(),
+        terminal,
+        InteractiveModeOptions::default(),
+    );
+    mode.init();
+
+    send(&mut mode, &handle, "go now");
+    send(&mut mode, &handle, "\r");
+    pump_until(&mut mode, &handle, Duration::from_secs(2), |screen| {
+        screen.contains("SLOW-STREAM-BODY")
+    })
+    .await;
+
+    // Large bracketed paste collapses to a marker in the editor.
+    let pasted = "paste-line\n".repeat(12);
+    let pasted = pasted.trim_end();
+    send(&mut mode, &handle, &format!("\x1b[200~{pasted}\x1b[201~"));
+    pump_until(&mut mode, &handle, Duration::from_secs(2), |screen| {
+        screen.contains("[paste #1")
+    })
+    .await;
+
+    // Alt+Enter queues the EXPANDED text, not the marker.
+    send(&mut mode, &handle, ALT_ENTER);
+    pump_until(&mut mode, &handle, Duration::from_secs(2), |screen| {
+        screen.contains("Follow-up:")
+    })
+    .await;
+    let follow_up = session.get_follow_up_messages();
+    assert_eq!(follow_up.len(), 1, "{follow_up:?}");
+    assert!(
+        follow_up[0].contains("paste-line\npaste-line"),
+        "{:?}",
+        follow_up[0]
+    );
+    assert!(!follow_up[0].contains("[paste"), "{:?}", follow_up[0]);
+    assert_no_flicker(&handle);
 }
