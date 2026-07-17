@@ -3,14 +3,16 @@
 //! Owns the current [`AgentSession`] plus its cwd-bound services. Session
 //! replacement (switch/new/fork) tears down the current session first, then
 //! creates and applies the next runtime via the stored factory. Extension
-//! lifecycle hooks route through [`ExtensionBridge::emit_lifecycle`];
-//! [`NoopExtensionBridge`] always continues.
+//! lifecycle hooks route through [`ExtensionBridge::emit_lifecycle`]; the
+//! bridge starts as [`NoopExtensionBridge`] (always continues) and is
+//! replaced by the live `SidecarBridge` when extensions bind.
 
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
+use pi_agent::CancellationToken;
 
 use crate::extension_bridge::{
     ExtensionBridge, ForkPosition, HookOutcome, SessionLifecycleEvent, SessionShutdownReason,
@@ -66,12 +68,25 @@ pub struct ReplaceResult {
     pub cancelled: bool,
     /// Fork with `position: before` returns the selected user text.
     pub selected_text: Option<String>,
+    /// Session file of the replaced session (oracle `previousSessionFile`,
+    /// carried on the follow-up `session_start`). `None` when cancelled.
+    pub previous_session_file: Option<PathBuf>,
+}
+
+impl ReplaceResult {
+    fn cancelled() -> Self {
+        Self {
+            cancelled: true,
+            selected_text: None,
+            previous_session_file: None,
+        }
+    }
 }
 
 pub struct AgentSessionRuntime {
     state: Mutex<RuntimeState>,
     create_runtime: CreateRuntimeFactory,
-    bridge: Arc<dyn ExtensionBridge>,
+    bridge: Mutex<Arc<dyn ExtensionBridge>>,
 }
 
 impl AgentSessionRuntime {
@@ -92,7 +107,7 @@ impl AgentSessionRuntime {
                 rebind_session: None,
             }),
             create_runtime,
-            bridge,
+            bridge: Mutex::new(bridge),
         })
     }
 
@@ -122,32 +137,52 @@ impl AgentSessionRuntime {
 
     /// The extension bridge shared by this runtime (modes bind UI hosts here).
     pub fn bridge(&self) -> Arc<dyn ExtensionBridge> {
-        self.bridge.clone()
+        self.bridge.lock().clone()
+    }
+
+    /// Install a replacement bridge (`bind_extensions` swaps the initial
+    /// `NoopExtensionBridge` for the live `SidecarBridge`, routing
+    /// `session_shutdown` and the blocking before_switch/before_fork hooks
+    /// to the sidecar).
+    pub fn set_bridge(&self, bridge: Arc<dyn ExtensionBridge>) {
+        *self.bridge.lock() = bridge;
     }
 
     async fn emit_before_switch(
         &self,
         reason: SessionStartReason,
         target_session_file: Option<PathBuf>,
+        signal: &CancellationToken,
     ) -> bool {
         matches!(
-            self.bridge
-                .emit_lifecycle(SessionLifecycleEvent::SessionBeforeSwitch {
-                    reason,
-                    target_session_file,
-                })
+            self.bridge()
+                .emit_lifecycle(
+                    SessionLifecycleEvent::SessionBeforeSwitch {
+                        reason,
+                        target_session_file,
+                    },
+                    Some(signal.clone()),
+                )
                 .await,
             HookOutcome::Cancel
         )
     }
 
-    async fn emit_before_fork(&self, entry_id: &str, position: ForkPosition) -> bool {
+    async fn emit_before_fork(
+        &self,
+        entry_id: &str,
+        position: ForkPosition,
+        signal: &CancellationToken,
+    ) -> bool {
         matches!(
-            self.bridge
-                .emit_lifecycle(SessionLifecycleEvent::SessionBeforeFork {
-                    entry_id: entry_id.to_string(),
-                    position,
-                })
+            self.bridge()
+                .emit_lifecycle(
+                    SessionLifecycleEvent::SessionBeforeFork {
+                        entry_id: entry_id.to_string(),
+                        position,
+                    },
+                    Some(signal.clone()),
+                )
                 .await,
             HookOutcome::Cancel
         )
@@ -165,13 +200,13 @@ impl AgentSessionRuntime {
         target_session_file: Option<PathBuf>,
     ) {
         let session = self.session();
-        drop(
-            self.bridge
-                .emit_lifecycle(SessionLifecycleEvent::SessionShutdown {
-                    reason,
-                    target_session_file,
-                }),
-        );
+        drop(self.bridge().emit_lifecycle(
+            SessionLifecycleEvent::SessionShutdown {
+                reason,
+                target_session_file,
+            },
+            None,
+        ));
         session.dispose();
     }
 
@@ -194,19 +229,27 @@ impl AgentSessionRuntime {
     }
 
     /// Switch to an existing session file (oracle `switchSession`).
+    ///
+    /// `signal` cancels the replacement only BEFORE the teardown commits
+    /// (pre-hook and post-hook checks); past teardown the replacement always
+    /// completes — a late cancel frame must never strand a disposed session.
     pub async fn switch_session(
         &self,
         session_path: &Path,
         cwd_override: Option<&str>,
+        signal: &CancellationToken,
     ) -> Result<ReplaceResult, String> {
-        if self
-            .emit_before_switch(SessionStartReason::Resume, Some(session_path.to_path_buf()))
-            .await
+        if signal.is_cancelled()
+            || self
+                .emit_before_switch(
+                    SessionStartReason::Resume,
+                    Some(session_path.to_path_buf()),
+                    signal,
+                )
+                .await
+            || signal.is_cancelled()
         {
-            return Ok(ReplaceResult {
-                cancelled: true,
-                selected_text: None,
-            });
+            return Ok(ReplaceResult::cancelled());
         }
 
         let previous_session_file = self.session().session_file();
@@ -223,24 +266,33 @@ impl AgentSessionRuntime {
             agent_dir,
             session_manager,
             session_start_reason: SessionStartReason::Resume,
-            previous_session_file,
+            previous_session_file: previous_session_file.clone(),
         })
         .await?;
         self.apply(result);
         self.finish_session_replacement();
-        Ok(ReplaceResult::default())
+        Ok(ReplaceResult {
+            cancelled: false,
+            selected_text: None,
+            previous_session_file,
+        })
     }
 
     /// Start a fresh session in the current cwd (oracle `newSession`).
+    ///
+    /// See [`switch_session`](Self::switch_session) for `signal` semantics.
     pub async fn new_session(
         &self,
         parent_session: Option<String>,
+        signal: &CancellationToken,
     ) -> Result<ReplaceResult, String> {
-        if self.emit_before_switch(SessionStartReason::New, None).await {
-            return Ok(ReplaceResult {
-                cancelled: true,
-                selected_text: None,
-            });
+        if signal.is_cancelled()
+            || self
+                .emit_before_switch(SessionStartReason::New, None, signal)
+                .await
+            || signal.is_cancelled()
+        {
+            return Ok(ReplaceResult::cancelled());
         }
 
         let session = self.session();
@@ -274,28 +326,34 @@ impl AgentSessionRuntime {
             agent_dir,
             session_manager,
             session_start_reason: SessionStartReason::New,
-            previous_session_file,
+            previous_session_file: previous_session_file.clone(),
         })
         .await?;
         self.apply(result);
         self.finish_session_replacement();
-        Ok(ReplaceResult::default())
+        Ok(ReplaceResult {
+            cancelled: false,
+            selected_text: None,
+            previous_session_file,
+        })
     }
 
     /// Fork from an entry into a new session (oracle `fork`).
     ///
     /// `position: Before` (default) targets a user message and returns its
     /// text for the editor; `position: At` keeps the selected entry.
+    /// See [`switch_session`](Self::switch_session) for `signal` semantics.
     pub async fn fork(
         &self,
         entry_id: &str,
         position: ForkPosition,
+        signal: &CancellationToken,
     ) -> Result<ReplaceResult, String> {
-        if self.emit_before_fork(entry_id, position).await {
-            return Ok(ReplaceResult {
-                cancelled: true,
-                selected_text: None,
-            });
+        if signal.is_cancelled()
+            || self.emit_before_fork(entry_id, position, signal).await
+            || signal.is_cancelled()
+        {
+            return Ok(ReplaceResult::cancelled());
         }
 
         let session = self.session();
@@ -397,7 +455,7 @@ impl AgentSessionRuntime {
                 agent_dir,
                 session_manager,
                 session_start_reason: SessionStartReason::Fork,
-                previous_session_file,
+                previous_session_file: previous_session_file.clone(),
             })
             .await?;
             self.apply(result);
@@ -405,6 +463,7 @@ impl AgentSessionRuntime {
             return Ok(ReplaceResult {
                 cancelled: false,
                 selected_text,
+                previous_session_file,
             });
         };
 
@@ -420,7 +479,7 @@ impl AgentSessionRuntime {
             agent_dir,
             session_manager,
             session_start_reason: SessionStartReason::Fork,
-            previous_session_file,
+            previous_session_file: previous_session_file.clone(),
         })
         .await?;
         self.apply(result);
@@ -428,6 +487,7 @@ impl AgentSessionRuntime {
         Ok(ReplaceResult {
             cancelled: false,
             selected_text,
+            previous_session_file,
         })
     }
 
@@ -444,7 +504,9 @@ impl AgentSessionRuntime {
     ) -> Result<(), String> {
         let session = self.session();
         let previous_session_file = session.session_file();
-        self.teardown_current(SessionShutdownReason::Reload, previous_session_file.clone());
+        // Oracle reload (agent-session.ts:2546): session_shutdown carries
+        // reason "reload" and NO targetSessionFile.
+        self.teardown_current(SessionShutdownReason::Reload, None);
         between.await?;
         let session_manager = session.take_session_manager();
         let agent_dir = self.services().agent_dir.clone();

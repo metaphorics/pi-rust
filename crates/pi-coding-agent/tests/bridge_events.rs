@@ -24,9 +24,14 @@ mod common;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use pi_coding_agent::extension_bridge::SessionStartReason;
+use pi_agent::CancellationToken;
+use pi_coding_agent::HostActions;
+use pi_coding_agent::extension_bridge::{
+    BoxFuture, ExtensionUiHost, NotifyType, SessionStartReason, UiDialogOptions, WidgetPlacement,
+};
 use pi_coding_agent::extensions::binding::{BindOptions, ExtensionBinding, SessionHostActions};
 use pi_coding_agent::extensions::{
     BridgeState, BunEnvironment, LauncherSource, SidecarLauncher, resolve_bun,
@@ -34,10 +39,14 @@ use pi_coding_agent::extensions::{
 use pi_coding_agent::session::AgentSession;
 use pi_coding_agent::session::events::AgentSessionEvent;
 use pi_coding_agent::session_types::SessionEntry;
-use pi_ext_protocol::{CommandExecuteParams, ExtensionError, ExtensionEvent, Request};
+use pi_ext_protocol::{
+    CommandExecuteParams, ExtensionError, ExtensionEvent, Request, SwitchSessionParams,
+};
 use serde_json::{Value, json};
 
-use common::{TestRuntime, TestRuntimeOptions, assistant_text_message, make_runtime};
+use common::{
+    TestRuntime, TestRuntimeOptions, assistant_text_message, gated_stream_fn, make_runtime,
+};
 
 // ============================================================================
 // Fixture extensions (unmodified pi extension API, no imports needed)
@@ -148,7 +157,101 @@ export default function (pi) {
         description: "reload extensions",
         handler: async (_args, ctx) => { await ctx.reload(); },
     });
-    pi.on("session_start", (ev) => pi.appendEntry("start", { reason: ev.reason, gen }));
+    pi.on("session_start", (ev) => pi.appendEntry("start", {
+        reason: ev.reason, gen, prev: ev.previousSessionFile ?? null,
+    }));
+}
+"#;
+
+/// Lifecycle recorder + replacement drivers: a process-global array captures
+/// the exact event order (shutdown/start survive session replacement).
+const LIFECYCLE: &str = r#"
+const g = globalThis;
+export default function (pi) {
+    g.__order ??= [];
+    const push = (x) => g.__order.push(x);
+    pi.on("session_shutdown", (ev) => push({
+        e: "shutdown", reason: ev.reason, target: ev.targetSessionFile ?? null,
+    }));
+    pi.on("session_before_switch", (ev) => {
+        push({ e: "before_switch", reason: ev.reason, target: ev.targetSessionFile ?? null });
+        return undefined;
+    });
+    pi.on("session_before_fork", (ev) => {
+        push({ e: "before_fork", entryId: ev.entryId });
+        return undefined;
+    });
+    pi.on("session_start", (ev) => push({
+        e: "start", reason: ev.reason, prev: ev.previousSessionFile ?? null,
+    }));
+    pi.registerCommand("do-new", {
+        description: "new session",
+        handler: async (_args, ctx) => {
+            const r = await ctx.newSession();
+            pi.appendEntry("done", { op: "new", cancelled: r.cancelled });
+        },
+    });
+    pi.registerCommand("do-switch", {
+        description: "switch session",
+        handler: async (args, ctx) => {
+            const r = await ctx.switchSession(args);
+            pi.appendEntry("done", { op: "switch", cancelled: r.cancelled });
+        },
+    });
+    pi.registerCommand("do-fork", {
+        description: "fork",
+        handler: async (args, ctx) => {
+            const r = await ctx.fork(args);
+            pi.appendEntry("done", { op: "fork", cancelled: r.cancelled });
+        },
+    });
+    pi.registerCommand("report-order", {
+        description: "dump recorded order",
+        handler: async () => { pi.appendEntry("order", { order: g.__order }); },
+    });
+}
+"#;
+
+/// A before_switch hook that always cancels; shutdown observation proves (or
+/// disproves) that a teardown happened anyway.
+const CANCELLER: &str = r#"
+export default function (pi) {
+    pi.on("session_before_switch", () => ({ cancel: true }));
+    pi.on("session_shutdown", () => pi.appendEntry("shut", {}));
+    pi.registerCommand("try-switch", {
+        description: "switch that the hook cancels",
+        handler: async (args, ctx) => {
+            const r = await ctx.switchSession(args);
+            pi.appendEntry("done", { cancelled: r.cancelled });
+        },
+    });
+}
+"#;
+
+/// A before_switch hook that stalls long enough for a cancel frame to win.
+const SLOW_GATE: &str = r#"
+export default function (pi) {
+    pi.on("session_before_switch", async () => {
+        await new Promise((resolve) => setTimeout(resolve, 8000));
+        return undefined;
+    });
+    pi.on("session_shutdown", () => pi.appendEntry("shut", {}));
+}
+"#;
+
+/// Aborts its own ui.select through an AbortController: the sidecar emits a
+/// real `cancel` frame for the in-flight `ui/select` request.
+const DIALOG_ABORTER: &str = r#"
+export default function (pi) {
+    pi.registerCommand("dialog-abort", {
+        description: "abort a pending select",
+        handler: async (_args, ctx) => {
+            const controller = new AbortController();
+            setTimeout(() => controller.abort(), 100);
+            const choice = await ctx.ui.select("pick", ["a", "b"], { signal: controller.signal });
+            pi.appendEntry("dialog", { choice: choice ?? null });
+        },
+    });
 }
 "#;
 
@@ -243,6 +346,16 @@ impl Fixture {
 /// Build a persisted-session runtime, write the fixture extensions, and bind
 /// the REAL sidecar.
 async fn fixture(extensions: &[(&str, &str)], options: TestRuntimeOptions) -> Fixture {
+    fixture_with_ui(extensions, options, false).await
+}
+
+/// [`fixture`] with `hasUi` control: `true` makes the sidecar runner install
+/// its RPC-backed `ctx.ui` (dialogs cross the wire).
+async fn fixture_with_ui(
+    extensions: &[(&str, &str)],
+    options: TestRuntimeOptions,
+    has_ui: bool,
+) -> Fixture {
     let runtime = make_runtime(TestRuntimeOptions {
         persisted: true,
         with_auth: true,
@@ -264,20 +377,22 @@ async fn fixture(extensions: &[(&str, &str)], options: TestRuntimeOptions) -> Fi
     let cwd = runtime.tmp.path().join("project");
     let agent_dir = runtime.tmp.path().join("agent");
     let session_dir = runtime.tmp.path().join("sessions");
-    let binding = pi_coding_agent::extensions::binding::bind_extensions(
-        &session,
-        BindOptions::new(
-            paths,
-            LauncherSource::Resolved(real_launcher()),
-            cwd,
-            agent_dir,
-            session_dir,
-            Arc::new(move |error| sink_errors.lock().push(error)),
-            actions.clone(),
-        ),
-    )
-    .expect("canonical extension paths")
-    .expect("extensions discovered");
+    let mut bind_options = BindOptions::new(
+        paths,
+        LauncherSource::Resolved(real_launcher()),
+        cwd,
+        agent_dir,
+        session_dir,
+        Arc::new(move |error| sink_errors.lock().push(error)),
+        actions.clone(),
+    );
+    // Fix P6-dispatch: bind installs the SidecarBridge into the runtime's
+    // lifecycle path (session_shutdown + blocking hooks reach the sidecar).
+    bind_options.runtime = Some(runtime.runtime.clone());
+    bind_options.has_ui = has_ui;
+    let binding = pi_coding_agent::extensions::binding::bind_extensions(&session, bind_options)
+        .expect("canonical extension paths")
+        .expect("extensions discovered");
     actions.attach(&binding);
     actions.attach_runtime(runtime.runtime.clone());
 
@@ -621,6 +736,11 @@ async fn reload_reinits_in_place_and_recreates_the_session() {
         .find(|data| data["reason"] == "reload")
         .expect("reload start entry");
     assert_eq!(reload_start["gen"], 2, "factory re-ran in place");
+    assert_eq!(
+        reload_start["prev"],
+        Value::Null,
+        "reload session_start omits previousSessionFile (oracle types.ts:552)"
+    );
 
     // Same process (in-place re-init), fresh registrations, new session.
     let connection_after = fx
@@ -729,6 +849,364 @@ async fn crash_defers_the_single_respawn_to_the_next_turn_boundary() {
             .iter()
             .any(|command| command.invocation_name == "mirror-report")
     );
+
+    fx.binding.shutdown().await;
+}
+
+// ============================================================================
+// Lifecycle order + cancellation (P6-dispatch fixes)
+// ============================================================================
+
+/// Seed one user + one assistant message (the assistant append flushes the
+/// persisted file so `switchSession` can re-open it); returns the user id.
+fn seed_user_and_assistant(session: &AgentSession) -> String {
+    session.with_session_manager_mut(|sm| {
+        let user_id = sm
+            .append_message(json!({
+                "role": "user",
+                "content": [{"type": "text", "text": "hello"}],
+                "timestamp": 1
+            }))
+            .expect("seed user");
+        sm.append_message(json!({
+            "role": "assistant",
+            "content": [{"type": "text", "text": "world"}],
+            "api": "anthropic-messages",
+            "provider": "anthropic",
+            "model": "m",
+            "usage": {"input": 1, "output": 1, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 2,
+                       "cost": {"input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 0.0}},
+            "stopReason": "stop",
+            "timestamp": 2
+        }))
+        .expect("seed assistant");
+        user_id
+    })
+}
+
+fn path_string(path: &std::path::Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+/// Real-sidecar lifecycle order for new/switch/fork driven through pi's own
+/// command context actions: before-hook → session_shutdown (exact reason +
+/// targetSessionFile) → session_start (exact reason + previousSessionFile),
+/// observed by the extension across every replacement.
+#[tokio::test]
+async fn replacements_emit_shutdown_then_start_with_previous_file() {
+    let fx = fixture(
+        &[("lifecycle.ts", LIFECYCLE)],
+        TestRuntimeOptions::default(),
+    )
+    .await;
+    let user_id = seed_user_and_assistant(&fx.session());
+    let f0 = fx.session().session_file().expect("persisted session file");
+    fx.binding
+        .start(SessionStartReason::Startup)
+        .await
+        .expect("sidecar boots");
+
+    fx.execute_command("do-new", "").await.expect("do-new");
+    let f1 = fx.session().session_file().expect("replacement file");
+    assert_ne!(f0, f1, "new_session replaced the session");
+
+    fx.execute_command("do-switch", &path_string(&f0))
+        .await
+        .expect("do-switch");
+    assert_eq!(fx.session().session_file().as_deref(), Some(f0.as_path()));
+
+    fx.execute_command("do-fork", &user_id).await.expect("do-fork");
+    let f2 = fx.session().session_file().expect("fork file");
+    assert_ne!(f2, f0, "fork replaced the session");
+
+    // Dump the global order once everything (including the fork start) landed.
+    let expected = json!([
+        { "e": "start", "reason": "startup", "prev": null },
+        { "e": "before_switch", "reason": "new", "target": null },
+        { "e": "shutdown", "reason": "new", "target": path_string(&f1) },
+        { "e": "start", "reason": "new", "prev": path_string(&f0) },
+        { "e": "before_switch", "reason": "resume", "target": path_string(&f0) },
+        { "e": "shutdown", "reason": "resume", "target": path_string(&f0) },
+        { "e": "start", "reason": "resume", "prev": path_string(&f1) },
+        { "e": "before_fork", "entryId": user_id },
+        { "e": "shutdown", "reason": "fork", "target": path_string(&f2) },
+        { "e": "start", "reason": "fork", "prev": path_string(&f0) },
+    ]);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        fx.execute_command("report-order", "")
+            .await
+            .expect("report-order");
+        fx.wait_until("order report entry", |fx| !fx.obs("order").is_empty())
+            .await;
+        let order = fx.obs("order").pop().expect("order dump")["order"].clone();
+        if order == expected {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "lifecycle order mismatch;\n  got {order:#}\n  want {expected:#}\n  errors={:?}",
+            fx.errors.lock(),
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    fx.binding.shutdown().await;
+}
+
+/// A cancelling before_switch hook (real extension, real sidecar) aborts the
+/// replacement: `cancelled: true` returns to the extension, no
+/// session_shutdown fires, and the session is untouched.
+#[tokio::test]
+async fn before_switch_cancel_blocks_the_replacement() {
+    let fx = fixture(
+        &[("canceller.ts", CANCELLER)],
+        TestRuntimeOptions::default(),
+    )
+    .await;
+    seed_user_and_assistant(&fx.session());
+    let f0 = fx.session().session_file().expect("persisted session file");
+    let session_before = fx.session();
+    fx.binding
+        .start(SessionStartReason::Startup)
+        .await
+        .expect("sidecar boots");
+
+    fx.execute_command("try-switch", &path_string(&f0))
+        .await
+        .expect("try-switch");
+    fx.wait_until("cancelled switch result", |fx| !fx.obs("done").is_empty())
+        .await;
+    assert_eq!(fx.obs("done").pop().expect("done")["cancelled"], true);
+    assert!(
+        fx.obs("shut").is_empty(),
+        "no session_shutdown after a hook-cancelled switch"
+    );
+    assert!(
+        fx.session().ptr_eq(&session_before),
+        "session untouched after a hook-cancelled switch"
+    );
+
+    fx.binding.shutdown().await;
+}
+
+/// A cancel token fired while `waitForIdle` blocks on a streaming turn stops
+/// the wait immediately; the turn itself keeps running.
+#[tokio::test]
+async fn wait_for_idle_stops_on_request_cancellation() {
+    // Empty script: the gated stream fn answers with a fallback message once
+    // the gate opens; the turn stays open until then.
+    let script = Arc::new(parking_lot::Mutex::new(std::collections::VecDeque::new()));
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let fx = fixture(
+        &[("lifecycle.ts", LIFECYCLE)],
+        TestRuntimeOptions {
+            stream_fn: Some(gated_stream_fn(script, gate.clone())),
+            ..Default::default()
+        },
+    )
+    .await;
+    fx.binding
+        .start(SessionStartReason::Startup)
+        .await
+        .expect("sidecar boots");
+
+    // Hold a turn open behind the gate.
+    let session = fx.session();
+    let turn = tokio::spawn({
+        let session = session.clone();
+        async move {
+            let _ = session
+                .prompt("hi", pi_coding_agent::session::PromptOptions::default())
+                .await;
+        }
+    });
+    let busy_deadline = Instant::now() + Duration::from_secs(10);
+    while !session.is_streaming() {
+        assert!(Instant::now() < busy_deadline, "turn never started");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // waitForIdle blocks while streaming...
+    let token = CancellationToken::new();
+    let wait = fx.actions.wait_for_idle(token.clone());
+    tokio::pin!(wait);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), wait.as_mut())
+            .await
+            .is_err(),
+        "waitForIdle blocks while a turn streams"
+    );
+    // ...and a cancel frame's token stops it while the turn is still live.
+    token.cancel();
+    tokio::time::timeout(Duration::from_secs(2), wait)
+        .await
+        .expect("cancelled waitForIdle returns promptly");
+    assert!(session.is_streaming(), "the turn itself keeps running");
+
+    gate.notify_one();
+    turn.await.expect("turn completes");
+    fx.binding.shutdown().await;
+}
+
+/// A cancel token fired while the before_switch hook is still pending on the
+/// real sidecar aborts the replacement (`cancelled: true`) without tearing
+/// anything down — no partial lifecycle.
+#[tokio::test]
+async fn replacement_cancelled_mid_hook_leaves_the_session_intact() {
+    let fx = fixture(&[("slow.ts", SLOW_GATE)], TestRuntimeOptions::default()).await;
+    seed_user_and_assistant(&fx.session());
+    let f0 = fx.session().session_file().expect("persisted session file");
+    let session_before = fx.session();
+    fx.binding
+        .start(SessionStartReason::Startup)
+        .await
+        .expect("sidecar boots");
+
+    let token = CancellationToken::new();
+    let switch = fx.actions.switch_session(
+        SwitchSessionParams {
+            session_path: path_string(&f0),
+            with_session_token: None,
+        },
+        token.clone(),
+    );
+    let started = Instant::now();
+    let switch = tokio::spawn(switch);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    token.cancel();
+    let result = tokio::time::timeout(Duration::from_secs(4), switch)
+        .await
+        .expect("cancel beats the 8s hook")
+        .expect("switch task")
+        .expect("switch result");
+    assert!(result.cancelled, "cancelled replacement reports cancelled");
+    assert!(
+        started.elapsed() < Duration::from_secs(6),
+        "cancel aborted the in-flight hook wait"
+    );
+    assert!(
+        fx.session().ptr_eq(&session_before),
+        "session untouched by a cancelled replacement"
+    );
+    assert!(fx.obs("shut").is_empty(), "no session_shutdown fired");
+
+    // A pre-cancelled token stops the replacement before the hook even fires.
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    let result = fx
+        .actions
+        .new_session(pi_ext_protocol::NewSessionParams::default(), cancelled)
+        .await
+        .expect("pre-cancelled newSession");
+    assert!(result.cancelled);
+    assert!(fx.session().ptr_eq(&session_before));
+    assert!(fx.obs("shut").is_empty());
+
+    fx.binding.shutdown().await;
+}
+
+/// Host dialog provider that resolves only when its request token cancels.
+#[derive(Default)]
+struct HangingUi {
+    saw_cancel: Arc<AtomicBool>,
+}
+
+impl ExtensionUiHost for HangingUi {
+    fn select(
+        &self,
+        _title: String,
+        _options: Vec<String>,
+        opts: UiDialogOptions,
+    ) -> BoxFuture<'static, Option<String>> {
+        let saw_cancel = self.saw_cancel.clone();
+        let signal = opts.signal;
+        Box::pin(async move {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                if signal.as_ref().is_some_and(CancellationToken::is_cancelled) {
+                    saw_cancel.store(true, Ordering::SeqCst);
+                    return None;
+                }
+                if Instant::now() > deadline {
+                    return Some("timed-out".to_string());
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+    }
+    fn confirm(
+        &self,
+        _title: String,
+        _message: String,
+        _opts: UiDialogOptions,
+    ) -> BoxFuture<'static, bool> {
+        Box::pin(std::future::ready(false))
+    }
+    fn input(
+        &self,
+        _title: String,
+        _placeholder: Option<String>,
+        _opts: UiDialogOptions,
+    ) -> BoxFuture<'static, Option<String>> {
+        Box::pin(std::future::ready(None))
+    }
+    fn editor(
+        &self,
+        _title: String,
+        _prefill: Option<String>,
+    ) -> BoxFuture<'static, Option<String>> {
+        Box::pin(std::future::ready(None))
+    }
+    fn notify(&self, _message: String, _notify_type: Option<NotifyType>) {}
+    fn set_status(&self, _key: String, _text: Option<String>) {}
+    fn set_widget(
+        &self,
+        _key: String,
+        _lines: Option<Vec<String>>,
+        _placement: Option<WidgetPlacement>,
+    ) {
+    }
+    fn set_title(&self, _title: String) {}
+    fn set_editor_text(&self, _text: String) {}
+}
+
+/// End-to-end cancel FRAME plumbing: the sidecar aborts its own in-flight
+/// `ui/select` (AbortController → wire `cancel` frame) and the host's
+/// per-request token fires.
+#[tokio::test]
+async fn sidecar_cancel_frame_cancels_the_host_request_token() {
+    let fx = fixture_with_ui(
+        &[("aborter.ts", DIALOG_ABORTER)],
+        TestRuntimeOptions::default(),
+        true,
+    )
+    .await;
+    let ui = Arc::new(HangingUi::default());
+    fx.binding.bind_ui(ui.clone());
+    fx.binding
+        .start(SessionStartReason::Startup)
+        .await
+        .expect("sidecar boots");
+
+    fx.execute_command("dialog-abort", "")
+        .await
+        .expect("dialog-abort");
+    fx.wait_until("aborted dialog result", |fx| !fx.obs("dialog").is_empty())
+        .await;
+    assert_eq!(
+        fx.obs("dialog").pop().expect("dialog entry")["choice"],
+        Value::Null,
+        "extension observed the aborted select as undefined"
+    );
+    let cancel_deadline = Instant::now() + Duration::from_secs(5);
+    while !ui.saw_cancel.load(Ordering::SeqCst) {
+        assert!(
+            Instant::now() < cancel_deadline,
+            "the wire cancel frame never cancelled the host request token"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 
     fx.binding.shutdown().await;
 }

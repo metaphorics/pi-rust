@@ -543,8 +543,14 @@ impl EventForwarder {
         let _ = self.queue_tx.send(QueueItem::Session(event));
     }
 
-    /// Blocking lifecycle hooks (before_switch / before_fork).
-    pub async fn emit_lifecycle_blocking(&self, event: SessionLifecycleEvent) -> HookOutcome {
+    /// Blocking lifecycle hooks (before_switch / before_fork). `signal`
+    /// aborts an in-flight hook wait (a cancelled replacement request);
+    /// abort resolves to the pass-through default.
+    pub async fn emit_lifecycle_blocking(
+        &self,
+        event: SessionLifecycleEvent,
+        signal: Option<CancellationToken>,
+    ) -> HookOutcome {
         self.flush().await;
         let wire = match event {
             SessionLifecycleEvent::SessionBeforeSwitch {
@@ -573,7 +579,7 @@ impl EventForwarder {
             }
             _ => return HookOutcome::Continue,
         };
-        let result = self.emit_blocking_or_default(wire, None).await;
+        let result = self.emit_blocking_or_default(wire, signal).await;
         let cancel = result
             .as_ref()
             .and_then(|value| value.get("cancel"))

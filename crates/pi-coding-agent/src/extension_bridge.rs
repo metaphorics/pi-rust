@@ -192,8 +192,14 @@ pub trait ExtensionBridge: Send + Sync {
     /// is returned, so a caller in a sync context (e.g. `dispose`) may drop
     /// the future without losing the event. Only the blocking kinds
     /// (`session_before_switch`, `session_before_fork`) carry a meaningful
-    /// outcome. The default (and `NoopExtensionBridge`) always continues.
-    fn emit_lifecycle(&self, _event: SessionLifecycleEvent) -> BoxFuture<'static, HookOutcome> {
+    /// outcome; `signal` (when provided) aborts an in-flight blocking hook
+    /// wait — implementations resolve to the pass-through default. The
+    /// default (and `NoopExtensionBridge`) always continues.
+    fn emit_lifecycle(
+        &self,
+        _event: SessionLifecycleEvent,
+        _signal: Option<CancellationToken>,
+    ) -> BoxFuture<'static, HookOutcome> {
         Box::pin(std::future::ready(HookOutcome::Continue))
     }
 

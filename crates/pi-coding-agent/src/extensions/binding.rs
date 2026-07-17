@@ -20,6 +20,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+use pi_agent::CancellationToken;
 use pi_ai::Model;
 use pi_ext_protocol::{
     AppendEntryParams, CancelledResult, CompactParams, Delivery, ExtensionMode, FlagValue,
@@ -46,7 +47,6 @@ use super::events::{
     DEFAULT_HOOK_TIMEOUT, EventForwarder, ExtensionErrorSink, SharedSessionState, StateOverlay,
     StateSource, agent_thinking_level, session_state_block,
 };
-use super::session_sync::session_file_string;
 use super::{
     ClientConfig, ExtensionHost, ExtensionHostConfig, ExtensionPathError, HostError,
     LauncherSource, SidecarTimeouts,
@@ -54,6 +54,14 @@ use super::{
 
 fn ready<T: Send + 'static>(value: T) -> BoxFuture<'static, T> {
     Box::pin(std::future::ready(value))
+}
+
+/// Resolves when `token` is cancelled (the house token is a bare flag, so
+/// this polls — same cadence as the forwarder's blocking-emit cancel arm).
+async fn cancelled(token: CancellationToken) {
+    while !token.is_cancelled() {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }
 
 /// Inputs for [`bind_extensions`].
@@ -79,6 +87,10 @@ pub struct BindOptions {
     pub fallback: Option<NotificationSink>,
     /// Per-blocking-hook timeout ([`DEFAULT_HOOK_TIMEOUT`]).
     pub hook_timeout: Duration,
+    /// Session runtime whose lifecycle path adopts the [`SidecarBridge`]
+    /// during bind (session_shutdown + blocking before_switch/before_fork
+    /// reach the sidecar instead of the initial `NoopExtensionBridge`).
+    pub runtime: Option<Arc<AgentSessionRuntime>>,
 }
 
 impl BindOptions {
@@ -108,6 +120,7 @@ impl BindOptions {
             ui: None,
             fallback: None,
             hook_timeout: DEFAULT_HOOK_TIMEOUT,
+            runtime: None,
         }
     }
 }
@@ -238,6 +251,9 @@ pub fn bind_extensions(
         unsubscribe: parking_lot::Mutex::new(None),
     });
     binding.attach_session(session);
+    if let Some(runtime) = &options.runtime {
+        runtime.set_bridge(Arc::new(SidecarBridge::new(&binding)));
+    }
     Ok(Some(binding))
 }
 
@@ -389,17 +405,26 @@ impl CompactHooks for ForwarderCompactHooks {
 
 /// [`ExtensionBridge`] implementation backed by a live binding (replaces
 /// `NoopExtensionBridge` when extensions exist).
+///
+/// Holds the binding weakly: the binding's action config owns the host
+/// actions, which own the runtime, which owns this bridge — a strong handle
+/// here would cycle. When the binding is gone the bridge degrades to the
+/// no-op behavior (dropping the binding stops forwarding by contract).
 pub struct SidecarBridge {
-    binding: Arc<ExtensionBinding>,
+    binding: Weak<ExtensionBinding>,
+    paths: Vec<PathBuf>,
 }
 
 impl SidecarBridge {
-    pub fn new(binding: Arc<ExtensionBinding>) -> Self {
-        Self { binding }
+    pub fn new(binding: &Arc<ExtensionBinding>) -> Self {
+        Self {
+            binding: Arc::downgrade(binding),
+            paths: binding.paths.clone(),
+        }
     }
 
-    pub fn binding(&self) -> &Arc<ExtensionBinding> {
-        &self.binding
+    pub fn binding(&self) -> Option<Arc<ExtensionBinding>> {
+        self.binding.upgrade()
     }
 }
 
@@ -409,31 +434,43 @@ impl ExtensionBridge for SidecarBridge {
     }
 
     fn discovered_paths(&self) -> &[PathBuf] {
-        &self.binding.paths
+        &self.paths
     }
 
-    fn emit_lifecycle(&self, event: SessionLifecycleEvent) -> BoxFuture<'static, HookOutcome> {
+    fn emit_lifecycle(
+        &self,
+        event: SessionLifecycleEvent,
+        signal: Option<CancellationToken>,
+    ) -> BoxFuture<'static, HookOutcome> {
+        let Some(binding) = self.binding.upgrade() else {
+            return ready(HookOutcome::Continue);
+        };
         match event {
             SessionLifecycleEvent::SessionStart { .. }
             | SessionLifecycleEvent::SessionShutdown { .. } => {
                 // Enqueued BEFORE returning (trait contract): a sync caller
                 // may drop the future.
-                self.binding.forwarder.enqueue_lifecycle(event);
+                binding.forwarder.enqueue_lifecycle(event);
                 ready(HookOutcome::Continue)
             }
             blocking => {
-                let forwarder = self.binding.forwarder.clone();
-                Box::pin(async move { forwarder.emit_lifecycle_blocking(blocking).await })
+                let forwarder = binding.forwarder.clone();
+                Box::pin(async move { forwarder.emit_lifecycle_blocking(blocking, signal).await })
             }
         }
     }
 
     fn registered_commands(&self) -> Vec<RegisteredCommand> {
-        self.binding.registered_commands()
+        self.binding
+            .upgrade()
+            .map(|binding| binding.registered_commands())
+            .unwrap_or_default()
     }
 
     fn bind_ui(&self, ui: Arc<dyn ExtensionUiHost>) {
-        self.binding.bind_ui(ui);
+        if let Some(binding) = self.binding.upgrade() {
+            binding.bind_ui(ui);
+        }
     }
 }
 
@@ -635,23 +672,34 @@ impl HostActions for SessionHostActions {
         })
     }
 
-    fn set_model(&self, model: Model) -> BoxFuture<'static, bool> {
+    fn set_model(&self, model: Model, signal: CancellationToken) -> BoxFuture<'static, bool> {
         let Some(session) = self.session() else {
             return ready(false);
         };
-        Box::pin(async move { session.set_model(model).await.is_ok() })
+        Box::pin(async move {
+            tokio::select! {
+                applied = session.set_model(model) => applied.is_ok(),
+                _ = cancelled(signal) => false,
+            }
+        })
     }
 
-    fn wait_for_idle(&self) -> BoxFuture<'static, ()> {
+    fn wait_for_idle(&self, signal: CancellationToken) -> BoxFuture<'static, ()> {
         let Some(session) = self.session() else {
             return ready(());
         };
-        Box::pin(async move { session.wait_for_idle().await })
+        Box::pin(async move {
+            tokio::select! {
+                _ = session.wait_for_idle() => {}
+                _ = cancelled(signal) => {}
+            }
+        })
     }
 
     fn new_session(
         &self,
         params: NewSessionParams,
+        signal: CancellationToken,
     ) -> BoxFuture<'static, Result<CancelledResult, String>> {
         let Some(runtime) = self.runtime() else {
             return ready(Err("newSession requires a session runtime".to_string()));
@@ -663,9 +711,20 @@ impl HostActions for SessionHostActions {
             if params.setup_token.is_some() || params.with_session_token.is_some() {
                 return Err("newSession setup callbacks are not supported yet".to_string());
             }
-            let result = runtime.new_session(params.parent_session).await?;
+            let result = runtime.new_session(params.parent_session, &signal).await?;
             if let Some(binding) = binding {
                 binding.rebind(runtime.session()).await;
+                if !result.cancelled {
+                    // Oracle order: extensions rebind to the replacement
+                    // session, then session_start fires with the reason and
+                    // the replaced session's file (types.ts:548).
+                    binding
+                        .forwarder()
+                        .enqueue_lifecycle(SessionLifecycleEvent::SessionStart {
+                            reason: SessionStartReason::New,
+                            previous_session_file: result.previous_session_file.clone(),
+                        });
+                }
             }
             Ok(CancelledResult {
                 cancelled: result.cancelled,
@@ -673,7 +732,11 @@ impl HostActions for SessionHostActions {
         })
     }
 
-    fn fork(&self, params: ForkParams) -> BoxFuture<'static, Result<CancelledResult, String>> {
+    fn fork(
+        &self,
+        params: ForkParams,
+        signal: CancellationToken,
+    ) -> BoxFuture<'static, Result<CancelledResult, String>> {
         let Some(runtime) = self.runtime() else {
             return ready(Err("fork requires a session runtime".to_string()));
         };
@@ -688,9 +751,17 @@ impl HostActions for SessionHostActions {
                 }
                 _ => crate::extension_bridge::ForkPosition::Before,
             };
-            let result = runtime.fork(&params.entry_id, position).await?;
+            let result = runtime.fork(&params.entry_id, position, &signal).await?;
             if let Some(binding) = binding {
                 binding.rebind(runtime.session()).await;
+                if !result.cancelled {
+                    binding
+                        .forwarder()
+                        .enqueue_lifecycle(SessionLifecycleEvent::SessionStart {
+                            reason: SessionStartReason::Fork,
+                            previous_session_file: result.previous_session_file.clone(),
+                        });
+                }
             }
             Ok(CancelledResult {
                 cancelled: result.cancelled,
@@ -701,6 +772,7 @@ impl HostActions for SessionHostActions {
     fn switch_session(
         &self,
         params: SwitchSessionParams,
+        signal: CancellationToken,
     ) -> BoxFuture<'static, Result<CancelledResult, String>> {
         let Some(runtime) = self.runtime() else {
             return ready(Err("switchSession requires a session runtime".to_string()));
@@ -711,10 +783,18 @@ impl HostActions for SessionHostActions {
                 return Err("switchSession withSession callbacks are not supported yet".to_string());
             }
             let result = runtime
-                .switch_session(std::path::Path::new(&params.session_path), None)
+                .switch_session(std::path::Path::new(&params.session_path), None, &signal)
                 .await?;
             if let Some(binding) = binding {
                 binding.rebind(runtime.session()).await;
+                if !result.cancelled {
+                    binding
+                        .forwarder()
+                        .enqueue_lifecycle(SessionLifecycleEvent::SessionStart {
+                            reason: SessionStartReason::Resume,
+                            previous_session_file: result.previous_session_file.clone(),
+                        });
+                }
             }
             Ok(CancelledResult {
                 cancelled: result.cancelled,
@@ -734,7 +814,10 @@ impl HostActions for SessionHostActions {
     /// `ctx.reload()` (oracle reload-runtime.ts order): session_shutdown to
     /// the OLD extensions → in-place sidecar re-init (fresh discovery/load,
     /// refreshed commands/flags) → session recreate → session_start(reload).
-    fn reload(&self) -> BoxFuture<'static, Result<(), String>> {
+    ///
+    /// A cancel frame is honored only BEFORE the teardown starts; past that
+    /// the reload commits (a half-reloaded runtime is worse than a late one).
+    fn reload(&self, signal: CancellationToken) -> BoxFuture<'static, Result<(), String>> {
         let Some(runtime) = self.runtime() else {
             return ready(Err("reload requires a session runtime".to_string()));
         };
@@ -742,6 +825,9 @@ impl HostActions for SessionHostActions {
             return ready(Err("reload requires a live extension binding".to_string()));
         };
         Box::pin(async move {
+            if signal.is_cancelled() {
+                return Ok(());
+            }
             let forwarder = binding.forwarder().clone();
             runtime
                 .reload_session(async {
@@ -752,17 +838,14 @@ impl HostActions for SessionHostActions {
                         .map_err(|error| error.to_string())
                 })
                 .await?;
-            let session = runtime.session();
-            let previous_session_file =
-                session.with_session_manager(|sm| Some(session_file_string(sm)));
-            binding.rebind(session).await;
+            binding.rebind(runtime.session()).await;
+            // Oracle (types.ts:552): previousSessionFile is present only for
+            // "new", "resume", and "fork" — a reload start omits it.
             binding
                 .forwarder()
                 .enqueue_lifecycle(SessionLifecycleEvent::SessionStart {
                     reason: SessionStartReason::Reload,
-                    previous_session_file: previous_session_file
-                        .filter(|path| !path.is_empty())
-                        .map(PathBuf::from),
+                    previous_session_file: None,
                 });
             Ok(())
         })

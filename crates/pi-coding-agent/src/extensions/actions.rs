@@ -76,19 +76,26 @@ pub trait HostActions: Send + Sync {
     }
 
     /// `true` when the model was applied (sidecar contract: bare boolean ok).
-    fn set_model(&self, _model: Model) -> BoxFuture<'static, bool> {
+    /// `signal` is the per-request cancel token (a cancel frame stops the
+    /// wait; the response is dropped by the sidecar anyway).
+    fn set_model(&self, _model: Model, _signal: CancellationToken) -> BoxFuture<'static, bool> {
         ready(false)
     }
-    fn wait_for_idle(&self) -> BoxFuture<'static, ()> {
+    fn wait_for_idle(&self, _signal: CancellationToken) -> BoxFuture<'static, ()> {
         ready(())
     }
     fn new_session(
         &self,
         _params: NewSessionParams,
+        _signal: CancellationToken,
     ) -> BoxFuture<'static, Result<CancelledResult, String>> {
         ready(Err("newSession is not supported by this mode".to_string()))
     }
-    fn fork(&self, _params: ForkParams) -> BoxFuture<'static, Result<CancelledResult, String>> {
+    fn fork(
+        &self,
+        _params: ForkParams,
+        _signal: CancellationToken,
+    ) -> BoxFuture<'static, Result<CancelledResult, String>> {
         ready(Err("fork is not supported by this mode".to_string()))
     }
     fn navigate_tree(
@@ -100,13 +107,14 @@ pub trait HostActions: Send + Sync {
     fn switch_session(
         &self,
         _params: SwitchSessionParams,
+        _signal: CancellationToken,
     ) -> BoxFuture<'static, Result<CancelledResult, String>> {
         ready(Err(
             "switchSession is not supported by this mode".to_string()
         ))
     }
     /// `ctx.reload()` — in-place extension reload + session recreate.
-    fn reload(&self) -> BoxFuture<'static, Result<(), String>> {
+    fn reload(&self, _signal: CancellationToken) -> BoxFuture<'static, Result<(), String>> {
         ready(Err("reload is not supported by this mode".to_string()))
     }
     fn replaced_send_message(&self, _params: SendMessageParams) -> BoxFuture<'static, ()> {
@@ -219,24 +227,24 @@ async fn handle_request(
 ) -> ResponseResult {
     let ui = config.ui.lock().clone();
     match request {
-        Request::ActionSetModel(params) => {
-            ok(Value::Bool(config.actions.set_model(params.model).await))
-        }
+        Request::ActionSetModel(params) => ok(Value::Bool(
+            config.actions.set_model(params.model, cancel).await,
+        )),
         Request::ActionWaitForIdle(_) => {
-            config.actions.wait_for_idle().await;
+            config.actions.wait_for_idle(cancel).await;
             ok(json!({}))
         }
         Request::ActionNewSession(params) => {
-            cancelled_value(config.actions.new_session(params).await)
+            cancelled_value(config.actions.new_session(params, cancel).await)
         }
-        Request::ActionFork(params) => cancelled_value(config.actions.fork(params).await),
+        Request::ActionFork(params) => cancelled_value(config.actions.fork(params, cancel).await),
         Request::ActionNavigateTree(params) => {
             cancelled_value(config.actions.navigate_tree(params).await)
         }
         Request::ActionSwitchSession(params) => {
-            cancelled_value(config.actions.switch_session(params).await)
+            cancelled_value(config.actions.switch_session(params, cancel).await)
         }
-        Request::ActionReload(_) => match config.actions.reload().await {
+        Request::ActionReload(_) => match config.actions.reload(cancel).await {
             Ok(()) => ok(json!({})),
             Err(message) => err(message),
         },
