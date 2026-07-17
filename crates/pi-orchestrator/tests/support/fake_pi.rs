@@ -83,6 +83,15 @@ for raw in sys.stdin:
     elif kind == "ui":
         write({"type": "extension_ui_request", "id": "ui-1", "method": "select"})
         write({"type": "response", "id": request_id, "command": kind, "success": True})
+    elif kind == "burst":
+        value = command.get("value")
+        lines = [
+            {"type": "agent_event", "value": value},
+            {"type": "extension_ui_request", "id": "ui-burst", "method": "select", "value": value},
+            {"type": "response", "id": request_id, "command": kind, "success": True, "data": value},
+        ]
+        sys.stdout.write("".join(json.dumps(line, separators=(",", ":")) + "\n" for line in lines))
+        sys.stdout.flush()
     elif kind == "stderr":
         sys.stderr.write(command.get("value", ""))
         sys.stderr.flush()
