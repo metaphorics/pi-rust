@@ -6,7 +6,6 @@ use pi_orchestrator::rpc_process::RpcProcessInstance;
 use pi_orchestrator::wire::RpcCommandEnvelope;
 use serde_json::{Value, json};
 use support::fake_pi::FakePi;
-use tokio::sync::mpsc;
 
 fn command(value: Value) -> RpcCommandEnvelope {
     RpcCommandEnvelope::try_from(value).unwrap()
@@ -70,26 +69,25 @@ async fn correlates_out_of_order_responses_and_generates_pi_ids() {
 }
 
 #[tokio::test]
-async fn fans_events_to_every_subscriber_and_routes_ui_to_one_handler() {
+async fn fans_events_to_every_subscriber_and_routes_ui_to_one_owner() {
     let fake = FakePi::new();
     let process = RpcProcessInstance::spawn(fake.options()).unwrap();
-    let mut events_one = process.subscribe_events().await;
-    let mut events_two = process.subscribe_events().await;
-    let (ui_sender, mut ui_requests) = mpsc::unbounded_channel();
-    process.set_ui_request_handler(Some(ui_sender)).await;
+    let (_sub_one, mut lane_one) = process.subscribe_output();
+    let (sub_two, mut lane_two) = process.subscribe_output();
+    process.claim_ui(sub_two);
 
     process
         .send(command(json!({ "type": "emit", "value": 42 })))
         .await
         .unwrap();
-    assert_eq!(events_one.recv().await.unwrap()["value"], 42);
-    assert_eq!(events_two.recv().await.unwrap()["value"], 42);
+    assert_eq!(lane_one.recv().await.unwrap().1["value"], 42);
+    assert_eq!(lane_two.recv().await.unwrap().1["value"], 42);
 
     process
         .send(command(json!({ "type": "ui" })))
         .await
         .unwrap();
-    let request = ui_requests.recv().await.unwrap();
+    let (_, request) = lane_two.recv().await.unwrap();
     assert_eq!(request["type"], "extension_ui_request");
     assert_eq!(request["id"], "ui-1");
 
@@ -100,8 +98,46 @@ async fn fans_events_to_every_subscriber_and_routes_ui_to_one_handler() {
             "value": "picked"
         }))
         .unwrap();
-    assert_eq!(events_one.recv().await.unwrap()["value"], "picked");
-    assert_eq!(events_two.recv().await.unwrap()["value"], "picked");
+    assert_eq!(lane_one.recv().await.unwrap().1["value"], "picked");
+    assert_eq!(lane_two.recv().await.unwrap().1["value"], "picked");
+    // The ui request never reached the non-owning lane.
+    assert!(lane_one.try_recv().is_err());
+
+    process.dispose().await;
+}
+
+#[tokio::test]
+async fn output_lane_preserves_child_order_and_barrier_fences_the_response() {
+    let fake = FakePi::new();
+    let process = RpcProcessInstance::spawn(fake.options()).unwrap();
+    let (subscriber, mut lane) = process.subscribe_output();
+    process.claim_ui(subscriber);
+
+    // The child writes event -> ui request -> response in one stdout chunk.
+    let (response, barrier) = process
+        .send_claimed(
+            command(json!({ "type": "burst", "id": "b-1", "value": 7 })),
+            subscriber,
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.id.as_deref(), Some("b-1"));
+    assert_eq!(response.raw["data"], 7);
+
+    let (event_seq, event) = lane.recv().await.unwrap();
+    assert_eq!(event["type"], "agent_event");
+    assert_eq!(event["value"], 7);
+    let (request_seq, request) = lane.recv().await.unwrap();
+    assert_eq!(request["type"], "extension_ui_request");
+    assert_eq!(
+        request_seq,
+        event_seq + 1,
+        "lane sequence must be contiguous"
+    );
+    assert_eq!(
+        barrier, request_seq,
+        "the barrier must cover everything the child emitted before the response"
+    );
 
     process.dispose().await;
 }
@@ -111,7 +147,7 @@ async fn exit_rejects_every_pending_once_and_preserves_stderr() {
     let fake = FakePi::new();
     let process = RpcProcessInstance::spawn(fake.options()).unwrap();
     let mut exits = process.subscribe_exit().await;
-    let mut events = process.subscribe_events().await;
+    let (_subscriber, mut events) = process.subscribe_output();
     process
         .send(command(
             json!({ "type": "stderr", "value": "child failed" }),
@@ -127,7 +163,7 @@ async fn exit_rejects_every_pending_once_and_preserves_stderr() {
             .await
             .unwrap_err()
     });
-    assert_eq!(events.recv().await.unwrap()["type"], "pending_received");
+    assert_eq!(events.recv().await.unwrap().1["type"], "pending_received");
     let exiting = process.clone();
     let exiting = tokio::spawn(async move {
         exiting
@@ -163,7 +199,7 @@ async fn dispose_rejects_pending_then_sends_sigterm_and_awaits_exit() {
     let fake = FakePi::new();
     let process = RpcProcessInstance::spawn(fake.options()).unwrap();
     let mut exits = process.subscribe_exit().await;
-    let mut events = process.subscribe_events().await;
+    let (_subscriber, mut events) = process.subscribe_output();
     process
         .send(command(
             json!({ "type": "stderr", "value": "child stopping" }),
@@ -179,7 +215,7 @@ async fn dispose_rejects_pending_then_sends_sigterm_and_awaits_exit() {
             .await
             .unwrap_err()
     });
-    assert_eq!(events.recv().await.unwrap()["type"], "pending_received");
+    assert_eq!(events.recv().await.unwrap().1["type"], "pending_received");
 
     process.dispose().await;
     assert_eq!(pending.await.unwrap().to_string(), "RPC process disposed");
@@ -212,7 +248,7 @@ async fn stdin_failure_tears_down_writer_while_child_stays_alive() {
     let fake = FakePi::new();
     let process = RpcProcessInstance::spawn(fake.options()).unwrap();
     let mut exits = process.subscribe_exit().await;
-    let mut events = process.subscribe_events().await;
+    let (_subscriber, mut events) = process.subscribe_output();
 
     let pending_process = process.clone();
     let pending = tokio::spawn(async move {
@@ -221,13 +257,13 @@ async fn stdin_failure_tears_down_writer_while_child_stays_alive() {
             .await
             .unwrap_err()
     });
-    assert_eq!(events.recv().await.unwrap()["type"], "pending_received");
+    assert_eq!(events.recv().await.unwrap().1["type"], "pending_received");
 
     process
         .send(command(json!({ "type": "close_stdin" })))
         .await
         .unwrap();
-    let pid = events.recv().await.unwrap()["value"].as_i64().unwrap() as i32;
+    let pid = events.recv().await.unwrap().1["value"].as_i64().unwrap() as i32;
     let _kill_child = KillOnDrop(Pid::from_raw(pid).unwrap());
 
     let failed = tokio::time::timeout(

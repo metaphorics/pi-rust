@@ -10,14 +10,14 @@
 use std::path::PathBuf;
 
 use serde_json::Value;
-use tokio::sync::mpsc;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::ipc::{
     HandlerFuture, InstanceSummary, IpcRequestHandler, OrchestratorRequest, OrchestratorResponse,
     RpcEventSink, RpcStreamHandler,
 };
-use crate::supervisor::{RpcStream, SpawnOptions, Supervisor};
+use crate::supervisor::{RpcStream, SpawnOptions, StreamRpcResponse, Supervisor};
 use crate::wire::RpcCommandEnvelope;
 
 /// Bridges the IPC protocol to the supervisor (port of handler.ts
@@ -142,47 +142,29 @@ impl IpcRequestHandler for OrchestratorIpcHandler {
     ) -> HandlerFuture<'a, Option<Box<dyn RpcStreamHandler>>> {
         Box::pin(async move {
             let mut stream = self.supervisor.open_rpc_stream(instance_id)?;
-            // Move the subscription receivers into a forwarder task; the
-            // stream keeps handling commands and ui responses.
-            let (_detached_events, placeholder_events) = mpsc::unbounded_channel();
-            let mut event_rx = std::mem::replace(&mut stream.events, placeholder_events);
-            let (_detached_ui, placeholder_ui) = mpsc::unbounded_channel();
-            let mut ui_rx = std::mem::replace(&mut stream.ui_requests, placeholder_ui);
+            let mut output = stream.take_output();
 
+            // The single sequential forwarder: events and ui requests reach
+            // the sink in exact child stdout order. `drained` publishes the
+            // lane sequence of the last delivered item so `handle_request`
+            // can fence a response behind everything the child emitted
+            // before it (the oracle gets this ordering for free from its
+            // synchronous stdout dispatch).
+            let (drained_tx, drained_rx) = watch::channel(0_u64);
             let sink = events.clone();
             let forwarder = tokio::spawn(async move {
-                // Events and ui requests are forwarded verbatim as they
-                // arrive. Deviation note: the oracle writes both from one
-                // stdout dispatch loop, so an event and a ui request keep the
-                // child's emission order; here they travel on two channels
-                // and only per-channel order is guaranteed.
-                let mut events_open = true;
-                let mut ui_open = true;
-                while events_open || ui_open {
-                    tokio::select! {
-                        event = event_rx.recv(), if events_open => match event {
-                            Some(value) => {
-                                if events.send(&value).is_err() {
-                                    break;
-                                }
-                            }
-                            None => events_open = false,
-                        },
-                        request = ui_rx.recv(), if ui_open => match request {
-                            Some(value) => {
-                                if events.send(&value).is_err() {
-                                    break;
-                                }
-                            }
-                            None => ui_open = false,
-                        },
+                while let Some((seq, value)) = output.recv().await {
+                    if events.send(&value).is_err() {
+                        break;
                     }
+                    let _ = drained_tx.send(seq);
                 }
             });
 
             Some(Box::new(SupervisorRpcStream {
                 stream,
                 sink,
+                drained: drained_rx,
                 forwarder,
             }) as Box<dyn RpcStreamHandler>)
         })
@@ -194,6 +176,8 @@ impl IpcRequestHandler for OrchestratorIpcHandler {
 struct SupervisorRpcStream {
     stream: RpcStream,
     sink: RpcEventSink,
+    /// Lane sequence of the last item the forwarder delivered to the sink.
+    drained: watch::Receiver<u64>,
     forwarder: JoinHandle<()>,
 }
 
@@ -208,11 +192,27 @@ impl RpcStreamHandler for SupervisorRpcStream {
             }
             let command =
                 RpcCommandEnvelope::try_from(request).map_err(|error| error.to_string())?;
-            let response = self
+            let StreamRpcResponse {
+                response,
+                lane_barrier,
+            } = self
                 .stream
                 .handle_rpc(command)
                 .await
                 .map_err(|error| error.to_string())?;
+            // Never let the response overtake events or ui requests the
+            // child emitted before it: wait until the forwarder has
+            // delivered the lane up to the barrier.
+            if self
+                .drained
+                .wait_for(|&seq| seq >= lane_barrier)
+                .await
+                .is_err()
+            {
+                // The forwarder is gone, so the connection is tearing down;
+                // there is nowhere ordered left to write the response.
+                return Ok(());
+            }
             self.sink
                 .send(&response.raw)
                 .map_err(|error| error.to_string())
