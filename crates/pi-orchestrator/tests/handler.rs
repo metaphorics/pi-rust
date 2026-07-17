@@ -280,48 +280,36 @@ async fn rpc_stream_forwards_events_ui_requests_and_responses() {
     assert_eq!(ready.status, InstanceStatus::Online);
 
     // emit: the child writes an agent_event and then the command response.
-    // Both arrive on the stream; cross-channel order is not guaranteed here
-    // (see handler.rs deviation note), so assert on the set.
+    // Total child stdout order is preserved on the socket, so the event
+    // always precedes the response.
     stream
         .send(&json!({"type":"emit","id":"emit-1","value":"ping"}))
         .await
         .unwrap();
     let first = stream.next_message().await.unwrap().unwrap();
+    assert_eq!(first, json!({"type":"agent_event","value":"ping"}));
     let second = stream.next_message().await.unwrap().unwrap();
-    let mut lines = [first, second];
-    lines.sort_by_key(|value| value["type"].as_str().unwrap().to_owned());
-    assert_eq!(lines[0], json!({"type":"agent_event","value":"ping"}));
     assert_eq!(
-        lines[1],
+        second,
         json!({"type":"response","id":"emit-1","command":"emit","success":true})
     );
 
-    // ui: the child raises an extension_ui_request which is forwarded to the
-    // stream; the client answers with extension_ui_response which is written
-    // to the child's stdin verbatim (observed as a ui_observed event).
+    // ui: the child raises an extension_ui_request before the command
+    // response; the stream preserves that order. The client answers with
+    // extension_ui_response which is written to the child's stdin verbatim
+    // (observed as a ui_observed event).
     stream
         .send(&json!({"type":"ui","id":"ui-cmd"}))
         .await
         .unwrap();
-    let mut seen_ui_request = false;
-    let mut seen_response = false;
-    while !(seen_ui_request && seen_response) {
-        let message = stream.next_message().await.unwrap().unwrap();
-        match message["type"].as_str().unwrap() {
-            "extension_ui_request" => {
-                assert_eq!(
-                    message,
-                    json!({"type":"extension_ui_request","id":"ui-1","method":"select"})
-                );
-                seen_ui_request = true;
-            }
-            "response" => {
-                assert_eq!(message["id"], json!("ui-cmd"));
-                seen_response = true;
-            }
-            other => panic!("unexpected stream message type {other}: {message}"),
-        }
-    }
+    let request = stream.next_message().await.unwrap().unwrap();
+    assert_eq!(
+        request,
+        json!({"type":"extension_ui_request","id":"ui-1","method":"select"})
+    );
+    let response = stream.next_message().await.unwrap().unwrap();
+    assert_eq!(response["type"], json!("response"));
+    assert_eq!(response["id"], json!("ui-cmd"));
 
     stream
         .send(&json!({"type":"extension_ui_response","id":"ui-1","value":"picked"}))
@@ -351,6 +339,48 @@ async fn rpc_stream_forwards_events_ui_requests_and_responses() {
         panic!("unexpected status response: {status:?}");
     };
     assert_eq!(refreshed.session_id.as_deref(), Some("session-1"));
+
+    fixture.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rpc_stream_preserves_child_emission_order_across_bursts() {
+    let fixture = Fixture::start().await;
+    let instance_id = fixture.spawn().await;
+
+    let (_ready, mut stream) = connect_rpc_stream_to(&fixture.socket_path, &instance_id)
+        .await
+        .unwrap();
+
+    // The child writes event -> ui request -> response in one stdout chunk.
+    // Every iteration must observe exactly that order on the socket; repeats
+    // turn scheduling races into deterministic failures.
+    for iteration in 0..100 {
+        let id = format!("burst-{iteration}");
+        stream
+            .send(&json!({"type":"burst","id":id,"value":iteration}))
+            .await
+            .unwrap();
+        let event = stream.next_message().await.unwrap().unwrap();
+        assert_eq!(
+            event,
+            json!({"type":"agent_event","value":iteration}),
+            "iteration {iteration}: expected the agent_event first"
+        );
+        let request = stream.next_message().await.unwrap().unwrap();
+        assert_eq!(
+            request["type"],
+            json!("extension_ui_request"),
+            "iteration {iteration}: expected the ui request second, got {request}"
+        );
+        assert_eq!(request["value"], json!(iteration));
+        let response = stream.next_message().await.unwrap().unwrap();
+        assert_eq!(
+            response,
+            json!({"type":"response","id":id,"command":"burst","success":true,"data":iteration}),
+            "iteration {iteration}: expected the response last"
+        );
+    }
 
     fixture.finish().await;
 }
