@@ -17,8 +17,32 @@ use pi_coding_agent::session::services::{
     CreateAgentSessionServicesOptions, create_agent_session_services,
 };
 use pi_coding_agent::session::{AgentSession, AgentSessionConfig, SessionToolDefinition};
-use pi_coding_agent::{AuthStorage, ModelRegistry, NoopExtensionBridge, SessionManager};
+use pi_coding_agent::{
+    AuthStorage, ExtensionBridge, ModelRegistry, RegisteredCommand, SessionManager, SourceInfo,
+};
 use pi_tui::terminal::ProcessTerminal;
+
+/// Bridge that registers one extension command (`/ext`) so the tmux harness
+/// can exercise the compaction-gate extension-command path.
+struct SmokeBridge;
+
+impl ExtensionBridge for SmokeBridge {
+    fn needs_sidecar(&self) -> bool {
+        false
+    }
+
+    fn discovered_paths(&self) -> &[std::path::PathBuf] {
+        &[]
+    }
+
+    fn registered_commands(&self) -> Vec<RegisteredCommand> {
+        vec![RegisteredCommand {
+            invocation_name: "ext".to_owned(),
+            description: None,
+            source_info: SourceInfo::synthetic("smoke-ext", "smoke", None, None, None),
+        }]
+    }
+}
 
 async fn make_runtime(
     tmp: &std::path::Path,
@@ -28,6 +52,13 @@ async fn make_runtime(
     std::fs::create_dir_all(&cwd).expect("cwd");
     let agent_dir = tmp.join("agent");
     std::fs::create_dir_all(&agent_dir).expect("agent dir");
+    // Tiny keep-recent budget so /compact has something to compact after a
+    // couple of short smoke exchanges.
+    std::fs::write(
+        agent_dir.join("settings.json"),
+        r#"{"compaction":{"keepRecentTokens":1}}"#,
+    )
+    .expect("seed settings");
 
     let auth = Arc::new(AuthStorage::new(agent_dir.join("auth.json")));
     auth.set_runtime_api_key("anthropic".to_string(), "smoke-key".to_string());
@@ -120,6 +151,17 @@ async fn make_runtime(
                     let has_tool = latest_user_msg
                         .as_ref()
                         .is_some_and(|t| t.to_lowercase().contains("tool"));
+                    // "slowly" prompts stream ~6s so the tmux harness has a
+                    // wide window to queue/dequeue follow-ups mid-stream.
+                    let has_slow = latest_user_msg
+                        .as_ref()
+                        .is_some_and(|t| t.to_lowercase().contains("slowly"));
+                    // Compaction summarization requests wrap the transcript
+                    // in <conversation> tags: stall them (cancel-aware) so
+                    // the harness can act while `is_compacting()` is true.
+                    let is_summary = latest_user_msg
+                        .as_ref()
+                        .is_some_and(|t| t.starts_with("<conversation>"));
 
                     tokio::spawn(async move {
                         let mut partial_msg = AssistantMessage {
@@ -139,7 +181,21 @@ async fn make_runtime(
                             partial: partial_msg.clone(),
                         });
 
-                        if is_after_tool {
+                        if is_summary {
+                            loop {
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                                if cancel.as_ref().is_some_and(|c| c.is_cancelled()) {
+                                    partial_msg.stop_reason = StopReason::Aborted;
+                                    partial_msg.error_message =
+                                        Some("Operation aborted".to_string());
+                                    s.push(AssistantMessageEvent::Done {
+                                        reason: StopReason::Aborted,
+                                        message: partial_msg,
+                                    });
+                                    return;
+                                }
+                            }
+                        } else if is_after_tool {
                             s.push(AssistantMessageEvent::TextStart {
                                 content_index: 0,
                                 partial: partial_msg.clone(),
@@ -201,11 +257,20 @@ async fn make_runtime(
                                 partial: partial_msg.clone(),
                             });
                             let mut accumulated_text = String::new();
-                            let reply_text = "Here is the response: SMOKE-REPLY. This is some dummy text to make the stream long enough to allow testing escape cancellation.";
+                            let reply_text: String = if has_slow {
+                                (0..60)
+                                    .map(|i| format!("SLOW-SMOKE-BODY-{i}"))
+                                    .collect::<Vec<_>>()
+                                    .join(" ")
+                            } else {
+                                "Here is the response: SMOKE-REPLY. This is some dummy text to make the stream long enough to allow testing escape cancellation.".to_string()
+                            };
+                            let chunk_delay =
+                                Duration::from_millis(if has_slow { 100 } else { 50 });
                             let chunks: Vec<&str> = reply_text.split_whitespace().collect();
                             let mut cancelled = false;
                             for chunk in chunks {
-                                tokio::time::sleep(Duration::from_millis(50)).await;
+                                tokio::time::sleep(chunk_delay).await;
                                 if cancel.as_ref().is_some_and(|c| c.is_cancelled()) {
                                     cancelled = true;
                                     break;
@@ -289,7 +354,7 @@ async fn make_runtime(
                 session_start_reason: pi_coding_agent::SessionStartReason::Startup,
                 previous_session_file: None,
             },
-            Arc::new(NoopExtensionBridge::default()),
+            Arc::new(SmokeBridge),
         )
         .await
         .expect("runtime"),

@@ -185,6 +185,76 @@ wait_for_not "Session Tree" 10 || fail "double-escape selector close"
 sleep 1.0
 pass "double-escape tree selector"
 
+# (8b) Idle Alt+Enter follow-up: acts exactly like Enter (normal submit).
+echo "Step 8b: Testing idle Alt+Enter follow-up..."
+tmux send-keys -t "$SESSION" -l 'idle follow check'
+# Alt+Enter as kitty CSI-u (works regardless of kitty negotiation state)
+tmux send-keys -t "$SESSION" -l $'\x1b[13;3u'
+wait_for "idle follow check" 10 || fail "idle follow-up: prompt not submitted"
+# Third fully-completed stream (steps 3 and 6 completed; step 7 was aborted)
+wait_for_count "escape cancellation" 3 10 || fail "idle follow-up: no reply stream"
+sleep 1.0
+pass "idle Alt+Enter follow-up"
+
+# (8c) Dequeue statuses: queue a follow-up mid-stream, Alt+Up restores it
+# (singular status), second Alt+Up reports nothing to restore.
+echo "Step 8c: Testing follow-up queue + dequeue statuses..."
+tmux send-keys -t "$SESSION" -l 'reply slowly please'
+tmux send-keys -t "$SESSION" Enter
+wait_for "SLOW-SMOKE-BODY-0" 10 || fail "dequeue: slow stream did not start"
+tmux send-keys -t "$SESSION" -l 'queued follow one'
+tmux send-keys -t "$SESSION" -l $'\x1b[13;3u'
+wait_for "Follow-up: queued follow one" 10 || fail "dequeue: follow-up not queued"
+tmux send-keys -t "$SESSION" -l $'\x1b[1;3A'
+wait_for "Restored 1 queued message to editor" 10 || fail "dequeue: singular restore status"
+tmux send-keys -t "$SESSION" -l $'\x1b[1;3A'
+wait_for "No queued messages to restore" 10 || fail "dequeue: zero restore status"
+# Abort the slow stream and clear the restored editor text
+tmux send-keys -t "$SESSION" -l $'\x1b[27u'
+wait_for_count "Operation aborted" 2 10 || fail "dequeue: abort slow stream"
+tmux send-keys -t "$SESSION" C-c
+sleep 1.0
+pass "dequeue statuses"
+
+# (8d) Large paste marker: bracketed paste collapses to a marker, idle
+# Alt+Enter submits the EXPANDED text (transcript shows pasted lines).
+echo "Step 8d: Testing large paste marker expansion..."
+printf 'pastemark-%d\n' 1 2 3 4 5 6 7 8 9 10 11 12 > "$TMPDIR/paste-body.txt"
+tmux load-buffer -b pi_smoke_paste "$TMPDIR/paste-body.txt" || fail "paste: load-buffer"
+# -p = wrap in bracketed-paste markers (the app enabled paste mode)
+tmux paste-buffer -p -b pi_smoke_paste -t "$SESSION" || fail "paste: paste-buffer"
+wait_for '\[paste #' 10 || fail "paste: marker not shown in editor"
+tmux send-keys -t "$SESSION" -l $'\x1b[13;3u'
+wait_for "pastemark-7" 10 || fail "paste: expanded text not submitted"
+wait_for_count "escape cancellation" 4 10 || fail "paste: no reply stream"
+sleep 1.0
+pass "large paste marker expansion"
+
+# (8e) Compaction gate: a registered extension command (/ext) executes
+# immediately via session.prompt while compacting; plain text queues.
+echo "Step 8e: Testing extension command during compaction..."
+tmux send-keys -t "$SESSION" -l '/compact'
+tmux send-keys -t "$SESSION" Enter
+wait_for "Compacting context" 10 || fail "compaction: did not start"
+tmux send-keys -t "$SESSION" -l '/ext go'
+tmux send-keys -t "$SESSION" -l $'\x1b[13;3u'
+# Executes immediately: a full reply streams while compaction is running
+wait_for_count "escape cancellation" 5 10 || fail "compaction: extension command did not execute"
+if tmux capture-pane -pt "$SESSION" -S - | grep -q "Queued message for after compaction"; then
+    fail "compaction: extension command was queued instead of executed"
+fi
+# (The compaction status indicator is replaced by the run's spinner, so the
+# proof compaction is STILL active is the next assertion: plain text queued
+# with the compaction status message.)
+tmux send-keys -t "$SESSION" -l 'plain during compaction'
+tmux send-keys -t "$SESSION" -l $'\x1b[13;3u'
+wait_for "Queued message for after compaction" 10 || fail "compaction: plain text did not queue"
+wait_for "Follow-up: plain during compaction" 10 || fail "compaction: queued follow-up not displayed"
+# Best-effort teardown: cancel the stalled compaction and let the UI settle
+tmux send-keys -t "$SESSION" -l $'\x1b[27u'
+sleep 1.5
+pass "compaction extension command"
+
 # (9) Ctrl+Z suspend: under a job-controlling shell the process must stop
 # (SIGTSTP to its own process group), resume on fg, and repaint with
 # working input. A dedicated session is used because a direct pane command
