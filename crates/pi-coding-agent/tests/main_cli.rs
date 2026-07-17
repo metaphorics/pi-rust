@@ -80,7 +80,9 @@ fn version_prints_and_exits_zero() {
     let bin = Bin::new();
     let output = bin.run(&["--version"]);
     assert!(output.status.success());
-    assert_eq!(stdout(&output).trim(), env!("CARGO_PKG_VERSION"));
+    // Drop-in contract: prints the replaced npm pi's version, not the
+    // crate version.
+    assert_eq!(stdout(&output), "0.80.7\n");
     assert!(stderr(&output).is_empty());
 }
 

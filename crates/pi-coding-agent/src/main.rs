@@ -595,7 +595,7 @@ async fn main() {
     report_arg_diagnostics(&parsed.diagnostics.clone());
 
     if parsed.version {
-        println!("{}", env!("CARGO_PKG_VERSION"));
+        println!("{}", pi_coding_agent::config::VERSION);
         std::process::exit(0);
     }
 

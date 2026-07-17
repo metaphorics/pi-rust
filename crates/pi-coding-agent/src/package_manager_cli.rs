@@ -101,7 +101,7 @@ impl Default for ProcessSelfUpdater<ProcessCommandRunner> {
         Self {
             runner: ProcessCommandRunner,
             entrypoint: std::env::current_exe().unwrap_or_default(),
-            current_version: env!("CARGO_PKG_VERSION").to_string(),
+            current_version: crate::config::VERSION.to_string(),
             release_override: None,
         }
     }

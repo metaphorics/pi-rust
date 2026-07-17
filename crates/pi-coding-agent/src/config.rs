@@ -21,6 +21,10 @@ pub const CONFIG_DIR_NAME: &str = match option_env!("PI_CONFIG_DIR") {
 
 /// Package display name fallback (oracle reads package.json; we keep the published default).
 pub const PACKAGE_NAME: &str = "@earendil-works/pi-coding-agent";
+/// Version of the npm pi this binary replaces (oracle `VERSION`,
+/// config.ts:492 — package.json version). pi-rust is a drop-in for this
+/// exact release; the crate version is internal.
+pub const VERSION: &str = "0.80.7";
 
 /// Runtime env key for agent dir override (e.g. `PI_CODING_AGENT_DIR`).
 pub fn env_agent_dir_key() -> String {

@@ -47,7 +47,7 @@ cd "$PROJ"
 # ---------------------------------------------------------------- metadata
 out=$("$BIN" --version); rc=$?
 check "version exit" 0 "$rc"
-check "version shape" "0.1.0" "$out"
+check "version shape" "0.80.7" "$out"
 
 out=$("$BIN" --help | head -1 | sed 's/\x1b\[[0-9;]*m//g'); rc=$?
 check "help first line" "pi - AI coding assistant with read, bash, edit, write tools" "$out"
