@@ -11,6 +11,33 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::components::trust_selector::{ProjectTrustStoreEntry, ProjectTrustUpdate};
+/// Oracle `hasTrustRequiringProjectResources` (trust-manager.ts:184-206):
+/// the cwd carries project resources whose loading requires trust —
+/// `.pi/{settings.json,extensions,skills,prompts,themes}` or a non-HOME
+/// ancestor `.agents/skills`.
+#[must_use]
+pub fn has_trust_requiring_project_resources(cwd: &Path) -> bool {
+    const TRUST_REQUIRING: [&str; 5] =
+        ["settings.json", "extensions", "skills", "prompts", "themes"];
+    let config_dir = cwd.join(crate::config::CONFIG_DIR_NAME);
+    if TRUST_REQUIRING
+        .iter()
+        .any(|entry| config_dir.join(entry).exists())
+    {
+        return true;
+    }
+    let user_agents_skills = dirs::home_dir().map(|home| home.join(".agents").join("skills"));
+    let mut current = cwd.to_path_buf();
+    loop {
+        let agents_skills = current.join(".agents").join("skills");
+        if Some(&agents_skills) != user_agents_skills.as_ref() && agents_skills.exists() {
+            return true;
+        }
+        if !current.pop() {
+            return false;
+        }
+    }
+}
 
 pub struct ProjectTrustStore {
     path: PathBuf,

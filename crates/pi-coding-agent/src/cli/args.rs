@@ -1192,8 +1192,10 @@ mod tests {
     #[test]
     fn test_version_fixture() {
         let fixture_content = include_str!("../../tests/fixtures/version.txt");
-        let expected = format!("{}\n", env!("CARGO_PKG_VERSION"));
-        assert_eq!(fixture_content, expected);
+        // Exact fixture: the version of the npm pi this binary replaces,
+        // NOT the crate version.
+        assert_eq!(fixture_content, "0.80.7\n");
+        assert_eq!(fixture_content, format!("{}\n", crate::config::VERSION));
     }
 
     #[test]

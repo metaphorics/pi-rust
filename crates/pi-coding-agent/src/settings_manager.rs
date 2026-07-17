@@ -399,9 +399,16 @@ impl SettingsManager {
     }
 
     pub fn create(cwd: impl AsRef<Path>, agent_dir: Option<PathBuf>) -> Self {
+        Self::create_with_trust(cwd, agent_dir, true)
+    }
+
+    pub fn create_with_trust(
+        cwd: impl AsRef<Path>,
+        agent_dir: Option<PathBuf>,
+        project_trusted: bool,
+    ) -> Self {
         let agent = agent_dir.unwrap_or_else(get_agent_dir);
         let mut storage = FileSettingsStorage::new(cwd, agent);
-        let project_trusted = true;
         let (global, gerr) = Self::try_load(&mut storage, SettingsScope::Global, project_trusted);
         let (project, perr) = Self::try_load(&mut storage, SettingsScope::Project, project_trusted);
         Self::from_parts(
@@ -444,6 +451,18 @@ impl SettingsManager {
 
     pub fn project_settings(&self) -> &Settings {
         &self.project_settings
+    }
+    /// Settings-file parse failures captured at load, as `(scope, message)`
+    /// pairs (oracle `drainErrors` payload; non-destructive snapshot).
+    pub fn load_errors(&self) -> Vec<(&'static str, String)> {
+        let mut errors = Vec::new();
+        if let Some(error) = &self.global_settings_load_error {
+            errors.push(("global", error.clone()));
+        }
+        if let Some(error) = &self.project_settings_load_error {
+            errors.push(("project", error.clone()));
+        }
+        errors
     }
 
     pub fn is_project_trusted(&self) -> bool {

@@ -42,6 +42,7 @@ use super::components::compaction_summary_message::CompactionSummaryMessageCompo
 use super::components::custom_editor::CustomEditor;
 use super::components::custom_entry::CustomEntryComponent;
 use super::components::dynamic_border::DynamicBorder;
+use super::components::expandable_text::ExpandableText;
 use super::components::extension_selector::ExtensionSelector;
 use super::components::footer::{FooterComponent, FooterData, FooterStats};
 use super::components::keybinding_hints::{key_display_text, key_text};
@@ -111,13 +112,26 @@ pub fn format_resume_command(session_manager: &SessionManager) -> Option<String>
     Some(command)
 }
 
+pub type ReloadRuntime =
+    Rc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<(), String>> + 'static>> + 'static>;
+
 /// Options for InteractiveMode (oracle `InteractiveModeOptions`, subset that
 /// exists pre-Phase-6).
 #[derive(Default)]
 pub struct InteractiveModeOptions {
     pub initial_message: Option<String>,
+    /// Images attached to `initial_message` (oracle `initialImages`; sent
+    /// only with the initial message, interactive-mode.ts:892-894).
+    pub initial_images: Vec<pi_ai::ImageContent>,
     pub initial_messages: Vec<String>,
+    /// Providers whose credentials were migrated to auth.json (oracle
+    /// `migratedProviders`; startup warning, interactive-mode.ts:876-878).
+    pub migrated_providers: Vec<String>,
     pub model_fallback_message: Option<String>,
+    /// Force verbose startup — overrides the `quietStartup` setting for the
+    /// startup header and loaded-resource listing, and starts tool output
+    /// expanded (oracle `verbose`).
+    pub verbose: bool,
     /// Install SIGTERM/SIGHUP handlers (binary entry points only).
     pub handle_signals: bool,
     /// Time source for double-press windows (tests inject a fake clock).
@@ -126,6 +140,15 @@ pub struct InteractiveModeOptions {
     /// The default ignores SIGINT, sends SIGTSTP to the process group, and
     /// restores SIGINT after SIGCONT resumes execution.
     pub suspend_signal: Option<Rc<dyn Fn()>>,
+    /// Cwd to trust after `/reload` if it gained a `.pi` directory during
+    /// this implicitly trusted session (oracle `autoTrustOnReloadCwd`).
+    pub auto_trust_on_reload_cwd: Option<std::path::PathBuf>,
+    /// Extension-aware runtime reload (P6 attach point): when a sidecar
+    /// binding is attached this runs the full `SessionHostActions::reload`
+    /// (forwarder reload + rebind + session_start(reload)); without it
+    /// `/reload` recreates the runtime extension-less via
+    /// [`AgentSessionRuntime::reload_session`].
+    pub reload_runtime: Option<ReloadRuntime>,
 }
 
 // ============================================================================
@@ -433,6 +456,7 @@ enum OpOutcome {
     NewSessionCreated(Result<crate::session::runtime::ReplaceResult, String>),
     ForkFinished(Result<crate::session::runtime::ReplaceResult, String>),
     TreeNavigated(Result<crate::session::NavigateTreeResult, String>),
+    ReloadFinished(Result<(), String>),
     FlushQueuePromptFailed(String),
     AnthropicKeyChecked(Option<String>),
     AuthChanged {
@@ -519,6 +543,8 @@ pub struct InteractiveMode {
     tui: Tui,
 
     // Shared mounted components (root order mirrors the oracle).
+    header: Rc<RefCell<Container>>,
+    loaded_resources: Rc<RefCell<Container>>,
     chat: Rc<RefCell<Container>>,
     pending_messages: Rc<RefCell<Container>>,
     status: Rc<RefCell<Container>>,
@@ -537,6 +563,10 @@ pub struct InteractiveMode {
     streaming_component: Option<(usize, Rc<RefCell<AssistantMessageComponent>>)>,
     pending_tools: HashMap<String, Rc<RefCell<ToolExecutionComponent>>>,
     tool_output_expanded: bool,
+    /// Startup header (oracle `builtInHeader`) — refreshed on tools-expand.
+    header_expandable: Option<Rc<RefCell<ExpandableText>>>,
+    /// Loaded-resource sections — refreshed on tools-expand.
+    resource_sections: Vec<Rc<RefCell<ExpandableText>>>,
     hide_thinking_block: bool,
     output_pad: usize,
 
@@ -551,13 +581,18 @@ pub struct InteractiveMode {
     last_sigint_time: Option<Instant>,
     last_escape_time: Option<Instant>,
     anthropic_subscription_warning_shown: bool,
+    /// Oracle `autoTrustOnReloadCwd` (copied from options; cleared once
+    /// consumed or once a saved decision exists).
+    auto_trust_on_reload_cwd: Option<std::path::PathBuf>,
+    /// True while a `/reload` runtime replacement op is pending.
+    reload_in_flight: bool,
     /// Monotonic time source (defaults to `Instant::now`).
     now: Rc<dyn Fn() -> Instant>,
     /// Ctrl+Z process-stop step (see `InteractiveModeOptions::suspend_signal`).
     suspend_signal: Rc<dyn Fn()>,
     is_bash_mode: bool,
     selector_open: bool,
-    startup_messages: VecDeque<String>,
+    startup_messages: VecDeque<(String, Vec<pi_ai::ImageContent>)>,
     compaction_queued: Vec<CompactionQueuedMessage>,
     bash_component: Option<Rc<RefCell<BashExecutionComponent>>>,
     bash_chunks: Option<Arc<parking_lot::Mutex<Vec<String>>>>,
@@ -736,8 +771,8 @@ impl InteractiveMode {
         // Mount (oracle init() :726-736 order).
         let editor_slot =
             SlotHandle::new(Box::new(Shared::new(custom_editor.clone())) as ComponentBox);
-        tui.add_child(Shared::new(header));
-        tui.add_child(Shared::new(loaded_resources));
+        tui.add_child(Shared::new(header.clone()));
+        tui.add_child(Shared::new(loaded_resources.clone()));
         tui.add_child(Shared::new(chat.clone()));
         tui.add_child(Shared::new(pending_messages.clone()));
         tui.add_child(Shared::new(status.clone()));
@@ -776,6 +811,8 @@ impl InteractiveMode {
             session,
             tui,
             chat,
+            header,
+            loaded_resources,
             pending_messages,
             status,
             footer,
@@ -789,7 +826,9 @@ impl InteractiveMode {
             unsubscribe: Some(Box::new(unsubscribe)),
             streaming_component: None,
             pending_tools: HashMap::new(),
-            tool_output_expanded: false,
+            tool_output_expanded: options.verbose,
+            header_expandable: None,
+            resource_sections: Vec::new(),
             hide_thinking_block,
             output_pad,
             active_status: None,
@@ -800,6 +839,8 @@ impl InteractiveMode {
             last_sigint_time: None,
             last_escape_time: None,
             anthropic_subscription_warning_shown: false,
+            auto_trust_on_reload_cwd: options.auto_trust_on_reload_cwd.clone(),
+            reload_in_flight: false,
             now: clock,
             suspend_signal,
             is_bash_mode: false,
@@ -832,9 +873,25 @@ impl InteractiveMode {
             return;
         }
         self.initialized = true;
+        // "Model scope: ..." console line before the TUI takes over
+        // (oracle init :709-722).
+        self.print_model_scope_line();
+        // Startup header + loaded-resource listing (oracle init :748-807 +
+        // showLoadedResources), both gated on `verbose || !quietStartup`.
+        self.populate_startup_header();
+        self.show_loaded_resources(false);
         self.update_editor_border_color();
         self.update_terminal_title();
         self.render_current_session_state();
+        // Startup warnings in oracle order (interactive-mode.ts:874-887):
+        // migrated providers, then the model fallback.
+        let migrated = std::mem::take(&mut self.options.migrated_providers);
+        if !migrated.is_empty() {
+            self.show_warning(&format!(
+                "Migrated credentials to auth.json: {}",
+                migrated.join(", ")
+            ));
+        }
         if let Some(fallback) = self.options.model_fallback_message.take() {
             self.show_warning(&fallback);
         }
@@ -842,16 +899,358 @@ impl InteractiveMode {
         self.tui.start_render_loop_hooks();
     }
 
+    /// Oracle `getStartupExpansionState` (interactive-mode.ts:1079-1081).
+    fn startup_expansion_state(&self) -> bool {
+        self.options.verbose || self.tool_output_expanded
+    }
+
+    /// Re-evaluate the header and resource sections after a tools-expand
+    /// toggle (oracle setExpanded on Expandable components).
+    fn refresh_startup_expansion(&mut self) {
+        let expanded = self.startup_expansion_state();
+        if let Some(header) = &self.header_expandable {
+            header.borrow_mut().set_expanded(expanded);
+        }
+        for section in &self.resource_sections {
+            section.borrow_mut().set_expanded(expanded);
+        }
+    }
+
+    fn quiet_startup(&self) -> bool {
+        self.runtime
+            .services()
+            .settings_manager
+            .lock()
+            .get_quiet_startup()
+    }
+
+    /// Oracle init :709-722: scoped models print one dim console line
+    /// above the TUI unless silenced.
+    fn print_model_scope_line(&mut self) {
+        let scoped = self.session.scoped_models();
+        if scoped.is_empty() || !(self.options.verbose || !self.quiet_startup()) {
+            return;
+        }
+        let model_list = scoped
+            .iter()
+            .map(|scoped_model| {
+                let thinking = scoped_model
+                    .thinking_level
+                    .map(|level| format!(":{}", agent_thinking_level_str(level)))
+                    .unwrap_or_default();
+                format!("{}{}", scoped_model.model.id, thinking)
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let cycle_keys = pi_tui::keybindings::get_keybindings().get_keys("app.model.cycleForward");
+        let cycle_hint = if cycle_keys.is_empty() {
+            String::new()
+        } else {
+            theme().fg(
+                ThemeColor::Muted,
+                &format!(
+                    " ({} to cycle)",
+                    super::components::keybinding_hints::format_key_text(
+                        &cycle_keys.join("/"),
+                        true
+                    )
+                ),
+            )
+        };
+        let line = theme().fg(
+            ThemeColor::Dim,
+            &format!("Model scope: {model_list}{cycle_hint}"),
+        );
+        self.tui.terminal_mut().write(&format!("{line}\r\n"));
+    }
+
+    /// Oracle init :748-807: the startup header — logo plus keybinding
+    /// instructions (compact by default, full when expanded) — unless
+    /// silenced, in which case a minimal empty header mounts.
+    fn populate_startup_header(&mut self) {
+        use super::components::keybinding_hints::{key_hint, raw_key_hint};
+
+        let show_header = self.options.verbose || !self.quiet_startup();
+        let mut header = self.header.borrow_mut();
+        header.clear();
+        self.header_expandable = None;
+        if !show_header {
+            // Minimal header when silenced (oracle :803-807).
+            header.add_child(pi_tui::components::Text::new("", 0, 0, None));
+            return;
+        }
+        let logo = || {
+            let t = theme();
+            format!(
+                "{}{}",
+                t.bold(&t.fg(ThemeColor::Accent, crate::config::APP_NAME)),
+                t.fg(ThemeColor::Dim, &format!(" v{}", crate::config::VERSION))
+            )
+        };
+        let expanded_instructions = || {
+            [
+                key_hint("app.interrupt", "to interrupt"),
+                key_hint("app.clear", "to clear"),
+                raw_key_hint(&format!("{} twice", key_text("app.clear")), "to exit"),
+                key_hint("app.exit", "to exit (empty)"),
+                key_hint("app.suspend", "to suspend"),
+                key_hint("tui.editor.deleteToLineEnd", "to delete to end"),
+                key_hint("app.thinking.cycle", "to cycle thinking level"),
+                raw_key_hint(
+                    &format!(
+                        "{}/{}",
+                        key_text("app.model.cycleForward"),
+                        key_text("app.model.cycleBackward")
+                    ),
+                    "to cycle models",
+                ),
+                key_hint("app.model.select", "to select model"),
+                key_hint("app.tools.expand", "to expand tools"),
+                key_hint("app.thinking.toggle", "to expand thinking"),
+                key_hint("app.editor.external", "for external editor"),
+                raw_key_hint("/", "for commands"),
+                raw_key_hint("!", "to run bash"),
+                raw_key_hint("!!", "to run bash (no context)"),
+                key_hint("app.message.followUp", "to queue follow-up"),
+                key_hint("app.message.dequeue", "to edit all queued messages"),
+                key_hint(
+                    "app.clipboard.pasteImage",
+                    "to paste image (with text fallback)",
+                ),
+                raw_key_hint("drop files", "to attach"),
+            ]
+            .join("\n")
+        };
+        let compact_instructions = || {
+            [
+                key_hint("app.interrupt", "interrupt"),
+                raw_key_hint(
+                    &format!("{}/{}", key_text("app.clear"), key_text("app.exit")),
+                    "clear/exit",
+                ),
+                raw_key_hint("/", "commands"),
+                raw_key_hint("!", "bash"),
+                key_hint("app.tools.expand", "more"),
+            ]
+            .join(&theme().fg(ThemeColor::Muted, " · "))
+        };
+        let compact_onboarding = || {
+            theme().fg(
+                ThemeColor::Dim,
+                &format!(
+                    "Press {} to show full startup help and loaded resources.",
+                    key_text("app.tools.expand")
+                ),
+            )
+        };
+        let onboarding = || {
+            theme().fg(
+                ThemeColor::Dim,
+                "Pi can explain its own features and look up its docs. Ask it how to use or extend Pi.",
+            )
+        };
+        let component = Rc::new(RefCell::new(ExpandableText::new(
+            Box::new(move || {
+                format!(
+                    "{}\n{}\n{}\n\n{}",
+                    logo(),
+                    compact_instructions(),
+                    compact_onboarding(),
+                    onboarding()
+                )
+            }),
+            Box::new(move || {
+                format!(
+                    "{}\n{}\n\n{}",
+                    logo(),
+                    expanded_instructions(),
+                    onboarding()
+                )
+            }),
+            self.options.verbose || self.tool_output_expanded,
+            1,
+            0,
+        )));
+        header.add_child(Spacer::new(1));
+        header.add_child(Shared::new(component.clone()));
+        header.add_child(Spacer::new(1));
+        drop(header);
+        self.header_expandable = Some(component);
+    }
+
+    /// Oracle `showLoadedResources` (interactive-mode.ts:1415-1565), over
+    /// the resources this runtime carries: context files, skills, prompt
+    /// templates, extensions, and custom themes. Listing is gated on
+    /// `force || verbose || !quietStartup`; sections render compact
+    /// summaries collapsed and per-path lists expanded.
+    fn show_loaded_resources(&mut self, force: bool) {
+        use super::components::expandable_text::ExpandableText;
+
+        let loaded_resources = self.loaded_resources.clone();
+        let mut container = loaded_resources.borrow_mut();
+        container.clear();
+        self.resource_sections.clear();
+        let show_listing = force || self.options.verbose || !self.quiet_startup();
+        if !show_listing {
+            return;
+        }
+        let expanded_now = self.startup_expansion_state();
+        let cwd = self.session.cwd().to_path_buf();
+
+        let compact_list = |mut labels: Vec<String>, sort: bool| {
+            labels = labels
+                .into_iter()
+                .map(|label| label.trim().to_string())
+                .filter(|label| !label.is_empty())
+                .collect();
+            if sort {
+                labels.sort();
+            }
+            theme().fg(ThemeColor::Dim, &format!("  {}", labels.join(", ")))
+        };
+        let path_list = |paths: &[String]| {
+            paths
+                .iter()
+                .map(|path| theme().fg(ThemeColor::Dim, &format!("  {path}")))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let mut sections = Vec::new();
+        let mut add_section =
+            |container: &mut Container, name: &'static str, collapsed: String, expanded: String| {
+                let section = Rc::new(RefCell::new(ExpandableText::new(
+                    Box::new(move || {
+                        format!(
+                            "{}\n{collapsed}",
+                            theme().fg(ThemeColor::MdHeading, &format!("[{name}]"))
+                        )
+                    }),
+                    Box::new(move || {
+                        format!(
+                            "{}\n{expanded}",
+                            theme().fg(ThemeColor::MdHeading, &format!("[{name}]"))
+                        )
+                    }),
+                    expanded_now,
+                    0,
+                    0,
+                )));
+                container.add_child(Shared::new(section.clone()));
+                container.add_child(Spacer::new(1));
+                sections.push(section);
+            };
+
+        let context_files = self.session.context_files();
+        if !context_files.is_empty() {
+            container.add_child(Spacer::new(1));
+            let compact = compact_list(
+                context_files
+                    .iter()
+                    .map(|file| format_context_path(&file.path, &cwd))
+                    .collect(),
+                false,
+            );
+            let expanded = path_list(
+                &context_files
+                    .iter()
+                    .map(|file| format_display_path(&file.path))
+                    .collect::<Vec<_>>(),
+            );
+            add_section(&mut container, "Context", compact, expanded);
+        }
+
+        let skills = self.session.skills();
+        if !skills.is_empty() {
+            let compact = compact_list(
+                skills.iter().map(|skill| skill.name.clone()).collect(),
+                true,
+            );
+            let expanded = path_list(
+                &skills
+                    .iter()
+                    .map(|skill| format_display_path(&skill.file_path.to_string_lossy()))
+                    .collect::<Vec<_>>(),
+            );
+            add_section(&mut container, "Skills", compact, expanded);
+        }
+
+        let templates = self.session.prompt_templates();
+        if !templates.is_empty() {
+            let names: Vec<String> = templates
+                .iter()
+                .map(|template| format!("/{}", template.name))
+                .collect();
+            let compact = compact_list(names.clone(), true);
+            let expanded = path_list(
+                &templates
+                    .iter()
+                    .map(|template| format_display_path(&template.file_path.to_string_lossy()))
+                    .collect::<Vec<_>>(),
+            );
+            add_section(&mut container, "Prompts", compact, expanded);
+        }
+
+        let extensions = {
+            let services = self.runtime.services();
+            let loader = services.resource_loader.lock();
+            loader.discovered().extension_paths()
+        };
+        if !extensions.is_empty() {
+            let compact = compact_list(
+                extensions
+                    .iter()
+                    .map(|path| {
+                        format_display_path(&path.to_string_lossy())
+                            .split('/')
+                            .rfind(|segment| !segment.is_empty() && *segment != "~")
+                            .unwrap_or_default()
+                            .to_string()
+                    })
+                    .collect(),
+                true,
+            );
+            let expanded = path_list(
+                &extensions
+                    .iter()
+                    .map(|path| {
+                        let display = format_display_path(&path.to_string_lossy());
+                        display
+                            .strip_suffix("/index.ts")
+                            .or_else(|| display.strip_suffix("/index.js"))
+                            .unwrap_or(&display)
+                            .to_string()
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            add_section(&mut container, "Extensions", compact, expanded);
+        }
+
+        let custom_themes: Vec<_> = super::theme::get_available_themes_with_paths()
+            .into_iter()
+            .filter(|info| info.path.is_some())
+            .collect();
+        if !custom_themes.is_empty() {
+            let compact = compact_list(
+                custom_themes.iter().map(|info| info.name.clone()).collect(),
+                true,
+            );
+            let expanded = path_list(
+                &custom_themes
+                    .iter()
+                    .filter_map(|info| info.path.as_ref())
+                    .map(|path| format_display_path(&path.to_string_lossy()))
+                    .collect::<Vec<_>>(),
+            );
+            add_section(&mut container, "Themes", compact, expanded);
+        }
+        drop(container);
+        self.resource_sections = sections;
+    }
+
     /// Run until quit; returns the exit code and farewell line.
     pub async fn run(mut self) -> RunOutcome {
         self.init();
-
-        if let Some(initial) = self.options.initial_message.take() {
-            self.startup_messages.push_back(initial);
-        }
-        self.startup_messages
-            .extend(std::mem::take(&mut self.options.initial_messages));
-        self.spawn_next_startup_message();
+        self.begin_startup_messages();
 
         #[cfg(unix)]
         let mut sigterm = if self.options.handle_signals {
@@ -1535,7 +1934,7 @@ impl InteractiveMode {
             DispatchAction::Nothing => {}
             DispatchAction::Builtin(command) => self.execute_builtin(command),
             DispatchAction::Bash { command, excluded } => {
-                self.editor.borrow_mut().add_to_history(text.trim());
+                self.record_history(text.trim());
                 self.editor.borrow_mut().set_text("");
                 self.handle_bash_command(command, excluded);
                 self.is_bash_mode = false;
@@ -1548,7 +1947,7 @@ impl InteractiveMode {
                 self.editor.borrow_mut().set_text(&original_text);
             }
             DispatchAction::ExtensionDuringCompaction { text } => {
-                self.editor.borrow_mut().add_to_history(&text);
+                self.record_history(&text);
                 self.editor.borrow_mut().set_text("");
                 self.spawn_prompt(text);
             }
@@ -1556,7 +1955,7 @@ impl InteractiveMode {
                 self.queue_compaction_message(text, StreamingBehavior::Steer);
             }
             DispatchAction::SteerStreaming { text } => {
-                self.editor.borrow_mut().add_to_history(&text);
+                self.record_history(&text);
                 self.editor.borrow_mut().set_text("");
                 let session = self.session.clone();
                 self.ops.push(Box::pin(async move {
@@ -1576,7 +1975,7 @@ impl InteractiveMode {
                 self.tui.request_render(false);
             }
             DispatchAction::Prompt { text } => {
-                self.editor.borrow_mut().add_to_history(&text);
+                self.record_history(&text);
                 self.editor.borrow_mut().set_text("");
                 self.spawn_prompt(text);
             }
@@ -1584,17 +1983,48 @@ impl InteractiveMode {
     }
 
     fn spawn_prompt(&mut self, text: String) {
+        self.spawn_prompt_with_images(text, Vec::new());
+    }
+
+    fn spawn_prompt_with_images(&mut self, text: String, images: Vec<pi_ai::ImageContent>) {
         let session = self.session.clone();
         self.ops.push(Box::pin(async move {
-            OpOutcome::PromptFinished(session.prompt(&text, PromptOptions::default()).await)
+            OpOutcome::PromptFinished(
+                session
+                    .prompt(
+                        &text,
+                        PromptOptions {
+                            images,
+                            ..Default::default()
+                        },
+                    )
+                    .await,
+            )
         }));
+    }
+
+    /// Queue the startup prompts exactly as `run()` sends them (oracle
+    /// interactive-mode.ts:891-910): the initial message carries the initial
+    /// images; additional messages follow sequentially. Public as the test
+    /// seam for the startup path — production only calls it from `run()`.
+    pub fn begin_startup_messages(&mut self) {
+        if let Some(initial) = self.options.initial_message.take() {
+            let images = std::mem::take(&mut self.options.initial_images);
+            self.startup_messages.push_back((initial, images));
+        }
+        self.startup_messages.extend(
+            std::mem::take(&mut self.options.initial_messages)
+                .into_iter()
+                .map(|message| (message, Vec::new())),
+        );
+        self.spawn_next_startup_message();
     }
 
     fn spawn_next_startup_message(&mut self) {
         if !self.session.is_streaming()
-            && let Some(message) = self.startup_messages.pop_front()
+            && let Some((message, images)) = self.startup_messages.pop_front()
         {
-            self.spawn_prompt(message);
+            self.spawn_prompt_with_images(message, images);
         }
     }
 
@@ -2237,6 +2667,7 @@ impl InteractiveMode {
                     Err(error) => self.show_error(&format!("Logout failed: {error}")),
                 }
             }
+            OpOutcome::ReloadFinished(result) => self.finish_reload(result),
             OpOutcome::FlushQueuePromptFailed(error) => {
                 self.show_error(&error);
             }
@@ -3222,11 +3653,7 @@ impl InteractiveMode {
             let signal = CancellationToken::new();
             OpOutcome::NewSessionCreated(
                 runtime
-                    .fork(
-                        &leaf,
-                        crate::extension_bridge::ForkPosition::At,
-                        &signal,
-                    )
+                    .fork(&leaf, crate::extension_bridge::ForkPosition::At, &signal)
                     .await,
             )
         }));
@@ -3294,7 +3721,7 @@ impl InteractiveMode {
         // immediately, oracle :3677-3686).
         if self.session.is_compacting() {
             if self.dispatch_context().is_extension_command(&text) {
-                self.editor.borrow_mut().add_to_history(&text);
+                self.record_history(&text);
                 self.editor.borrow_mut().set_text("");
                 self.spawn_prompt(text);
             } else {
@@ -3304,7 +3731,7 @@ impl InteractiveMode {
         }
         // Streaming: queue a follow-up message (oracle :3690-3696).
         if self.session.is_streaming() {
-            self.editor.borrow_mut().add_to_history(&text);
+            self.record_history(&text);
             self.editor.borrow_mut().set_text("");
             self.session.follow_up(&text, Vec::new());
             self.update_pending_messages_display();
@@ -3654,7 +4081,45 @@ impl InteractiveMode {
         self.show_error("Share failed: HTML export is not available in this build");
     }
 
+    /// Oracle `handleReloadCommand` (interactive-mode.ts:5279-5381): guard
+    /// against active work, recreate the runtime (settings, resources,
+    /// models, context files re-resolve through the runtime factory), then
+    /// refresh UI state and persist implicit project trust when eligible.
     fn handle_reload_command(&mut self) {
+        if self.session.is_streaming() {
+            self.show_warning("Wait for the current response to finish before reloading.");
+            return;
+        }
+        if self.session.is_compacting() {
+            self.show_warning("Wait for compaction to finish before reloading.");
+            return;
+        }
+        // One reload at a time: slash-command Enter can dispatch twice in
+        // one pump (autocomplete accept + plain submit); a second
+        // concurrent runtime teardown must never start.
+        if self.reload_in_flight {
+            return;
+        }
+        self.reload_in_flight = true;
+        if let Some(reload_runtime) = self.options.reload_runtime.clone() {
+            self.ops.push(Box::pin(async move {
+                OpOutcome::ReloadFinished(reload_runtime().await)
+            }));
+            return;
+        }
+        let runtime = self.runtime.clone();
+        self.ops.push(Box::pin(async move {
+            OpOutcome::ReloadFinished(runtime.reload_session(async { Ok(()) }).await)
+        }));
+    }
+
+    /// Completion of the async `/reload` (oracle handleReloadCommand tail).
+    fn finish_reload(&mut self, result: Result<(), String>) {
+        self.reload_in_flight = false;
+        if let Err(error) = result {
+            self.show_error(&format!("Reload failed: {error}"));
+            return;
+        }
         let services = self.runtime.services();
         set_keybindings(create_app_keybindings(&services.agent_dir));
         let theme_setting = {
@@ -3664,9 +4129,64 @@ impl InteractiveMode {
         if let Some(name) = theme_setting {
             let _ = set_theme(&name, false);
         }
+        self.rebind_session();
+        self.show_loaded_resources(false);
+        let saved_implicit_project_trust = self.maybe_save_implicit_project_trust_after_reload();
         self.tui.invalidate();
-        self.show_status("Reloaded keybindings and themes");
+        self.show_status(if saved_implicit_project_trust {
+            "Reloaded keybindings, extensions, skills, prompts, themes, and context files; saved project trust"
+        } else {
+            "Reloaded keybindings, extensions, skills, prompts, themes, and context files"
+        });
         self.tui.request_render(false);
+    }
+
+    /// Oracle `maybeSaveImplicitProjectTrustAfterReload` (interactive-mode.
+    /// ts:4378-4402): a cwd implicitly trusted at startup (no trust-
+    /// requiring resources then) that gained them during the session gets
+    /// its trust persisted after the first reload that loads them.
+    fn maybe_save_implicit_project_trust_after_reload(&mut self) -> bool {
+        let cwd = self.session.cwd().to_path_buf();
+        if self.auto_trust_on_reload_cwd.as_deref() != Some(cwd.as_path()) {
+            return false;
+        }
+        let services = self.runtime.services();
+        if !services.settings_manager.lock().is_project_trusted()
+            || !super::trust_store::has_trust_requiring_project_resources(&cwd)
+        {
+            return false;
+        }
+        let store = super::trust_store::ProjectTrustStore::new(&services.agent_dir);
+        match store.get_entry(&cwd) {
+            Ok(Some(_)) => {
+                self.auto_trust_on_reload_cwd = None;
+                false
+            }
+            Ok(None) => {
+                let update = super::components::trust_selector::ProjectTrustUpdate {
+                    path: cwd.display().to_string(),
+                    decision: Some(true),
+                };
+                match store.set_many(&[update]) {
+                    Ok(()) => {
+                        self.auto_trust_on_reload_cwd = None;
+                        true
+                    }
+                    Err(error) => {
+                        self.show_warning(&format!(
+                            "Could not save project trust after reload: {error}"
+                        ));
+                        false
+                    }
+                }
+            }
+            Err(error) => {
+                self.show_warning(&format!(
+                    "Could not save project trust after reload: {error}"
+                ));
+                false
+            }
+        }
     }
 
     fn handle_debug_command(&mut self) {
@@ -3768,8 +4288,15 @@ impl InteractiveMode {
         }));
     }
 
+    /// Editor history for a genuine user submission — in-memory Up-arrow
+    /// history only (oracle keeps editor history session-scoped;
+    /// editor.ts:402-408).
+    fn record_history(&self, text: &str) {
+        self.editor.borrow_mut().add_to_history(text);
+    }
+
     fn queue_compaction_message(&mut self, text: String, mode: StreamingBehavior) {
-        self.editor.borrow_mut().add_to_history(&text);
+        self.record_history(&text);
         self.editor.borrow_mut().set_text("");
         self.compaction_queued
             .push(CompactionQueuedMessage { text, mode });
@@ -3915,6 +4442,7 @@ impl InteractiveMode {
         for tool in self.pending_tools.values() {
             tool.borrow_mut().set_expanded(expanded);
         }
+        self.refresh_startup_expansion();
         self.chat.borrow_mut().mark_changed();
         self.tui.request_render(false);
     }
@@ -4220,5 +4748,44 @@ fn footer_stats(session: &AgentSession) -> FooterStats {
         ),
         using_subscription: false,
         experimental: false,
+    }
+}
+
+/// Oracle `formatDisplayPath` (interactive-mode.ts:1050-1060): home prefix
+/// shortened to `~`.
+fn format_display_path(path: &str) -> String {
+    if let Some(home) = dirs::home_dir() {
+        let home = home.to_string_lossy().into_owned();
+        if let Some(rest) = path.strip_prefix(&home) {
+            return format!("~{rest}");
+        }
+    }
+    path.to_string()
+}
+
+/// Oracle `formatContextPath` (interactive-mode.ts:1068-1077): cwd-relative
+/// when inside the cwd, display path otherwise.
+fn format_context_path(path: &str, cwd: &std::path::Path) -> String {
+    let absolute = if std::path::Path::new(path).is_absolute() {
+        std::path::PathBuf::from(path)
+    } else {
+        cwd.join(path)
+    };
+    match absolute.strip_prefix(cwd) {
+        Ok(relative) if !relative.as_os_str().is_empty() => relative.to_string_lossy().into_owned(),
+        _ => format_display_path(&absolute.to_string_lossy()),
+    }
+}
+
+/// Wire string of an [`AgentThinkingLevel`] (serde camelCase names).
+fn agent_thinking_level_str(level: AgentThinkingLevel) -> &'static str {
+    match level {
+        AgentThinkingLevel::Off => "off",
+        AgentThinkingLevel::Minimal => "minimal",
+        AgentThinkingLevel::Low => "low",
+        AgentThinkingLevel::Medium => "medium",
+        AgentThinkingLevel::High => "high",
+        AgentThinkingLevel::Xhigh => "xhigh",
+        AgentThinkingLevel::Max => "max",
     }
 }

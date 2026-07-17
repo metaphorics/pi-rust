@@ -17,6 +17,7 @@ pub mod daxnuts;
 pub mod diff;
 pub mod dynamic_border;
 pub mod earendil_announcement;
+pub mod expandable_text;
 pub mod extension_editor;
 pub mod extension_input;
 pub mod extension_selector;

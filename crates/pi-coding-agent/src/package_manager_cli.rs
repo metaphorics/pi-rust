@@ -4,11 +4,19 @@
 //! order. Returning a value instead of writing stdout makes the command path
 //! deterministic and keeps JSON/RPC stdout ownership separate.
 
+use crate::cli::startup_ui;
 use crate::config::{APP_NAME, CONFIG_DIR_NAME, PACKAGE_NAME};
+use crate::modes::interactive::components::trust_selector::ProjectTrustUpdate;
+use crate::modes::interactive::trust_store::{
+    ProjectTrustStore, has_trust_requiring_project_resources,
+};
 use crate::package_manager::{
     CommandRunner, DefaultPackageManager, PackageManagerError, ProcessCommandRunner,
 };
+use crate::settings_manager::SettingsManager;
+use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PackageCommand {
@@ -101,7 +109,7 @@ impl Default for ProcessSelfUpdater<ProcessCommandRunner> {
         Self {
             runner: ProcessCommandRunner,
             entrypoint: std::env::current_exe().unwrap_or_default(),
-            current_version: env!("CARGO_PKG_VERSION").to_string(),
+            current_version: crate::config::VERSION.to_string(),
             release_override: None,
         }
     }
@@ -546,6 +554,63 @@ pub fn get_package_command_help(command: PackageCommand) -> String {
         ),
     }
 }
+/// Oracle `CONFIG_COMMAND_USAGE` (package-manager-cli.ts:90).
+pub fn get_config_command_usage() -> String {
+    format!("{APP_NAME} config [-l] [--approve|--no-approve]")
+}
+
+/// Oracle `printConfigCommandHelp` (package-manager-cli.ts:92-105), SGR
+/// stripped like every other package-command help in this module.
+pub fn get_config_command_help() -> String {
+    format!(
+        "Usage:\n  {}\n\nOpen the resource configuration TUI to enable or disable package resources.\nWithout -l, starts in global settings (~/{CONFIG_DIR_NAME}/agent/settings.json).\nPress Tab in the TUI to switch between global and project-local modes.\n\nOptions:\n  -l, --local       Edit project overrides ({CONFIG_DIR_NAME}/settings.json)\n  -a, --approve     Trust project-local files for this command with -l\n  -na, --no-approve Ignore project-local files for this command with -l\n",
+        get_config_command_usage()
+    )
+}
+
+/// Parsed `pi config` invocation (oracle handleConfigCommand:557-587).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ConfigCommandOptions {
+    pub help: bool,
+    pub local: bool,
+    pub project_trust_override: Option<bool>,
+    pub invalid_option: Option<String>,
+    pub invalid_argument: Option<String>,
+}
+
+/// `None` unless the first argument is `config`. Mirrors the oracle: the
+/// help check wins over everything; the first invalid token stops parsing.
+pub fn parse_config_command<S: AsRef<str>>(args: &[S]) -> Option<ConfigCommandOptions> {
+    if args.first()?.as_ref() != "config" {
+        return None;
+    }
+    let rest = &args[1..];
+    let mut options = ConfigCommandOptions::default();
+    if rest
+        .iter()
+        .any(|arg| matches!(arg.as_ref(), "-h" | "--help"))
+    {
+        options.help = true;
+        return Some(options);
+    }
+    for arg in rest {
+        let arg = arg.as_ref();
+        match arg {
+            "-l" | "--local" => options.local = true,
+            "-a" | "--approve" => options.project_trust_override = Some(true),
+            "-na" | "--no-approve" => options.project_trust_override = Some(false),
+            _ if arg.starts_with('-') => {
+                options.invalid_option = Some(arg.to_string());
+                break;
+            }
+            _ => {
+                options.invalid_argument = Some(arg.to_string());
+                break;
+            }
+        }
+    }
+    Some(options)
+}
 
 pub fn parse_package_command<S: AsRef<str>>(args: &[S]) -> Option<PackageCommandOptions> {
     let raw = args.first()?.as_ref();
@@ -933,4 +998,76 @@ fn install_method_name(method: InstallMethod) -> &'static str {
         InstallMethod::BunBinary => "bun-binary",
         InstallMethod::Unknown => "unknown",
     }
+}
+
+pub fn resolve_command_project_trust(
+    cwd: &Path,
+    agent_dir: &Path,
+    trust_override: Option<bool>,
+    default_project_trust: &str,
+    use_saved_project_trust_only: bool,
+    interactive_ui: Option<&Arc<Mutex<SettingsManager>>>,
+) -> bool {
+    if let Some(overridden) = trust_override {
+        return overridden;
+    }
+    let store = ProjectTrustStore::new(agent_dir);
+    if use_saved_project_trust_only {
+        if let Ok(Some(entry)) = store.get_entry(cwd) {
+            return entry.decision;
+        }
+        return false;
+    }
+    if !has_trust_requiring_project_resources(cwd) {
+        return true;
+    }
+    if let Ok(Some(entry)) = store.get_entry(cwd) {
+        return entry.decision;
+    }
+    match default_project_trust {
+        "always" => return true,
+        "never" => return false,
+        _ => {}
+    }
+    let Some(settings_manager) = interactive_ui else {
+        return false;
+    };
+
+    let trust_path = cwd.display().to_string();
+    let parent = cwd.parent().map(|p| p.display().to_string());
+    let mut labels = vec!["Trust".to_string()];
+    if let Some(parent) = &parent {
+        labels.push(format!("Trust parent folder ({parent})"));
+    }
+    labels.push("Trust (this session only)".to_string());
+    labels.push("Do not trust".to_string());
+    labels.push("Do not trust (this session only)".to_string());
+
+    let title = format!(
+        "Trust project folder?\n{cwd_display}\n\nThis allows pi to load {config_dir_name} settings and resources, install missing project packages, and execute project extensions.",
+        cwd_display = trust_path,
+        config_dir_name = CONFIG_DIR_NAME
+    );
+    let terminal = pi_tui::terminal::ProcessTerminal::new();
+    let mut ui = startup_ui::create_startup_tui(agent_dir, settings_manager, terminal);
+    let selected = startup_ui::show_startup_selector(&mut ui, &title, &labels);
+    ui.stop();
+    let Some(index) = selected else {
+        return false;
+    };
+    let label = labels[index].as_str();
+    let (trusted, saved): (bool, Option<(String, bool)>) = match label {
+        "Trust" => (true, Some((trust_path.clone(), true))),
+        "Trust (this session only)" => (true, None),
+        "Do not trust" => (false, Some((trust_path.clone(), false))),
+        "Do not trust (this session only)" => (false, None),
+        _ => (true, parent.map(|p| (p, true))),
+    };
+    if let Some((path, decision)) = saved {
+        let _ = store.set_many(&[ProjectTrustUpdate {
+            path,
+            decision: Some(decision),
+        }]);
+    }
+    trusted
 }

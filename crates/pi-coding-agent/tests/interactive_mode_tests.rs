@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use pi_agent::StreamFn;
+use pi_agent::{AgentThinkingLevel, StreamFn};
 use pi_ai::{
     AssistantMessage, AssistantMessageEvent, Content, Message, StopReason, TextContent, ToolCall,
     UserContent,
@@ -15,6 +15,8 @@ use pi_coding_agent::modes::interactive::dispatch::{
 use pi_coding_agent::modes::interactive::interactive_mode::{
     InteractiveMode, InteractiveModeOptions,
 };
+use pi_coding_agent::session::{PromptTemplate, ScopedModel};
+use pi_coding_agent::system_prompt::Skill;
 use pi_coding_agent::{ExtensionBridge, RegisteredCommand, SourceInfo};
 
 use common::vt_terminal::{VtHandle, VtTerminal};
@@ -1309,4 +1311,403 @@ async fn follow_up_expands_large_paste_markers() {
     );
     assert!(!follow_up[0].contains("[paste"), "{:?}", follow_up[0]);
     assert_no_flicker(&handle);
+}
+
+/// Editor history is in-memory only (oracle editor.ts:402-408): a submitted
+/// prompt is recalled with Up and resubmits verbatim, and nothing is
+/// persisted under the agent dir.
+#[tokio::test(flavor = "current_thread")]
+async fn editor_history_recalls_in_memory_and_persists_nothing() {
+    let seed = make_runtime(TestRuntimeOptions {
+        with_auth: true,
+        ..Default::default()
+    })
+    .await;
+    let first = assistant_text_message(&seed.model, "first reply");
+    let second = assistant_text_message(&seed.model, "second reply");
+    drop(seed);
+    let test = make_runtime(TestRuntimeOptions {
+        with_auth: true,
+        script: vec![first, second],
+        ..Default::default()
+    })
+    .await;
+    let session = test.runtime.session();
+    let (terminal, handle) = VtTerminal::new(90, 28);
+    let mut mode = InteractiveMode::new(
+        test.runtime.clone(),
+        terminal,
+        InteractiveModeOptions::default(),
+    );
+    mode.init();
+
+    send(&mut mode, &handle, "alpha-one prompt");
+    send(&mut mode, &handle, "\r");
+    pump_until(&mut mode, &handle, Duration::from_secs(2), |screen| {
+        screen.contains("first reply")
+    })
+    .await;
+
+    // Up recalls the submitted prompt into the (now empty) editor; Enter
+    // resubmits it verbatim.
+    send(&mut mode, &handle, "\x1b[A");
+    send(&mut mode, &handle, "\r");
+    pump_until(&mut mode, &handle, Duration::from_secs(2), |screen| {
+        screen.contains("second reply")
+    })
+    .await;
+
+    let user_texts: Vec<String> = session
+        .messages()
+        .iter()
+        .filter_map(|message| {
+            if let Some(Message::User(user)) = message.as_message() {
+                match &user.content {
+                    UserContent::Text(text) => Some(text.clone()),
+                    UserContent::Blocks(blocks) => blocks.iter().find_map(|block| {
+                        if let Content::Text(text) = block {
+                            Some(text.text.to_string())
+                        } else {
+                            None
+                        }
+                    }),
+                }
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(
+        user_texts,
+        vec![
+            "alpha-one prompt".to_string(),
+            "alpha-one prompt".to_string()
+        ],
+        "Up-arrow recall must resubmit the in-memory history entry"
+    );
+
+    // Nothing history-related is written to disk: the agent dir holds no
+    // new files beyond what runtime creation itself produced.
+    let unexpected: Vec<String> = std::fs::read_dir(test.tmp.path().join("agent"))
+        .expect("agent dir")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains("history"))
+        .collect();
+    assert!(unexpected.is_empty(), "{unexpected:?}");
+    assert_no_flicker(&handle);
+}
+
+/// Oracle interactive-mode.ts:892-894: the initial startup prompt is sent
+/// with `initialImages`; the provider call must see the image content in
+/// the first user message.
+#[tokio::test(flavor = "current_thread")]
+async fn initial_message_carries_initial_images_to_the_provider() {
+    use parking_lot::Mutex;
+    use std::collections::VecDeque;
+
+    let contexts: Arc<Mutex<Vec<pi_ai::Context>>> = Arc::new(Mutex::new(Vec::new()));
+    let seed = make_runtime(TestRuntimeOptions {
+        with_auth: true,
+        ..Default::default()
+    })
+    .await;
+    let reply = assistant_text_message(&seed.model, "image-received");
+    drop(seed);
+    let stream_fn: StreamFn = {
+        let contexts = contexts.clone();
+        let script = Arc::new(Mutex::new(VecDeque::from(vec![reply])));
+        Arc::new(move |model: pi_ai::Model, context, _options| {
+            let contexts = contexts.clone();
+            let script = script.clone();
+            Box::pin(async move {
+                contexts.lock().push(context);
+                let stream = pi_ai::create_assistant_message_event_stream();
+                let message = script.lock().pop_front().unwrap_or_else(|| {
+                    let mut error = assistant_text_message(&model, "");
+                    error.stop_reason = StopReason::Error;
+                    error.error_message = Some("script exhausted".to_string());
+                    error
+                });
+                stream.push(AssistantMessageEvent::Done {
+                    reason: message.stop_reason,
+                    message,
+                });
+                stream
+            })
+        })
+    };
+    let test = make_runtime(TestRuntimeOptions {
+        with_auth: true,
+        stream_fn: Some(stream_fn),
+        ..Default::default()
+    })
+    .await;
+    let (terminal, handle) = VtTerminal::new(90, 28);
+    let mut mode = InteractiveMode::new(
+        test.runtime.clone(),
+        terminal,
+        InteractiveModeOptions {
+            initial_message: Some("describe the attachment".to_string()),
+            initial_images: vec![pi_ai::ImageContent {
+                data: "QUJDREVG".to_string(),
+                mime_type: "image/png".to_string(),
+            }],
+            ..Default::default()
+        },
+    );
+    mode.init();
+    mode.begin_startup_messages();
+    pump_until(&mut mode, &handle, Duration::from_secs(2), |screen| {
+        screen.contains("image-received")
+    })
+    .await;
+
+    let contexts = contexts.lock();
+    assert_eq!(contexts.len(), 1, "one provider call expected");
+    let Message::User(user) = &contexts[0].messages[0] else {
+        panic!("first context message must be the user prompt");
+    };
+    let UserContent::Blocks(blocks) = &user.content else {
+        panic!("image prompt must use content blocks");
+    };
+    assert!(
+        blocks.iter().any(|block| matches!(
+            block,
+            Content::Image(image) if image.data == "QUJDREVG" && image.mime_type == "image/png"
+        )),
+        "provider context missing the initial image: {blocks:?}"
+    );
+    assert!(blocks.iter().any(|block| matches!(
+        block,
+        Content::Text(text) if text.text.to_string().contains("describe the attachment")
+    )));
+}
+
+/// Oracle interactive-mode.ts:876-878: migrated credentials surface as a
+/// TUI startup warning with the exact oracle string.
+#[tokio::test(flavor = "current_thread")]
+async fn migrated_providers_show_startup_warning() {
+    let test = make_runtime(TestRuntimeOptions {
+        with_auth: true,
+        ..Default::default()
+    })
+    .await;
+    let (terminal, handle) = VtTerminal::new(100, 30);
+    let mut mode = InteractiveMode::new(
+        test.runtime.clone(),
+        terminal,
+        InteractiveModeOptions {
+            migrated_providers: vec!["anthropic".to_string(), "openai".to_string()],
+            ..Default::default()
+        },
+    );
+    mode.init();
+    let screen = pump_until(&mut mode, &handle, Duration::from_secs(2), |screen| {
+        screen.contains("Migrated credentials to auth.json: anthropic, openai")
+    })
+    .await;
+    assert!(screen.contains("Migrated credentials to auth.json: anthropic, openai"));
+}
+
+/// Oracle `verbose || !quietStartup`: quiet mode hides the startup header,
+/// model-scope line, and resource sections; `--verbose` reveals all three
+/// and expands resource entries to their source paths.
+#[tokio::test(flavor = "current_thread")]
+async fn verbose_overrides_quiet_startup_and_expands_resources() {
+    let resources = || {
+        (
+            Skill {
+                name: "demo-skill".to_string(),
+                description: "demo".to_string(),
+                file_path: PathBuf::from("/tmp/resources/demo-skill/SKILL.md"),
+                base_dir: PathBuf::from("/tmp/resources/demo-skill"),
+                ..Default::default()
+            },
+            PromptTemplate {
+                name: "hello".to_string(),
+                description: "hello prompt".to_string(),
+                argument_hint: None,
+                content: "hello".to_string(),
+                file_path: PathBuf::from("/tmp/resources/prompts/hello.md"),
+                source_info: Default::default(),
+            },
+        )
+    };
+
+    let (skill, prompt) = resources();
+    let quiet = make_runtime(TestRuntimeOptions {
+        global_settings: Some(serde_json::json!({ "quietStartup": true })),
+        skills: vec![skill],
+        prompt_templates: vec![prompt],
+        ..Default::default()
+    })
+    .await;
+    quiet.runtime.session().set_scoped_models(vec![ScopedModel {
+        model: quiet.model.clone(),
+        thinking_level: Some(AgentThinkingLevel::Low),
+    }]);
+    let (terminal, handle) = VtTerminal::new(120, 40);
+    let mut mode = InteractiveMode::new(
+        quiet.runtime.clone(),
+        terminal,
+        InteractiveModeOptions::default(),
+    );
+    mode.init();
+    mode.pump();
+    let quiet_screen = handle.screen(|screen| screen.serialize());
+    assert!(!quiet_screen.contains("pi v0.80.7"), "{quiet_screen}");
+    assert!(!quiet_screen.contains("Model scope:"), "{quiet_screen}");
+    assert!(!quiet_screen.contains("[Skills]"), "{quiet_screen}");
+    assert!(!quiet_screen.contains("[Prompts]"), "{quiet_screen}");
+
+    let (skill, prompt) = resources();
+    let verbose = make_runtime(TestRuntimeOptions {
+        global_settings: Some(serde_json::json!({ "quietStartup": true })),
+        skills: vec![skill],
+        prompt_templates: vec![prompt],
+        ..Default::default()
+    })
+    .await;
+    verbose
+        .runtime
+        .session()
+        .set_scoped_models(vec![ScopedModel {
+            model: verbose.model.clone(),
+            thinking_level: Some(AgentThinkingLevel::Low),
+        }]);
+    let (terminal, handle) = VtTerminal::new(120, 40);
+    let mut mode = InteractiveMode::new(
+        verbose.runtime.clone(),
+        terminal,
+        InteractiveModeOptions {
+            verbose: true,
+            ..Default::default()
+        },
+    );
+    mode.init();
+    let verbose_screen = pump_until(&mut mode, &handle, Duration::from_secs(2), |screen| {
+        screen.contains("pi v0.80.7")
+            && screen.contains("Model scope:")
+            && screen.contains("[Skills]")
+            && screen.contains("[Prompts]")
+    })
+    .await;
+    assert!(
+        verbose_screen.contains("~/")
+            || verbose_screen.contains("/tmp/resources/demo-skill/SKILL.md"),
+        "verbose skill listing must show its source path:\n{verbose_screen}"
+    );
+    assert!(
+        verbose_screen.contains("/tmp/resources/prompts/hello.md"),
+        "verbose prompt listing must show its source path:\n{verbose_screen}"
+    );
+}
+
+/// Oracle `maybeSaveImplicitProjectTrustAfterReload` (interactive-mode.ts:
+/// 4378-4402): a cwd implicitly trusted at startup that gained a `.pi`
+/// directory during the session gets its trust persisted by the first
+/// `/reload`; a second reload does not re-save.
+#[tokio::test(flavor = "multi_thread")]
+async fn reload_persists_implicit_project_trust_once() {
+    let test = make_runtime(TestRuntimeOptions {
+        with_auth: true,
+        ..Default::default()
+    })
+    .await;
+    let session = test.runtime.session();
+    let cwd = session.cwd().to_path_buf();
+    let agent_dir = test.runtime.services().agent_dir.clone();
+    let (terminal, handle) = VtTerminal::new(160, 30);
+    let mut mode = InteractiveMode::new(
+        test.runtime.clone(),
+        terminal,
+        InteractiveModeOptions {
+            auto_trust_on_reload_cwd: Some(cwd.clone()),
+            ..Default::default()
+        },
+    );
+    mode.init();
+
+    // The project gains trust-requiring resources mid-session.
+    std::fs::create_dir_all(cwd.join(".pi")).expect(".pi dir");
+    std::fs::write(cwd.join(".pi/settings.json"), "{}").expect("project settings");
+
+    send(&mut mode, &handle, "/reload");
+    send(&mut mode, &handle, "\r");
+    pump_until(&mut mode, &handle, Duration::from_secs(5), |screen| {
+        screen.contains(
+            "Reloaded keybindings, extensions, skills, prompts, themes, and context files; saved project trust",
+        )
+    })
+    .await;
+
+    let trust_json =
+        std::fs::read_to_string(agent_dir.join("trust.json")).expect("trust.json written");
+    let parsed: serde_json::Value = serde_json::from_str(&trust_json).expect("valid trust.json");
+    let canonical = cwd.canonicalize().unwrap_or(cwd.clone());
+    let entry = parsed
+        .get(canonical.to_string_lossy().as_ref())
+        .or_else(|| parsed.get(cwd.to_string_lossy().as_ref()));
+    assert_eq!(
+        entry.and_then(serde_json::Value::as_bool),
+        Some(true),
+        "trust.json must record the cwd as trusted: {trust_json}"
+    );
+
+    // Second reload: the saved decision short-circuits — the status is the
+    // plain string (it REPLACES the previous status) and trust.json is
+    // byte-identical.
+    send(&mut mode, &handle, "/reload");
+    send(&mut mode, &handle, "\r");
+    let screen = pump_until(&mut mode, &handle, Duration::from_secs(5), |screen| {
+        screen.contains(
+            "Reloaded keybindings, extensions, skills, prompts, themes, and context files",
+        ) && !screen.contains("; saved project trust")
+    })
+    .await;
+    assert!(!screen.contains("; saved project trust"), "{screen}");
+    let trust_json_after =
+        std::fs::read_to_string(agent_dir.join("trust.json")).expect("trust.json");
+    assert_eq!(
+        trust_json, trust_json_after,
+        "second reload must not rewrite trust.json"
+    );
+}
+
+/// Without `autoTrustOnReloadCwd` (explicit override or trust-requiring
+/// resources present at startup) `/reload` never writes trust.json.
+#[tokio::test(flavor = "multi_thread")]
+async fn reload_without_auto_trust_saves_nothing() {
+    let test = make_runtime(TestRuntimeOptions {
+        with_auth: true,
+        ..Default::default()
+    })
+    .await;
+    let session = test.runtime.session();
+    let cwd = session.cwd().to_path_buf();
+    let agent_dir = test.runtime.services().agent_dir.clone();
+    let (terminal, handle) = VtTerminal::new(100, 30);
+    let mut mode = InteractiveMode::new(
+        test.runtime.clone(),
+        terminal,
+        InteractiveModeOptions::default(),
+    );
+    mode.init();
+    std::fs::create_dir_all(cwd.join(".pi")).expect(".pi dir");
+    std::fs::write(cwd.join(".pi/settings.json"), "{}").expect("project settings");
+
+    send(&mut mode, &handle, "/reload");
+    send(&mut mode, &handle, "\r");
+    let screen = pump_until(&mut mode, &handle, Duration::from_secs(5), |screen| {
+        screen.contains(
+            "Reloaded keybindings, extensions, skills, prompts, themes, and context files",
+        )
+    })
+    .await;
+    assert!(!screen.contains("; saved project trust"), "{screen}");
+    assert!(
+        !agent_dir.join("trust.json").exists(),
+        "no implicit trust may be persisted without autoTrustOnReloadCwd"
+    );
 }
