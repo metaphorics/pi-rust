@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll, Waker};
 use std::time::{Duration, Instant};
 
-use pi_agent::{AgentMessage, AgentThinkingLevel, AgentToolResult};
+use pi_agent::{AgentMessage, AgentThinkingLevel, AgentToolResult, CancellationToken};
 use pi_ai::{Message, Model, ModelThinkingLevel, StopReason, Transport};
 use pi_tui::autocomplete::{CombinedAutocompleteProvider, CommandEntry, SlashCommand};
 use pi_tui::component::{Component, ComponentBox};
@@ -1094,7 +1094,8 @@ impl InteractiveMode {
                 self.restore_editor();
                 let runtime = self.runtime.clone();
                 self.ops.push(Box::pin(async move {
-                    OpOutcome::SessionSwitched(runtime.switch_session(&path, None).await)
+                    let signal = CancellationToken::new();
+                    OpOutcome::SessionSwitched(runtime.switch_session(&path, None, &signal).await)
                 }));
             }
             UiCommand::SessionSelectorExit => {
@@ -1105,9 +1106,14 @@ impl InteractiveMode {
                 self.restore_editor();
                 let runtime = self.runtime.clone();
                 self.ops.push(Box::pin(async move {
+                    let signal = CancellationToken::new();
                     OpOutcome::ForkFinished(
                         runtime
-                            .fork(&entry_id, crate::extension_bridge::ForkPosition::Before)
+                            .fork(
+                                &entry_id,
+                                crate::extension_bridge::ForkPosition::Before,
+                                &signal,
+                            )
                             .await,
                     )
                 }));
@@ -3213,9 +3219,14 @@ impl InteractiveMode {
         };
         let runtime = self.runtime.clone();
         self.ops.push(Box::pin(async move {
+            let signal = CancellationToken::new();
             OpOutcome::NewSessionCreated(
                 runtime
-                    .fork(&leaf, crate::extension_bridge::ForkPosition::At)
+                    .fork(
+                        &leaf,
+                        crate::extension_bridge::ForkPosition::At,
+                        &signal,
+                    )
                     .await,
             )
         }));
@@ -3226,7 +3237,8 @@ impl InteractiveMode {
         self.clear_status_indicator(None);
         let runtime = self.runtime.clone();
         self.ops.push(Box::pin(async move {
-            OpOutcome::NewSessionCreated(runtime.new_session(None).await)
+            let signal = CancellationToken::new();
+            OpOutcome::NewSessionCreated(runtime.new_session(None, &signal).await)
         }));
     }
 
@@ -3614,7 +3626,8 @@ impl InteractiveMode {
         }
         let runtime = self.runtime.clone();
         self.ops.push(Box::pin(async move {
-            OpOutcome::SessionSwitched(runtime.switch_session(&path, None).await)
+            let signal = CancellationToken::new();
+            OpOutcome::SessionSwitched(runtime.switch_session(&path, None, &signal).await)
         }));
     }
 
