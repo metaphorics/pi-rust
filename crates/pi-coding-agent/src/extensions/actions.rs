@@ -14,9 +14,9 @@ use pi_agent::CancellationToken;
 use pi_ai::Model;
 use pi_ext_protocol::{
     AppendEntryParams, CancelledResult, CompactParams, ForkParams, NavigateTreeParams,
-    NewSessionParams, Notification, ProtocolError, Request, RequestId, ResponseResult,
-    SendMessageParams, SendUserMessageParams, SetLabelParams, SetThinkingLevelParams,
-    SwitchSessionParams,
+    NewSessionParams, Notification, ProtocolError, RefreshToolsParams, Request, RequestId,
+    ResponseResult, SendMessageParams, SendUserMessageParams, SetLabelParams,
+    SetThinkingLevelParams, SwitchSessionParams,
 };
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -57,7 +57,9 @@ pub trait HostActions: Send + Sync {
     fn set_active_tools(&self, _tool_names: Vec<String>) -> BoxFuture<'static, ()> {
         ready(())
     }
-    fn refresh_tools(&self) -> BoxFuture<'static, ()> {
+    /// `refreshTools()` — the params carry the sidecar's current
+    /// registration snapshot (late `pi.registerTool` calls).
+    fn refresh_tools(&self, _params: RefreshToolsParams) -> BoxFuture<'static, ()> {
         ready(())
     }
     fn set_thinking_level(&self, _params: SetThinkingLevelParams) -> BoxFuture<'static, ()> {
@@ -168,6 +170,11 @@ pub fn spawn_action_server(
                     if let Some(token) = in_flight.remove(&id.get()) {
                         token.cancel();
                     }
+                }
+                Incoming::Barrier(done) => {
+                    // Everything enqueued before the fence has been handled
+                    // (notifications are awaited serially above).
+                    let _ = done.send(());
                 }
             }
         }
@@ -339,7 +346,7 @@ async fn handle_notification(
         Notification::ActionSetActiveTools(params) => {
             config.actions.set_active_tools(params.tool_names).await;
         }
-        Notification::ActionRefreshTools(_) => config.actions.refresh_tools().await,
+        Notification::ActionRefreshTools(params) => config.actions.refresh_tools(params).await,
         Notification::ActionSetThinkingLevel(params) => {
             config.actions.set_thinking_level(params).await;
         }

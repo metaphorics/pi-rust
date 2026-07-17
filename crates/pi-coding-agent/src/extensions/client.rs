@@ -88,6 +88,12 @@ pub enum Incoming {
     Notification(Notification),
     /// The sidecar cancelled one of its own in-flight requests.
     Cancel { id: RequestId },
+    /// Host-injected ordering fence: completed by the consumer only after
+    /// every earlier inbound frame has been fully handled. Lets a caller
+    /// that just received a RESPONSE (delivered out-of-band by the demux)
+    /// wait until the notifications the sidecar sent BEFORE that response
+    /// have taken effect — pi's synchronous read-after-write semantics.
+    Barrier(tokio::sync::oneshot::Sender<()>),
 }
 
 struct HeartbeatState {

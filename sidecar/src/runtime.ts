@@ -227,6 +227,7 @@ export async function bootRuntime(options: BootOptions): Promise<SidecarRuntime>
     cwd: init.cwd,
     getCommands: commandCatalog,
     createCommandContext: () => runner.createCommandContext(),
+    getRegistrations: () => toWire(registrations()),
   });
   bridged.turnSignal.setIdle(init.state.idle);
 
@@ -391,6 +392,7 @@ function toolRegistration(tool: RegisteredTool) {
     label: definition.label,
     description: definition.description,
     parameters: JSON.parse(JSON.stringify(definition.parameters)) as JsonValue,
+    ...(definition.promptSnippet !== undefined ? { promptSnippet: definition.promptSnippet } : {}),
     ...(definition.promptGuidelines !== undefined
       ? { promptGuidelines: definition.promptGuidelines.join("\n") }
       : {}),

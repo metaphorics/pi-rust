@@ -45,6 +45,8 @@ export interface BridgedActionDeps {
   getCommands: () => SlashCommandInfo[];
   /** Fresh command context for ReplacedSessionContext construction. */
   createCommandContext: () => ExtensionCommandContext;
+  /** Current registration snapshot; rides `action/refreshTools`. */
+  getRegistrations: () => JsonValue;
 }
 
 export interface BridgedActions {
@@ -150,7 +152,9 @@ export function createBridgedActions(deps: BridgedActionDeps): BridgedActions {
       peer.notify("action/setActiveTools", { toolNames });
     },
     refreshTools: () => {
-      peer.notify("action/refreshTools", {});
+      // Late registrations (pi.registerTool post-initialized) ride along so
+      // the host can rebuild its tool registry without a fetch round trip.
+      peer.notify("action/refreshTools", { registrations: deps.getRegistrations() });
     },
     getCommands: () => deps.getCommands(),
     setModel: async (model) => {

@@ -213,7 +213,7 @@ pub enum Notification {
     #[serde(rename = "action/setActiveTools")]
     ActionSetActiveTools(SetActiveToolsParams),
     #[serde(rename = "action/refreshTools")]
-    ActionRefreshTools(Empty),
+    ActionRefreshTools(RefreshToolsParams),
     #[serde(rename = "action/setThinkingLevel")]
     ActionSetThinkingLevel(SetThinkingLevelParams),
     #[serde(rename = "action/shutdown")]
@@ -961,6 +961,8 @@ pub struct StateUpdate {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_tools: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub all_tools: Option<Vec<ToolInfo>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub context_usage: Option<ContextUsageDto>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
@@ -1023,6 +1025,8 @@ pub struct ToolRegistration {
     pub label: String,
     pub description: String,
     pub parameters: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_snippet: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_guidelines: Option<String>,
     pub source_info: SourceInfo,
@@ -1205,6 +1209,15 @@ pub struct SetLabelParams {
 #[serde(rename_all = "camelCase")]
 pub struct SetActiveToolsParams {
     pub tool_names: Vec<String>,
+}
+/// `action/refreshTools` — the sidecar includes its current registration
+/// snapshot so late `pi.registerTool` calls (post-`initialized`) reach the
+/// host without an extra round trip.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RefreshToolsParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registrations: Option<Registrations>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SetThinkingLevelParams {
@@ -1793,7 +1806,9 @@ mod tests {
             Notification::ActionSetActiveTools(SetActiveToolsParams {
                 tool_names: vec!["read".into()],
             }),
-            Notification::ActionRefreshTools(Empty {}),
+            Notification::ActionRefreshTools(RefreshToolsParams {
+                registrations: Some(Registrations::default()),
+            }),
             Notification::ActionShutdown(Empty {}),
             Notification::ActionAbort(Empty {}),
             Notification::ActionSetThinkingLevel(SetThinkingLevelParams {

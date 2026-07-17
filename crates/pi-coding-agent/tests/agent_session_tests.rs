@@ -714,6 +714,7 @@ fn noop_tool(name: &str) -> SessionToolDefinition {
         prompt_snippet: Some(format!("custom {name} snippet")),
         prompt_guidelines: vec![],
         source: "sdk",
+        source_info: None,
     }
 }
 

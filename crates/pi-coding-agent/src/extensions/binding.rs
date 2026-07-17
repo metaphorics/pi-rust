@@ -24,9 +24,9 @@ use pi_agent::CancellationToken;
 use pi_ai::Model;
 use pi_ext_protocol::{
     AppendEntryParams, CancelledResult, CompactParams, Delivery, ExtensionMode, FlagValue,
-    ForkParams, InitParams, NavigateTreeParams, NewSessionParams, Registrations, SendMessageParams,
-    SendUserMessageParams, SetLabelParams, SetThinkingLevelParams, SwitchSessionParams,
-    UserMessageDelivery,
+    ForkParams, InitParams, NavigateTreeParams, NewSessionParams, Notification, RefreshToolsParams,
+    Registrations, SendMessageParams, SendUserMessageParams, SetLabelParams,
+    SetThinkingLevelParams, SwitchSessionParams, UserMessageDelivery,
 };
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -45,8 +45,10 @@ use crate::source_info::{SourceInfo, SourceOrigin, SourceScope};
 use super::actions::{ActionServerConfig, HostActions, NotificationSink, spawn_action_server};
 use super::events::{
     DEFAULT_HOOK_TIMEOUT, EventForwarder, ExtensionErrorSink, SharedSessionState, StateOverlay,
-    StateSource, agent_thinking_level, session_state_block,
+    StateSource, agent_thinking_level, session_state_block, state_block_all_tools,
+    wire_thinking_level,
 };
+use super::tools::{ExtensionToolContext, ToolUpdateRouter, extension_tool_definitions};
 use super::{
     ClientConfig, ExtensionHost, ExtensionHostConfig, ExtensionPathError, HostError,
     LauncherSource, SidecarTimeouts,
@@ -136,6 +138,9 @@ pub struct ExtensionBinding {
     queue_task: JoinHandle<()>,
     server_task: JoinHandle<()>,
     unsubscribe: parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Shared execute-context (host handle + `tool/update` router) captured
+    /// by every bridged tool definition (C7).
+    tool_context: Arc<ExtensionToolContext>,
 }
 
 impl Drop for ExtensionBinding {
@@ -233,10 +238,47 @@ pub fn bind_extensions(
         }
     });
 
+    let tool_router = ToolUpdateRouter::new();
+    let tool_context = Arc::new(ExtensionToolContext {
+        host: Arc::downgrade(&host),
+        router: tool_router.clone(),
+        // Freshness patch pushed before every tool/execute: active tools,
+        // registry, thinking level, and system prompt at call time.
+        fresh_state: {
+            let shared = shared.clone();
+            Arc::new(move || {
+                let session = shared.session();
+                pi_ext_protocol::StateUpdate {
+                    active_tools: Some(session.get_active_tool_names()),
+                    all_tools: Some(state_block_all_tools(&session)),
+                    thinking_level: Some(wire_thinking_level(session.thinking_level())),
+                    system_prompt: Some(session.system_prompt()),
+                    ..Default::default()
+                }
+            })
+        },
+    });
+
+    // Compose the notification fallback: `tool/update` routes to the
+    // in-flight tool call; everything else keeps the caller's sink (C8).
+    let fallback: Option<NotificationSink> = {
+        let caller = options.fallback;
+        let tool_router = tool_router.clone();
+        Some(Arc::new(move |notification: Notification| {
+            if let Notification::ToolUpdate(params) = notification {
+                tool_router.dispatch(&params.tool_call_id, params.partial);
+                return;
+            }
+            if let Some(caller) = &caller {
+                caller(notification);
+            }
+        }))
+    };
+
     let config = Arc::new(ActionServerConfig {
         actions: options.actions,
         ui: parking_lot::Mutex::new(options.ui),
-        fallback: options.fallback,
+        fallback,
     });
     let server_task = spawn_action_server(forwarder.clone(), incoming, config.clone());
 
@@ -249,7 +291,22 @@ pub fn bind_extensions(
         queue_task,
         server_task,
         unsubscribe: parking_lot::Mutex::new(None),
+        tool_context,
     });
+    // Registration snapshots (initial load, reload, respawn replay,
+    // `refreshTools` payloads) rebuild the bound session's extension tool
+    // registry. Installed BEFORE `start()` so the initial `initialized`
+    // cannot be missed (forwarder contract).
+    {
+        let weak = Arc::downgrade(&binding);
+        binding
+            .forwarder
+            .set_registrations_listener(Arc::new(move |registrations| {
+                if let Some(binding) = weak.upgrade() {
+                    binding.apply_registration_tools(registrations);
+                }
+            }));
+    }
     binding.attach_session(session);
     if let Some(runtime) = &options.runtime {
         runtime.set_bridge(Arc::new(SidecarBridge::new(&binding)));
@@ -312,10 +369,20 @@ impl ExtensionBinding {
 
     /// Re-point the binding at a replacement session (switch/new/fork/reload
     /// rebind): re-subscribes events + compact hooks; the next mirror sync
-    /// is a full resync.
+    /// is a full resync. The replacement session was constructed WITHOUT
+    /// extension tools, so the current registration snapshot is re-applied
+    /// (its first application is construction-equivalent: include-all).
     pub async fn rebind(self: &Arc<Self>, session: AgentSession) {
         self.forwarder.rebind_session(session.clone()).await;
         self.attach_session(&session);
+        self.apply_registration_tools(&self.forwarder.registrations());
+    }
+
+    /// Rebuild the bound session's extension tool partition from a
+    /// registration snapshot (C7; oracle `_refreshToolRegistry`).
+    pub fn apply_registration_tools(&self, registrations: &Registrations) {
+        let tools = extension_tool_definitions(&registrations.tools, &self.tool_context);
+        self.shared.session().refresh_extension_tools(tools);
     }
 
     /// Subscribe the session's event stream + compaction hooks.
@@ -340,7 +407,7 @@ impl ExtensionBinding {
     }
 }
 
-fn wire_source_info(info: pi_ext_protocol::SourceInfo) -> SourceInfo {
+pub(super) fn wire_source_info(info: pi_ext_protocol::SourceInfo) -> SourceInfo {
     SourceInfo {
         path: info.path,
         source: info.source,
@@ -630,6 +697,16 @@ impl HostActions for SessionHostActions {
     fn set_active_tools(&self, tool_names: Vec<String>) -> BoxFuture<'static, ()> {
         if let Some(session) = self.session() {
             session.set_active_tools_by_name(tool_names);
+        }
+        ready(())
+    }
+
+    /// `refreshTools()` — a late `pi.registerTool` shipped its registration
+    /// snapshot; store it (the forwarder notifies the binding's listener,
+    /// which rebuilds the session's extension tool registry).
+    fn refresh_tools(&self, params: RefreshToolsParams) -> BoxFuture<'static, ()> {
+        if let (Some(binding), Some(registrations)) = (self.binding(), params.registrations) {
+            binding.forwarder().update_registrations(registrations);
         }
         ready(())
     }

@@ -225,6 +225,7 @@ export interface StateUpdateDto {
   idle?: boolean;
   thinkingLevel?: string;
   activeTools?: string[];
+  allTools?: ToolInfoDto[];
   contextUsage?: ContextUsageDto;
   systemPrompt?: string;
   footer?: JsonValue;
@@ -272,6 +273,7 @@ export interface ToolRegistrationDto {
   label: string;
   description: string;
   parameters: JsonValue;
+  promptSnippet?: string;
   promptGuidelines?: string;
   sourceInfo: SourceInfoDto;
   hasRenderCall: boolean;
