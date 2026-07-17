@@ -112,6 +112,9 @@ pub fn format_resume_command(session_manager: &SessionManager) -> Option<String>
     Some(command)
 }
 
+pub type ReloadRuntime =
+    Rc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<(), String>> + 'static>> + 'static>;
+
 /// Options for InteractiveMode (oracle `InteractiveModeOptions`, subset that
 /// exists pre-Phase-6).
 #[derive(Default)]
@@ -145,10 +148,7 @@ pub struct InteractiveModeOptions {
     /// (forwarder reload + rebind + session_start(reload)); without it
     /// `/reload` recreates the runtime extension-less via
     /// [`AgentSessionRuntime::reload_session`].
-    #[allow(clippy::type_complexity)]
-    pub reload_runtime: Option<
-        Rc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<(), String>> + 'static>> + 'static>,
-    >,
+    pub reload_runtime: Option<ReloadRuntime>,
 }
 
 // ============================================================================

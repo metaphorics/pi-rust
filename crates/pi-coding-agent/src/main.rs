@@ -40,7 +40,7 @@ use pi_coding_agent::modes::interactive::components::config_selector::{
     ConfigSelectorComponent, ConfigWriteScope, ScopedResolvedPaths,
 };
 use pi_coding_agent::modes::interactive::interactive_mode::{
-    InteractiveMode, InteractiveModeOptions,
+    InteractiveMode, InteractiveModeOptions, ReloadRuntime,
 };
 use pi_coding_agent::modes::interactive::theme::init_theme;
 use pi_coding_agent::modes::interactive::trust_store::{
@@ -1060,9 +1060,7 @@ async fn main() {
                     // when a sidecar is bound.
                     reload_runtime: bound.as_ref().map(|(_, actions)| {
                         let actions = actions.clone();
-                        let reload: std::rc::Rc<
-                            dyn Fn() -> std::pin::Pin<Box<dyn Future<Output = Result<(), String>>>>,
-                        > = std::rc::Rc::new(move || {
+                        let reload: ReloadRuntime = std::rc::Rc::new(move || {
                             Box::pin(HostActions::reload(
                                 &*actions,
                                 pi_agent::CancellationToken::new(),
