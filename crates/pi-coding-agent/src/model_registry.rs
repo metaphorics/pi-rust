@@ -1308,6 +1308,138 @@ impl ModelRegistry {
         }
     }
 }
+/// One resolved `--models` scope entry (oracle `ScopedModel`,
+/// core/model-resolver.ts).
+#[derive(Clone, Debug)]
+pub struct ScopedModelEntry {
+    pub model: pi_ai::types::Model,
+    pub thinking_level: Option<pi_ai::types::ModelThinkingLevel>,
+}
+
+/// Result of [`ModelRegistry::resolve_model_scope`] (oracle
+/// `resolveModelScopeWithDiagnostics`).
+#[derive(Clone, Debug, Default)]
+pub struct ModelScopeResolution {
+    pub scoped_models: Vec<ScopedModelEntry>,
+    /// Warning messages (oracle `ModelScopeDiagnostic.message`).
+    pub warnings: Vec<String>,
+}
+
+impl ModelRegistry {
+    /// Resolve `--models` patterns to models with optional `:thinking`
+    /// suffixes. Port of core/model-resolver.ts:270-331: glob patterns match
+    /// `provider/id` OR bare `id` case-insensitively (`*` does not cross
+    /// `/`, minimatch semantics); non-glob patterns go through
+    /// `parseModelPattern` with the invalid-thinking-level fallback.
+    pub async fn resolve_model_scope(&self, patterns: &[String]) -> ModelScopeResolution {
+        let available = self.get_available().await;
+        let mut resolution = ModelScopeResolution::default();
+
+        for pattern in patterns {
+            if pattern.contains('*') || pattern.contains('?') || pattern.contains('[') {
+                let mut glob_pattern = pattern.as_str();
+                let mut thinking_level = None;
+                if let Some(colon_idx) = pattern.rfind(':') {
+                    let suffix = &pattern[colon_idx + 1..];
+                    if let Some(level) = parse_thinking_level(suffix) {
+                        thinking_level = Some(level);
+                        glob_pattern = &pattern[..colon_idx];
+                    }
+                }
+                let matcher = globset::GlobBuilder::new(&glob_pattern.to_lowercase())
+                    .literal_separator(true)
+                    .build()
+                    .map(|glob| glob.compile_matcher());
+                let Ok(matcher) = matcher else {
+                    resolution
+                        .warnings
+                        .push(format!("No models match pattern \"{pattern}\""));
+                    continue;
+                };
+                let matching: Vec<&pi_ai::types::Model> = available
+                    .iter()
+                    .filter(|m| {
+                        let full_id = format!("{}/{}", m.provider, m.id).to_lowercase();
+                        matcher.is_match(&full_id) || matcher.is_match(m.id.to_lowercase())
+                    })
+                    .collect();
+                if matching.is_empty() {
+                    resolution
+                        .warnings
+                        .push(format!("No models match pattern \"{pattern}\""));
+                    continue;
+                }
+                for model in matching {
+                    if !resolution
+                        .scoped_models
+                        .iter()
+                        .any(|sm| pi_ai::models::models_are_equal(Some(&sm.model), Some(model)))
+                    {
+                        resolution.scoped_models.push(ScopedModelEntry {
+                            model: model.clone(),
+                            thinking_level,
+                        });
+                    }
+                }
+                continue;
+            }
+
+            let (model, thinking_level, warning) = parse_model_pattern(pattern, &available, true);
+            if let Some(warning) = warning {
+                resolution.warnings.push(warning);
+            }
+            let Some(model) = model else {
+                resolution
+                    .warnings
+                    .push(format!("No models match pattern \"{pattern}\""));
+                continue;
+            };
+            if !resolution
+                .scoped_models
+                .iter()
+                .any(|sm| pi_ai::models::models_are_equal(Some(&sm.model), Some(&model)))
+            {
+                resolution.scoped_models.push(ScopedModelEntry {
+                    model,
+                    thinking_level,
+                });
+            }
+        }
+
+        resolution
+    }
+    /// Oracle `findInitialModel` steps 3-5 (model-resolver.ts:551-631; the
+    /// CLI and scoped-model steps are handled by the caller): saved default
+    /// with configured auth, then a known provider's default among available
+    /// models, then the first available model.
+    pub async fn find_initial_model(
+        &self,
+        default_provider: Option<&str>,
+        default_model_id: Option<&str>,
+        default_thinking_level: Option<pi_ai::types::ModelThinkingLevel>,
+    ) -> (
+        Option<pi_ai::types::Model>,
+        Option<pi_ai::types::ModelThinkingLevel>,
+    ) {
+        if let (Some(provider), Some(model_id)) = (default_provider, default_model_id)
+            && let Some(found) = self.find(provider, model_id).cloned()
+            && self.has_configured_auth(&found).await
+        {
+            return (Some(found), default_thinking_level);
+        }
+
+        let available = self.get_available().await;
+        for (provider, default_id) in DEFAULT_MODEL_PER_PROVIDER {
+            if let Some(known_default) = available
+                .iter()
+                .find(|m| m.provider == *provider && m.id == *default_id)
+            {
+                return (Some(known_default.clone()), None);
+            }
+        }
+        (available.first().cloned(), None)
+    }
+}
 
 fn is_alias(id: &str) -> bool {
     if id.ends_with("-latest") {
@@ -1482,46 +1614,55 @@ fn parse_model_pattern(
     }
 }
 
+/// Oracle `defaultModelPerProvider` (model-resolver.ts), in the oracle's
+/// key order — `find_initial_model` iterates it in this order.
+const DEFAULT_MODEL_PER_PROVIDER: &[(&str, &str)] = &[
+    ("amazon-bedrock", "us.anthropic.claude-opus-4-6-v1"),
+    ("ant-ling", "Ring-2.6-1T"),
+    ("anthropic", "claude-opus-4-8"),
+    ("openai", "gpt-5.5"),
+    ("azure-openai-responses", "gpt-5.4"),
+    ("openai-codex", "gpt-5.5"),
+    ("radius", "auto"),
+    ("nvidia", "nvidia/nemotron-3-super-120b-a12b"),
+    ("deepseek", "deepseek-v4-pro"),
+    ("google", "gemini-3.1-pro-preview"),
+    ("google-vertex", "gemini-3.1-pro-preview"),
+    ("github-copilot", "gpt-5.4"),
+    ("openrouter", "moonshotai/kimi-k2.6"),
+    ("vercel-ai-gateway", "zai/glm-5.1"),
+    ("xai", "grok-4.20-0309-reasoning"),
+    ("groq", "openai/gpt-oss-120b"),
+    ("cerebras", "zai-glm-4.7"),
+    ("zai", "glm-5.1"),
+    ("zai-coding-cn", "glm-5.1"),
+    ("mistral", "devstral-medium-latest"),
+    ("minimax", "MiniMax-M2.7"),
+    ("minimax-cn", "MiniMax-M2.7"),
+    ("moonshotai", "kimi-k2.6"),
+    ("moonshotai-cn", "kimi-k2.6"),
+    ("huggingface", "moonshotai/Kimi-K2.6"),
+    ("fireworks", "accounts/fireworks/models/kimi-k2p6"),
+    ("together", "moonshotai/Kimi-K2.6"),
+    ("opencode", "kimi-k2.6"),
+    ("opencode-go", "kimi-k2.6"),
+    ("kimi-coding", "kimi-for-coding"),
+    ("cloudflare-workers-ai", "@cf/moonshotai/kimi-k2.6"),
+    (
+        "cloudflare-ai-gateway",
+        "workers-ai/@cf/moonshotai/kimi-k2.6",
+    ),
+    ("xiaomi", "mimo-v2.5-pro"),
+    ("xiaomi-token-plan-cn", "mimo-v2.5-pro"),
+    ("xiaomi-token-plan-ams", "mimo-v2.5-pro"),
+    ("xiaomi-token-plan-sgp", "mimo-v2.5-pro"),
+];
+
 fn default_model_id(provider: &str) -> Option<&'static str> {
-    Some(match provider {
-        "amazon-bedrock" => "us.anthropic.claude-opus-4-6-v1",
-        "ant-ling" => "Ring-2.6-1T",
-        "anthropic" => "claude-opus-4-8",
-        "openai" => "gpt-5.5",
-        "azure-openai-responses" => "gpt-5.4",
-        "openai-codex" => "gpt-5.5",
-        "radius" => "auto",
-        "nvidia" => "nvidia/nemotron-3-super-120b-a12b",
-        "deepseek" => "deepseek-v4-pro",
-        "google" => "gemini-3.1-pro-preview",
-        "google-vertex" => "gemini-3.1-pro-preview",
-        "github-copilot" => "gpt-5.4",
-        "openrouter" => "moonshotai/kimi-k2.6",
-        "vercel-ai-gateway" => "zai/glm-5.1",
-        "xai" => "grok-4.20-0309-reasoning",
-        "groq" => "openai/gpt-oss-120b",
-        "cerebras" => "zai-glm-4.7",
-        "zai" => "glm-5.1",
-        "zai-coding-cn" => "glm-5.1",
-        "mistral" => "devstral-medium-latest",
-        "minimax" => "MiniMax-M2.7",
-        "minimax-cn" => "MiniMax-M2.7",
-        "moonshotai" => "kimi-k2.6",
-        "moonshotai-cn" => "kimi-k2.6",
-        "huggingface" => "moonshotai/Kimi-K2.6",
-        "fireworks" => "accounts/fireworks/models/kimi-k2p6",
-        "together" => "moonshotai/Kimi-K2.6",
-        "opencode" => "kimi-k2.6",
-        "opencode-go" => "kimi-k2.6",
-        "kimi-coding" => "kimi-for-coding",
-        "cloudflare-workers-ai" => "@cf/moonshotai/kimi-k2.6",
-        "cloudflare-ai-gateway" => "workers-ai/@cf/moonshotai/kimi-k2.6",
-        "xiaomi" => "mimo-v2.5-pro",
-        "xiaomi-token-plan-cn" => "mimo-v2.5-pro",
-        "xiaomi-token-plan-ams" => "mimo-v2.5-pro",
-        "xiaomi-token-plan-sgp" => "mimo-v2.5-pro",
-        _ => return None,
-    })
+    DEFAULT_MODEL_PER_PROVIDER
+        .iter()
+        .find(|(p, _)| *p == provider)
+        .map(|(_, id)| *id)
 }
 
 fn build_fallback_model(

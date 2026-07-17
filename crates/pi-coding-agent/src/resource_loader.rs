@@ -467,6 +467,190 @@ fn collect_files_with_ext(dir: &Path, ext: &str) -> Vec<PathBuf> {
     }
     out
 }
+// ============================================================================
+// Content loading layer (oracle core/skills.ts loadSkillFromFile +
+// core/prompt-templates.ts loadTemplateFromFile; frontmatter is real YAML
+// via serde_yaml, matching the oracle's `yaml` package)
+// ============================================================================
+
+/// Parse a `---` frontmatter block into (key → stringified scalar, body).
+/// Mirrors utils/frontmatter.ts: the body is trimmed; a missing or
+/// unparseable block yields an empty map with the normalized content.
+fn parse_frontmatter(content: &str) -> (std::collections::HashMap<String, String>, String) {
+    let normalized = content.replace("\r\n", "\n").replace('\r', "\n");
+    let mut map = std::collections::HashMap::new();
+    if !normalized.starts_with("---") {
+        return (map, normalized);
+    }
+    let Some(end) = normalized[3..].find("\n---") else {
+        return (map, normalized);
+    };
+    let yaml_block = &normalized[4.min(3 + end)..3 + end];
+    let body = normalized[3 + end + 4..].trim().to_string();
+    if let Ok(serde_yaml::Value::Mapping(mapping)) =
+        serde_yaml::from_str::<serde_yaml::Value>(yaml_block)
+    {
+        for (key, value) in mapping {
+            let serde_yaml::Value::String(key) = key else {
+                continue;
+            };
+            let value = match value {
+                serde_yaml::Value::String(s) => s,
+                serde_yaml::Value::Bool(b) => b.to_string(),
+                serde_yaml::Value::Number(n) => n.to_string(),
+                _ => continue,
+            };
+            map.insert(key, value);
+        }
+    }
+    (map, body)
+}
+
+fn source_scope(source: ResourceSource) -> crate::source_info::SourceScope {
+    match source {
+        ResourceSource::Project => crate::source_info::SourceScope::Project,
+        ResourceSource::User => crate::source_info::SourceScope::User,
+        _ => crate::source_info::SourceScope::Temporary,
+    }
+}
+
+/// Expand discovered resource paths that point at directories (configured/
+/// CLI skill roots) into their SKILL.md entries; file paths pass through.
+fn expand_skill_paths(discovered: &[ResourcePath]) -> Vec<ResourcePath> {
+    let mut out = Vec::new();
+    for resource in discovered {
+        if resource.path.is_dir() {
+            for path in collect_skill_entries(&resource.path) {
+                out.push(ResourcePath {
+                    path,
+                    source: resource.source,
+                });
+            }
+        } else {
+            out.push(resource.clone());
+        }
+    }
+    dedupe_paths(out)
+}
+
+/// Expand discovered prompt-template paths (directories → contained .md).
+fn expand_prompt_paths(discovered: &[ResourcePath]) -> Vec<ResourcePath> {
+    let mut out = Vec::new();
+    for resource in discovered {
+        if resource.path.is_dir() {
+            for path in collect_files_with_ext(&resource.path, "md") {
+                out.push(ResourcePath {
+                    path,
+                    source: resource.source,
+                });
+            }
+        } else {
+            out.push(resource.clone());
+        }
+    }
+    dedupe_paths(out)
+}
+
+/// Load [`Skill`]s from discovered SKILL.md paths. Skills without a
+/// description are skipped (oracle skills.ts:305-307); unreadable files are
+/// skipped.
+pub fn load_skills(discovered: &[ResourcePath]) -> Vec<crate::system_prompt::Skill> {
+    let mut skills = Vec::new();
+    for resource in &expand_skill_paths(discovered) {
+        let Ok(content) = fs::read_to_string(&resource.path) else {
+            continue;
+        };
+        let (frontmatter, _body) = parse_frontmatter(&content);
+        let Some(description) = frontmatter
+            .get("description")
+            .map(|d| d.trim())
+            .filter(|d| !d.is_empty())
+        else {
+            continue;
+        };
+        let skill_dir = resource
+            .path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        let parent_dir_name = skill_dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let name = frontmatter
+            .get("name")
+            .map(|n| n.trim())
+            .filter(|n| !n.is_empty())
+            .map(str::to_string)
+            .unwrap_or(parent_dir_name);
+        skills.push(crate::system_prompt::Skill {
+            name,
+            description: description.to_string(),
+            file_path: resource.path.clone(),
+            base_dir: skill_dir.clone(),
+            source_info: crate::source_info::SourceInfo::synthetic(
+                resource.path.to_string_lossy(),
+                "local",
+                Some(source_scope(resource.source)),
+                None,
+                Some(skill_dir.to_string_lossy().into_owned()),
+            ),
+            disable_model_invocation: frontmatter
+                .get("disable-model-invocation")
+                .is_some_and(|v| v == "true"),
+        });
+    }
+    skills
+}
+
+/// Load [`crate::session::PromptTemplate`]s from discovered prompt paths
+/// (oracle prompt-templates.ts `loadTemplateFromFile`).
+pub fn load_prompt_templates(discovered: &[ResourcePath]) -> Vec<crate::session::PromptTemplate> {
+    let mut templates = Vec::new();
+    for resource in &expand_prompt_paths(discovered) {
+        let Ok(content) = fs::read_to_string(&resource.path) else {
+            continue;
+        };
+        let (frontmatter, body) = parse_frontmatter(&content);
+        let name = resource
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+            .trim_end_matches(".md")
+            .to_string();
+        let mut description = frontmatter.get("description").cloned().unwrap_or_default();
+        if description.is_empty()
+            && let Some(first_line) = body.lines().find(|line| !line.trim().is_empty())
+        {
+            description = first_line.chars().take(60).collect();
+            if first_line.chars().count() > 60 {
+                description.push_str("...");
+            }
+        }
+        templates.push(crate::session::PromptTemplate {
+            name,
+            description,
+            argument_hint: frontmatter
+                .get("argument-hint")
+                .filter(|hint| !hint.is_empty())
+                .cloned(),
+            content: body,
+            file_path: resource.path.clone(),
+            source_info: crate::source_info::SourceInfo::synthetic(
+                resource.path.to_string_lossy(),
+                "local",
+                Some(source_scope(resource.source)),
+                None,
+                resource
+                    .path
+                    .parent()
+                    .map(|p| p.to_string_lossy().into_owned()),
+            ),
+        });
+    }
+    templates
+}
 
 fn collect_ancestor_agents_skill_dirs(cwd: &Path) -> Vec<PathBuf> {
     let mut dirs = Vec::new();

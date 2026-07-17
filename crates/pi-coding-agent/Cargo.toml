@@ -13,6 +13,9 @@ pi-ext-protocol = { path = "../pi-ext-protocol" }
 anyhow.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
+# YAML frontmatter parsing (replaces pi's `yaml` npm package in
+# utils/frontmatter.ts, consumed by skills/prompt-template loading).
+serde_yaml = "0.9"
 thiserror.workspace = true
 jiff.workspace = true
 reqwest.workspace = true

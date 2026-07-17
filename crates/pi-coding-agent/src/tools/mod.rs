@@ -1158,7 +1158,7 @@ fn detect_supported_image_mime_type(buffer: &[u8]) -> Option<&'static str> {
     None
 }
 
-fn image_mime(path: &Path) -> Option<&'static str> {
+pub(crate) fn image_mime(path: &Path) -> Option<&'static str> {
     let mut file = File::open(path).ok()?;
     let mut buffer = vec![0u8; 4100];
     use std::io::Read;
@@ -1342,6 +1342,53 @@ fn read_image_content(
             text: format!("Read image file [{mime_type}]\n{IMAGE_OMITTED_RESIZE}").into(),
             text_signature: None,
         })],
+    }
+}
+
+/// Process an image for a CLI `@file` attachment (oracle `processImage`
+/// semantics as consumed by cli/file-processor.ts): returns
+/// `(base64 data, mime type, hints)` or `Err` with the oracle omitted
+/// message when the image cannot be decoded/resized.
+pub(crate) fn process_image_attachment(
+    data: &[u8],
+    mime_type: &'static str,
+    auto_resize_images: bool,
+) -> Result<(String, String, Vec<String>), String> {
+    let needs_conversion = mime_type == "image/bmp";
+    let b64 = BASE64.encode(data);
+    let original_dims = pi_tui::terminal_image::get_image_dimensions(&b64, mime_type);
+
+    if !needs_conversion {
+        let within_limits = original_dims
+            .map(|d| d.width_px <= IMAGE_MAX_DIMENSION && d.height_px <= IMAGE_MAX_DIMENSION);
+        if !auto_resize_images || within_limits == Some(true) {
+            return Ok((b64, mime_type.to_owned(), Vec::new()));
+        }
+    }
+
+    let max = if auto_resize_images {
+        Some(IMAGE_MAX_DIMENSION)
+    } else {
+        None
+    };
+    match pi_tui::terminal_image::decode_and_resize_to_png_base64(data, max, max) {
+        Some((png_b64, final_dims)) => {
+            let mut hints: Vec<String> = Vec::new();
+            if needs_conversion {
+                hints.push(format!("[Image converted from {mime_type} to image/png.]"));
+            }
+            if let Some(orig) = original_dims
+                && (orig.width_px != final_dims.width_px || orig.height_px != final_dims.height_px)
+            {
+                let scale = f64::from(orig.width_px) / f64::from(final_dims.width_px);
+                hints.push(format!(
+                    "[Image: original {}x{}, displayed at {}x{}. Multiply coordinates by {:.2} to map to original image.]",
+                    orig.width_px, orig.height_px, final_dims.width_px, final_dims.height_px, scale
+                ));
+            }
+            Ok((png_b64, "image/png".to_owned(), hints))
+        }
+        None => Err(IMAGE_OMITTED_RESIZE.to_owned()),
     }
 }
 
