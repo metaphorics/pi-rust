@@ -47,6 +47,32 @@ impl<'a> ExtensionEditor<'a> {
         }
     }
 
+    /// `'static` variant over a shared [`EditorTui`] handle (the mode's
+    /// editor-signal seam), for dialogs stored in the component tree.
+    #[must_use]
+    pub fn with_shared_tui(
+        tui: std::rc::Rc<dyn EditorTui>,
+        title: impl Into<String>,
+        prefill: Option<&str>,
+        options: Option<EditorOptions>,
+    ) -> ExtensionEditor<'static> {
+        let mut editor = Editor::with_shared_tui(tui, EditorTheme, options.unwrap_or_default());
+        if let Some(prefill) = prefill {
+            editor.set_text(prefill);
+        }
+        ExtensionEditor {
+            title: title.into(),
+            editor,
+            focused: false,
+            external_editor_command: None,
+            before_external_editor: None,
+            after_external_editor: None,
+            on_submit: None,
+            on_cancel: None,
+            cached: Vec::new(),
+        }
+    }
+
     pub fn set_external_editor_command(&mut self, command: Option<String>) {
         self.external_editor_command = command;
     }

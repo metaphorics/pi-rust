@@ -38,6 +38,10 @@ pub struct StatusIndicator {
     started: Instant,
     frame: usize,
     retry: Option<RetryState>,
+    /// Extension override for the spinner (frames, interval ms; oracle
+    /// `ctx.ui.setWorkingIndicator`). `None` = built-in braille spinner.
+    custom_frames: Option<(Vec<String>, u64)>,
+    last_tick: Option<Instant>,
     cached: Vec<Line>,
 }
 
@@ -92,7 +96,16 @@ impl StatusIndicator {
             frame: 0,
             cached: Vec::new(),
             retry: None,
+            custom_frames: None,
+            last_tick: None,
         }
+    }
+
+    /// Extension spinner override (`None` restores the built-in frames).
+    pub fn set_custom_frames(&mut self, frames: Option<(Vec<String>, u64)>) {
+        self.custom_frames = frames.filter(|(frames, _)| !frames.is_empty());
+        self.frame = 0;
+        self.last_tick = None;
     }
 
     pub fn set_message(&mut self, message: impl Into<String>) {
@@ -115,8 +128,22 @@ impl StatusIndicator {
     }
 
     /// Explicit animation step for callers that drive their own clock.
+    /// Custom frames honor their interval; built-in frames advance per call
+    /// (the pump tick is the built-in cadence).
     pub fn tick(&mut self) {
-        self.frame = self.frame.wrapping_add(1);
+        match &self.custom_frames {
+            Some((_, interval_ms)) => {
+                let now = Instant::now();
+                let due = self
+                    .last_tick
+                    .is_none_or(|last| now.duration_since(last).as_millis() as u64 >= *interval_ms);
+                if due {
+                    self.frame = self.frame.wrapping_add(1);
+                    self.last_tick = Some(now);
+                }
+            }
+            None => self.frame = self.frame.wrapping_add(1),
+        }
     }
 
     #[must_use]
@@ -138,9 +165,13 @@ impl Component for StatusIndicator {
         } else {
             ThemeColor::Accent
         };
+        let spinner: &str = match &self.custom_frames {
+            Some((frames, _)) => &frames[self.frame % frames.len()],
+            None => SPINNER_FRAMES[self.frame % SPINNER_FRAMES.len()],
+        };
         let output = format!(
             "{} {}",
-            theme().fg(color, SPINNER_FRAMES[self.frame % SPINNER_FRAMES.len()]),
+            theme().fg(color, spinner),
             theme().fg(ThemeColor::Muted, &self.message)
         );
         self.cached = vec![Line::empty(), Line::from_ansi(&output)];

@@ -552,6 +552,31 @@ impl ExtensionBinding {
             })
     }
 
+    /// `ui/terminal_input` round trip with the 50ms reply budget (plan §2,
+    /// deviation R4). Timeout / dead sidecar ⇒ not-consumed.
+    pub async fn terminal_input(&self, data: &str) -> pi_ext_protocol::TerminalInputResult {
+        let Some(connection) = self.host.current_connection().await else {
+            return pi_ext_protocol::TerminalInputResult::default();
+        };
+        let request =
+            pi_ext_protocol::Request::UiTerminalInput(pi_ext_protocol::TerminalInputParams {
+                data: data.to_string(),
+            });
+        match tokio::time::timeout(Duration::from_millis(50), connection.request(request)).await {
+            Ok(Ok(value)) => serde_json::from_value(value).unwrap_or_default(),
+            _ => pi_ext_protocol::TerminalInputResult::default(),
+        }
+    }
+
+    /// Push a `state/update` patch (theme changes, footer data, ...).
+    pub async fn notify_state(&self, patch: pi_ext_protocol::StateUpdate) {
+        if let Some(connection) = self.host.current_connection().await {
+            let _ = connection
+                .notify(pi_ext_protocol::Notification::StateUpdate(Box::new(patch)))
+                .await;
+        }
+    }
+
     /// Build the TUI-thread outbound sender for bridged frames (C8).
     ///
     /// Messages are relayed through one ordered queue task (key input MUST

@@ -42,6 +42,8 @@ use super::components::compaction_summary_message::CompactionSummaryMessageCompo
 use super::components::custom_editor::CustomEditor;
 use super::components::custom_entry::CustomEntryComponent;
 use super::components::dynamic_border::DynamicBorder;
+use super::components::extension_editor::ExtensionEditor;
+use super::components::extension_input::ExtensionInput;
 use super::components::extension_selector::ExtensionSelector;
 use super::components::footer::{FooterComponent, FooterData, FooterStats};
 use super::components::keybinding_hints::{key_display_text, key_text};
@@ -68,16 +70,21 @@ use super::components::trust_selector::{
 use super::components::user_message::UserMessageComponent;
 use super::components::user_message_selector::{UserMessageItem, UserMessageSelectorComponent};
 use super::dispatch::{BuiltinCommand, DispatchAction, DispatchContext, dispatch_input};
+use super::extension_ui::{UiHostRequest, current_theme_dto, parse_overlay_options};
 use super::shared::{Shared, SlotHandle, SwapSlot};
 use super::theme::{
     ThemeColor, current_theme_name, detect_terminal_background_from_env, get_available_themes,
     on_theme_change, set_theme, theme,
 };
+use crate::extensions::binding::ExtensionBinding;
+use crate::extensions::events::StateOverlay;
+use crate::extensions::frames::{BridgedLeaf, FrameHub, HubEvent, UiOutbound, UiOutboundSender};
 use crate::session::events::{AgentSessionEvent, CompactionReason};
 use crate::session::runtime::AgentSessionRuntime;
 use crate::session::{AgentSession, PromptOptions, StreamingBehavior};
 use crate::session_manager::SessionManager;
 use crate::session_types::SessionEntry;
+use pi_ext_protocol::WidgetPlacement;
 
 /// Oracle `quoteIfNeeded` (interactive-mode.ts:225-230).
 #[must_use]
@@ -177,6 +184,10 @@ enum UiCommand {
     OAuthPromptSubmitted(String),
     OAuthSelectSubmitted(Option<String>),
     OAuthCancelled,
+    /// Extension dialog resolved (submit label / cancel).
+    ExtDialogChoice(Option<String>),
+    /// Extension keyboard shortcut matched in the editor interceptor.
+    ExtensionShortcut(String),
 }
 
 enum SettingChange {
@@ -441,6 +452,14 @@ enum OpOutcome {
         logging_in: bool,
         result: Result<(), String>,
     },
+    /// `shortcut/invoke` round-trip finished.
+    ExtShortcutDone(Result<(), String>),
+    /// `ui/terminal_input` round-trip finished (or timed out).
+    ExtTerminalInput {
+        original: String,
+        consumed: bool,
+        data: Option<String>,
+    },
 }
 
 /// One queued-during-compaction message (oracle `CompactionQueuedMessage`).
@@ -519,10 +538,14 @@ pub struct InteractiveMode {
     tui: Tui,
 
     // Shared mounted components (root order mirrors the oracle).
+    header: Rc<RefCell<Container>>,
     chat: Rc<RefCell<Container>>,
     pending_messages: Rc<RefCell<Container>>,
     status: Rc<RefCell<Container>>,
+    widgets_above: Rc<RefCell<Container>>,
+    widgets_below: Rc<RefCell<Container>>,
     footer: Rc<RefCell<FooterComponent>>,
+    footer_slot: SlotHandle,
     editor: Rc<RefCell<Editor<'static>>>,
     custom_editor: Rc<RefCell<CustomEditor<Shared<Editor<'static>>>>>,
     editor_slot: SlotHandle,
@@ -572,10 +595,17 @@ pub struct InteractiveMode {
     theme_changed: Rc<Cell<bool>>,
     exit: Option<ExitReason>,
     initialized: bool,
+
+    // Extension UI runtime (Phase 6 C8; None until attach_extensions).
+    extensions: Option<ExtensionsUi>,
+    /// Registered extension shortcut key ids (interceptor snapshot).
+    extension_shortcuts: Rc<RefCell<Vec<String>>>,
 }
 
-/// Root child indices (construction order, oracle init() :726-736).
-const IDX_EDITOR_SLOT: usize = 5;
+/// Root child indices (construction order, oracle init() :726-736:
+/// header, loadedResources, chat, pendingMessages, status, widgetsAbove,
+/// editor, widgetsBelow, footer).
+const IDX_EDITOR_SLOT: usize = 6;
 
 impl InteractiveMode {
     pub fn new(
@@ -659,10 +689,13 @@ impl InteractiveMode {
         }
 
         // CustomEditor interceptor: app keybindings before editor input
-        // (oracle custom-editor.ts handleInput ordering).
+        // (oracle custom-editor.ts handleInput ordering); extension
+        // shortcuts check after app actions (oracle onExtensionShortcut).
+        let extension_shortcuts: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
         let custom_editor = {
             let queue = commands.clone();
             let editor_for_interceptor = editor.clone();
+            let shortcuts = extension_shortcuts.clone();
             let interceptor = move |data: &str| -> bool {
                 let kb = pi_tui::keybindings::get_keybindings();
                 // Escape/interrupt — only when autocomplete is NOT active.
@@ -689,6 +722,14 @@ impl InteractiveMode {
                 for (id, action) in INTERCEPTED_ACTIONS {
                     if kb.matches(data, id) {
                         queue.borrow_mut().push_back(UiCommand::Action(*action));
+                        return true;
+                    }
+                }
+                for key_id in shortcuts.borrow().iter() {
+                    if pi_tui::keys::matches_key(data, key_id) {
+                        queue
+                            .borrow_mut()
+                            .push_back(UiCommand::ExtensionShortcut(key_id.clone()));
                         return true;
                     }
                 }
@@ -733,16 +774,22 @@ impl InteractiveMode {
             Rc::new(RefCell::new(component))
         };
 
-        // Mount (oracle init() :726-736 order).
+        // Mount (oracle init() :726-736 order; widget containers stay empty
+        // — zero lines — until extension widgets mount, see renderWidgets).
+        let widgets_above = Rc::new(RefCell::new(Container::new()));
+        let widgets_below = Rc::new(RefCell::new(Container::new()));
         let editor_slot =
             SlotHandle::new(Box::new(Shared::new(custom_editor.clone())) as ComponentBox);
-        tui.add_child(Shared::new(header));
+        let footer_slot = SlotHandle::new(Box::new(Shared::new(footer.clone())) as ComponentBox);
+        tui.add_child(Shared::new(header.clone()));
         tui.add_child(Shared::new(loaded_resources));
         tui.add_child(Shared::new(chat.clone()));
         tui.add_child(Shared::new(pending_messages.clone()));
         tui.add_child(Shared::new(status.clone()));
+        tui.add_child(Shared::new(widgets_above.clone()));
         tui.add_child(SwapSlot::new(editor_slot.clone()));
-        tui.add_child(Shared::new(footer.clone()));
+        tui.add_child(Shared::new(widgets_below.clone()));
+        tui.add_child(SwapSlot::new(footer_slot.clone()));
         tui.set_focus_child(Some(IDX_EDITOR_SLOT));
 
         // Session events → channel (subscribe seam).
@@ -775,10 +822,14 @@ impl InteractiveMode {
             runtime,
             session,
             tui,
+            header,
             chat,
             pending_messages,
             status,
+            widgets_above,
+            widgets_below,
             footer,
+            footer_slot,
             editor,
             custom_editor,
             editor_slot,
@@ -818,6 +869,8 @@ impl InteractiveMode {
             theme_changed,
             exit: None,
             initialized: false,
+            extensions: None,
+            extension_shortcuts,
         }
     }
 
@@ -936,6 +989,9 @@ impl InteractiveMode {
             self.handle_op_outcome(outcome);
         }
 
+        // Extension UI traffic (frames, dialogs, statuses; Phase 6 C8).
+        self.drain_extension_ui();
+
         // Commands from editor/selector callbacks.
         loop {
             let command = self.commands.borrow_mut().pop_front();
@@ -952,6 +1008,7 @@ impl InteractiveMode {
         if theme_flag || self.theme_changed.replace(false) {
             self.tui.invalidate();
             self.update_editor_border_color();
+            self.sync_extension_theme();
             self.tui.request_render(false);
         }
 
@@ -1049,6 +1106,10 @@ impl InteractiveMode {
                 if bash != self.is_bash_mode {
                     self.is_bash_mode = bash;
                     self.update_editor_border_color();
+                }
+                // Sync getters (ctx.ui.getEditorText) read the mirror.
+                if let Some(ext) = &self.extensions {
+                    ext.state_overlay.lock().editor_text = text;
                 }
             }
             UiCommand::Action(action) => self.handle_app_action(action),
@@ -1183,7 +1244,38 @@ impl InteractiveMode {
                 self.restore_editor();
             }
             UiCommand::SettingChanged(change) => self.apply_setting_change(*change),
+            UiCommand::ExtDialogChoice(choice) => self.resolve_ext_dialog(choice),
+            UiCommand::ExtensionShortcut(key_id) => {
+                let Some(ext) = &self.extensions else { return };
+                let binding = ext.binding.clone();
+                self.ops.push(Box::pin(async move {
+                    OpOutcome::ExtShortcutDone(binding.invoke_shortcut(&key_id).await)
+                }));
+            }
         }
+    }
+
+    /// Resolve the visible extension dialog with the submitted label /
+    /// value (`None` = cancel or timeout).
+    fn resolve_ext_dialog(&mut self, choice: Option<String>) {
+        let dialog = match &mut self.extensions {
+            Some(ext) => ext.dialog.take(),
+            None => None,
+        };
+        let Some(dialog) = dialog else { return };
+        match dialog.reply {
+            Some(ExtDialogReply::Select(tx)) => {
+                let _ = tx.send(choice);
+            }
+            Some(ExtDialogReply::Confirm(tx)) => {
+                let _ = tx.send(choice.as_deref() == Some("Yes"));
+            }
+            Some(ExtDialogReply::Input(tx)) | Some(ExtDialogReply::Editor(tx)) => {
+                let _ = tx.send(choice);
+            }
+            None => {}
+        }
+        self.restore_editor();
     }
 
     fn apply_setting_change(&mut self, change: SettingChange) {
@@ -1789,17 +1881,34 @@ impl InteractiveMode {
             AgentSessionEvent::EntryAppended { entry } => {
                 if let SessionEntry::Custom {
                     custom_type, data, ..
-                } = entry
+                } = &entry
                 {
-                    // No extension entry renderers pre-Phase-6; render body text.
+                    // Fallback body text; an extension entry renderer frame
+                    // replaces this component when the sidecar resolves one.
                     let body = data
                         .as_ref()
                         .and_then(|d| d.as_str())
                         .unwrap_or_default()
                         .to_owned();
-                    let mut component = CustomEntryComponent::new(custom_type, body);
+                    let index = self.chat.borrow().len();
+                    let mut component = CustomEntryComponent::new(custom_type.clone(), body);
                     component.set_expanded(self.tool_output_expanded);
                     self.chat.borrow_mut().add_child(component);
+                    if let Some(entry_id) = entry.id()
+                        && let Some(ext) = &mut self.extensions
+                    {
+                        ext.entry_positions.insert(entry_id.to_string(), index);
+                        // Ask the sidecar for a renderer frame; an unknown
+                        // renderer errs quietly and the fallback stays.
+                        let width = self.tui.terminal().columns();
+                        let generation = ext.hub.begin_render_request(&format!("entry:{entry_id}"));
+                        (ext.outbound)(UiOutbound::Render {
+                            slot: format!("entry:{entry_id}"),
+                            width,
+                            revision: 0,
+                            generation,
+                        });
+                    }
                     self.tui.request_render(false);
                 }
             }
@@ -2240,6 +2349,30 @@ impl InteractiveMode {
             OpOutcome::FlushQueuePromptFailed(error) => {
                 self.show_error(&error);
             }
+            OpOutcome::ExtShortcutDone(result) => {
+                if let Err(error) = result {
+                    self.show_error(&format!("Extension shortcut failed: {error}"));
+                }
+            }
+            OpOutcome::ExtTerminalInput {
+                original,
+                consumed,
+                data,
+            } => {
+                if let Some(ext) = &mut self.extensions {
+                    ext.gate_in_flight = false;
+                }
+                if !consumed {
+                    let payload = data.unwrap_or(original);
+                    if let Some(ext) = &self.extensions {
+                        ext.gate_bypass.set(true);
+                    }
+                    self.tui.handle_input(payload);
+                    if let Some(ext) = &self.extensions {
+                        ext.gate_bypass.set(false);
+                    }
+                }
+            }
             OpOutcome::AnthropicKeyChecked(key) => {
                 if !self.anthropic_subscription_warning_shown
                     && key
@@ -2355,8 +2488,7 @@ impl InteractiveMode {
         if !self.selector_open {
             return;
         }
-        self.editor_slot
-            .replace(Box::new(Shared::new(self.custom_editor.clone())) as ComponentBox);
+        self.editor_slot.replace(self.resting_editor_component());
         self.refocus_slot();
         self.selector_open = false;
         self.tui.request_render(false);
@@ -3222,11 +3354,7 @@ impl InteractiveMode {
             let signal = CancellationToken::new();
             OpOutcome::NewSessionCreated(
                 runtime
-                    .fork(
-                        &leaf,
-                        crate::extension_bridge::ForkPosition::At,
-                        &signal,
-                    )
+                    .fork(&leaf, crate::extension_bridge::ForkPosition::At, &signal)
                     .await,
             )
         }));
@@ -4155,6 +4283,1058 @@ impl InteractiveMode {
                 }
             }
         }
+    }
+}
+
+// ============================================================================
+// Extension UI runtime (Phase 6 C8 / F2)
+// ============================================================================
+
+/// Pending `ui.custom` dialog bookkeeping (slot → lifetime).
+struct PendingCustom {
+    overlay: bool,
+    /// Resolves the sidecar's `ui/custom` request (None once resolved).
+    respond: Option<tokio::sync::oneshot::Sender<()>>,
+    cancel: CancellationToken,
+    /// `Some(text)` while the component occupies the editor slot (oracle
+    /// saves and restores the draft, interactive-mode.ts:2451-2460).
+    saved_editor_text: Option<String>,
+    mounted: bool,
+}
+
+/// Reply channel of the visible extension dialog.
+enum ExtDialogReply {
+    Select(tokio::sync::oneshot::Sender<Option<String>>),
+    Confirm(tokio::sync::oneshot::Sender<bool>),
+    Input(tokio::sync::oneshot::Sender<Option<String>>),
+    Editor(tokio::sync::oneshot::Sender<Option<String>>),
+}
+
+/// One visible extension dialog (select/confirm/input/editor). A newer
+/// dialog replaces the visible one (oracle clobber semantics); the replaced
+/// reply drops, resolving its caller with the cancel fallback.
+struct ExtDialog {
+    reply: Option<ExtDialogReply>,
+    cancel: Option<CancellationToken>,
+    /// Countdown dialogs need a render per tick to advance.
+    has_timeout: bool,
+}
+
+/// Live extension UI state (hub consumer side).
+struct ExtensionsUi {
+    binding: Arc<ExtensionBinding>,
+    hub: Arc<FrameHub>,
+    outbound: UiOutboundSender,
+    state_overlay: Arc<parking_lot::Mutex<StateOverlay>>,
+    host_rx: std::sync::mpsc::Receiver<UiHostRequest>,
+    /// Mounted widget leaves in registration order (oracle Map order).
+    widgets: Vec<(String, WidgetPlacement, Rc<RefCell<BridgedLeaf>>)>,
+    header_leaf: Option<Rc<RefCell<BridgedLeaf>>>,
+    footer_leaf: Option<Rc<RefCell<BridgedLeaf>>>,
+    editor_leaf: Option<Rc<RefCell<CustomEditor<BridgedLeaf>>>>,
+    /// `custom:*` dialog leaves (editor-swap or overlay mounted).
+    custom_leaves: HashMap<String, Rc<RefCell<BridgedLeaf>>>,
+    /// `entry:*` renderer leaves swapped into the chat container.
+    entry_leaves: HashMap<String, Rc<RefCell<BridgedLeaf>>>,
+    /// Custom-entry chat indices awaiting an extension renderer frame.
+    entry_positions: HashMap<String, usize>,
+    overlays: HashMap<String, u64>,
+    /// Last `ui/overlay` options per slot (mount may precede or follow).
+    overlay_options: HashMap<String, serde_json::Value>,
+    pending_customs: HashMap<String, PendingCustom>,
+    dialog: Option<ExtDialog>,
+    statuses: Rc<RefCell<Vec<(String, String)>>>,
+    // Terminal-input gate (onTerminalInput, deviation R4: 50ms budget).
+    terminal_input_active: Rc<Cell<bool>>,
+    gate_bypass: Rc<Cell<bool>>,
+    gate_queue: Rc<RefCell<VecDeque<String>>>,
+    gate_in_flight: bool,
+    /// Custom working-indicator spinner (frames, interval ms).
+    indicator_frames: Option<(Vec<String>, u64)>,
+    hidden_thinking_label: Option<String>,
+}
+
+impl InteractiveMode {
+    /// Attach a live extension binding (call before `run()`, after
+    /// `bind_extensions`): binds frame slots, dialogs, statuses, shortcuts,
+    /// and input routing. `host_rx` comes from `InteractiveUiHost::channel`;
+    /// `state_overlay` is the same handle passed in `BindOptions.overlay`.
+    pub fn attach_extensions(
+        &mut self,
+        binding: Arc<ExtensionBinding>,
+        hub: Arc<FrameHub>,
+        host_rx: std::sync::mpsc::Receiver<UiHostRequest>,
+        state_overlay: Arc<parking_lot::Mutex<StateOverlay>>,
+    ) {
+        let outbound = binding.ui_outbound(&hub);
+        // Real theme JSON baseline (F8): the init snapshot must never carry
+        // the empty-object placeholder pi's loader rejects.
+        state_overlay.lock().theme = current_theme_dto();
+
+        let statuses: Rc<RefCell<Vec<(String, String)>>> = Rc::new(RefCell::new(Vec::new()));
+        {
+            // Footer shows extension statuses (oracle FooterDataProvider).
+            let statuses = statuses.clone();
+            self.footer.borrow_mut().data_mut().extension_statuses =
+                Box::new(move || statuses.borrow().clone());
+        }
+
+        // Terminal-input gate listener (consumes raw input while a listener
+        // is registered sidecar-side; replies re-inject through `bypass`).
+        let terminal_input_active = Rc::new(Cell::new(false));
+        let gate_bypass = Rc::new(Cell::new(false));
+        let gate_queue: Rc<RefCell<VecDeque<String>>> = Rc::new(RefCell::new(VecDeque::new()));
+        {
+            let active = terminal_input_active.clone();
+            let bypass = gate_bypass.clone();
+            let queue = gate_queue.clone();
+            self.tui.add_input_listener(move |data| {
+                if !active.get() || bypass.get() {
+                    return None;
+                }
+                queue.borrow_mut().push_back(data.to_string());
+                Some(pi_tui::tui::InputListenerResult {
+                    consume: true,
+                    data: None,
+                })
+            });
+        }
+
+        self.refresh_extension_shortcuts_from(&binding);
+        self.extensions = Some(ExtensionsUi {
+            binding,
+            hub,
+            outbound,
+            state_overlay,
+            host_rx,
+            widgets: Vec::new(),
+            header_leaf: None,
+            footer_leaf: None,
+            editor_leaf: None,
+            custom_leaves: HashMap::new(),
+            entry_leaves: HashMap::new(),
+            entry_positions: HashMap::new(),
+            overlays: HashMap::new(),
+            overlay_options: HashMap::new(),
+            pending_customs: HashMap::new(),
+            dialog: None,
+            statuses,
+            terminal_input_active,
+            gate_bypass,
+            gate_queue,
+            gate_in_flight: false,
+            indicator_frames: None,
+            hidden_thinking_label: None,
+        });
+    }
+
+    fn refresh_extension_shortcuts_from(&self, binding: &Arc<ExtensionBinding>) {
+        let keys: Vec<String> = binding
+            .registrations()
+            .shortcuts
+            .into_iter()
+            .map(|shortcut| shortcut.key_id)
+            .collect();
+        *self.extension_shortcuts.borrow_mut() = keys;
+    }
+
+    /// One pump step of extension UI traffic: host dialog requests, hub
+    /// events, coalesced frame updates, cancellations, and the terminal
+    /// input gate.
+    fn drain_extension_ui(&mut self) {
+        if self.extensions.is_none() {
+            return;
+        }
+
+        // 1. Host requests (dialogs / statuses / notifications).
+        let mut requests = Vec::new();
+        if let Some(ext) = &self.extensions {
+            while let Ok(request) = ext.host_rx.try_recv() {
+                requests.push(request);
+            }
+        }
+        for request in requests {
+            self.handle_ui_host_request(request);
+        }
+
+        // 2. Structural hub events + coalesced content updates.
+        let (events, dirty) = {
+            let ext = self.extensions.as_ref().expect("checked above");
+            ext.hub.drain()
+        };
+        if !events.is_empty() {
+            let binding = self.extensions.as_ref().expect("checked").binding.clone();
+            self.refresh_extension_shortcuts_from(&binding);
+        }
+        for event in events {
+            match event {
+                HubEvent::Mounted { slot } => self.ensure_slot_mounted(&slot),
+                HubEvent::Disposed { slot } => self.unmount_slot(&slot),
+                HubEvent::Done { slot, .. } => self.resolve_custom(&slot),
+                HubEvent::Overlay { slot, options } => self.apply_overlay_state(&slot, options),
+                HubEvent::Ui(notification) => self.handle_ui_notification(notification),
+            }
+        }
+        for slot in dirty {
+            self.sync_slot(&slot);
+        }
+
+        // 3. Cancellation tokens (dialogs + pending customs) and countdown
+        // repaints.
+        self.poll_extension_cancellations();
+
+        // 4. Terminal-input gate round trips.
+        self.pump_terminal_input_gate();
+    }
+
+    /// Create a leaf for `slot` (shared helper; hub content may not exist
+    /// yet — the leaf syncs lazily).
+    fn new_leaf(&self, slot: &str) -> Rc<RefCell<BridgedLeaf>> {
+        let ext = self.extensions.as_ref().expect("extensions attached");
+        Rc::new(RefCell::new(BridgedLeaf::new(
+            ext.hub.clone(),
+            ext.outbound.clone(),
+            slot,
+        )))
+    }
+
+    /// Rebuild the widget containers from the mounted widget list (oracle
+    /// `renderWidgets`: above = Spacer(1) when empty-with-widgets-feature,
+    /// leading spacer when populated; below = bare).
+    fn render_extension_widgets(&mut self) {
+        let Some(ext) = &self.extensions else { return };
+        let mut above = self.widgets_above.borrow_mut();
+        let mut below = self.widgets_below.borrow_mut();
+        above.clear();
+        below.clear();
+        let has_above = ext
+            .widgets
+            .iter()
+            .any(|(_, placement, _)| *placement == WidgetPlacement::AboveEditor);
+        if has_above {
+            above.add_child(Spacer::new(1));
+        }
+        for (_, placement, leaf) in &ext.widgets {
+            match placement {
+                WidgetPlacement::AboveEditor => above.add_child(Shared::new(leaf.clone())),
+                WidgetPlacement::BelowEditor => below.add_child(Shared::new(leaf.clone())),
+            }
+        }
+        drop((above, below));
+        self.tui.request_render(false);
+    }
+
+    /// Mount a slot that has content (first frame arrived or a render
+    /// response landed). Idempotent.
+    fn ensure_slot_mounted(&mut self, slot: &str) {
+        let Some(ext) = &self.extensions else { return };
+        if let Some(key) = slot.strip_prefix("widget:") {
+            if ext.widgets.iter().any(|(s, _, _)| s == slot) {
+                // Placement may change on re-registration.
+                let placement = ext
+                    .hub
+                    .snapshot(slot)
+                    .and_then(|s| s.placement)
+                    .unwrap_or(WidgetPlacement::AboveEditor);
+                let ext = self.extensions.as_mut().expect("checked");
+                if let Some(entry) = ext.widgets.iter_mut().find(|(s, _, _)| s == slot) {
+                    entry.1 = placement;
+                }
+                self.render_extension_widgets();
+                return;
+            }
+            let _ = key;
+            let placement = ext
+                .hub
+                .snapshot(slot)
+                .and_then(|s| s.placement)
+                .unwrap_or(WidgetPlacement::AboveEditor);
+            let leaf = self.new_leaf(slot);
+            let ext = self.extensions.as_mut().expect("checked");
+            ext.widgets.push((slot.to_string(), placement, leaf));
+            self.render_extension_widgets();
+        } else if slot == "header" {
+            if self
+                .extensions
+                .as_ref()
+                .is_some_and(|e| e.header_leaf.is_some())
+            {
+                return;
+            }
+            let leaf = self.new_leaf(slot);
+            {
+                let mut header = self.header.borrow_mut();
+                header.clear();
+                header.add_child(Shared::new(leaf.clone()));
+            }
+            self.extensions.as_mut().expect("checked").header_leaf = Some(leaf);
+            self.tui.request_render(false);
+        } else if slot == "footer" {
+            if self
+                .extensions
+                .as_ref()
+                .is_some_and(|e| e.footer_leaf.is_some())
+            {
+                return;
+            }
+            let leaf = self.new_leaf(slot);
+            self.footer_slot
+                .replace(Box::new(Shared::new(leaf.clone())) as ComponentBox);
+            self.extensions.as_mut().expect("checked").footer_leaf = Some(leaf);
+            self.tui.request_render(false);
+        } else if slot == "editor" {
+            if self
+                .extensions
+                .as_ref()
+                .is_some_and(|e| e.editor_leaf.is_some())
+            {
+                return;
+            }
+            // Wrap in the app-key interceptor (oracle copies escape/exit and
+            // action handlers onto custom editors, :2390-2410).
+            let leaf = BridgedLeaf::new(
+                self.extensions.as_ref().expect("checked").hub.clone(),
+                self.extensions.as_ref().expect("checked").outbound.clone(),
+                slot,
+            );
+            let queue = self.commands.clone();
+            let shortcuts = self.extension_shortcuts.clone();
+            let interceptor = move |data: &str| -> bool {
+                let kb = pi_tui::keybindings::get_keybindings();
+                if kb.matches(data, "app.interrupt") {
+                    queue
+                        .borrow_mut()
+                        .push_back(UiCommand::Action(AppAction::Interrupt));
+                    return true;
+                }
+                for (id, action) in INTERCEPTED_ACTIONS {
+                    if kb.matches(data, id) {
+                        queue.borrow_mut().push_back(UiCommand::Action(*action));
+                        return true;
+                    }
+                }
+                for key_id in shortcuts.borrow().iter() {
+                    if pi_tui::keys::matches_key(data, key_id) {
+                        queue
+                            .borrow_mut()
+                            .push_back(UiCommand::ExtensionShortcut(key_id.clone()));
+                        return true;
+                    }
+                }
+                false
+            };
+            let wrapped = Rc::new(RefCell::new(CustomEditor::new(leaf, interceptor)));
+            self.extensions.as_mut().expect("checked").editor_leaf = Some(wrapped);
+            if !self.selector_open {
+                self.editor_slot.replace(self.resting_editor_component());
+                self.refocus_slot();
+            }
+            self.tui.request_render(false);
+        } else if slot.starts_with("custom:") {
+            self.mount_custom_slot(slot);
+        } else if let Some(entry_id) = slot.strip_prefix("entry:") {
+            let position = self
+                .extensions
+                .as_ref()
+                .and_then(|e| e.entry_positions.get(entry_id).copied());
+            let Some(index) = position else { return };
+            if self
+                .extensions
+                .as_ref()
+                .is_some_and(|e| e.entry_leaves.contains_key(entry_id))
+            {
+                return;
+            }
+            let leaf = self.new_leaf(slot);
+            {
+                let mut chat = self.chat.borrow_mut();
+                if let Some(child) = chat.children_mut().get_mut(index) {
+                    *child = Box::new(Shared::new(leaf.clone()));
+                }
+                chat.mark_changed();
+            }
+            self.extensions
+                .as_mut()
+                .expect("checked")
+                .entry_leaves
+                .insert(entry_id.to_string(), leaf);
+            self.tui.request_render(false);
+        }
+        // tool:*/msg:* transcript renderer slots are C9 residual (report).
+    }
+
+    /// Mount a pending `custom:*` component: overlay when requested (options
+    /// may arrive before or after the frame), editor swap otherwise.
+    fn mount_custom_slot(&mut self, slot: &str) {
+        let Some(ext) = &mut self.extensions else {
+            return;
+        };
+        let Some(pending) = ext.pending_customs.get_mut(slot) else {
+            return; // Frame before the ui/custom request; mounted on request.
+        };
+        if pending.mounted {
+            return;
+        }
+        pending.mounted = true;
+        let overlay = pending.overlay;
+        let options_value = ext.overlay_options.get(slot).cloned();
+        let leaf = Rc::new(RefCell::new(BridgedLeaf::new(
+            ext.hub.clone(),
+            ext.outbound.clone(),
+            slot,
+        )));
+        ext.custom_leaves.insert(slot.to_string(), leaf.clone());
+        if overlay {
+            let parsed = parse_overlay_options(&options_value.unwrap_or_default());
+            let id = self.tui.show_overlay(Shared::new(leaf), parsed.options);
+            let ext = self.extensions.as_mut().expect("checked");
+            ext.overlays.insert(slot.to_string(), id);
+            if parsed.hidden {
+                self.tui.set_overlay_hidden(id, true);
+            }
+        } else {
+            // Editor-area swap (oracle :2501-2506); draft saved for restore.
+            let saved = self.editor.borrow().get_text();
+            self.extensions
+                .as_mut()
+                .expect("checked")
+                .pending_customs
+                .get_mut(slot)
+                .expect("pending exists")
+                .saved_editor_text = Some(saved);
+            self.mount_selector(Box::new(Shared::new(leaf)) as ComponentBox);
+        }
+        self.tui.request_render(false);
+    }
+
+    /// Sidecar disposed a slot: unmount its host-side view.
+    fn unmount_slot(&mut self, slot: &str) {
+        let Some(ext) = &mut self.extensions else {
+            return;
+        };
+        if slot.starts_with("widget:") {
+            let before = ext.widgets.len();
+            ext.widgets.retain(|(s, _, _)| s != slot);
+            if ext.widgets.len() != before {
+                self.render_extension_widgets();
+            }
+        } else if slot == "header" {
+            if ext.header_leaf.take().is_some() {
+                // Restore the built-in (empty pre-Phase-6) header.
+                self.header.borrow_mut().clear();
+                self.tui.request_render(false);
+            }
+        } else if slot == "footer" {
+            if ext.footer_leaf.take().is_some() {
+                let footer = self.footer.clone();
+                self.footer_slot
+                    .replace(Box::new(Shared::new(footer)) as ComponentBox);
+                self.tui.request_render(false);
+            }
+        } else if slot == "editor" {
+            if ext.editor_leaf.take().is_some() && !self.selector_open {
+                self.editor_slot.replace(self.resting_editor_component());
+                self.refocus_slot();
+                self.tui.request_render(false);
+            }
+        } else if slot.starts_with("custom:") {
+            // Visual teardown only; the ui/custom request resolves through
+            // ui/done (pi keeps the promise pending on bare dispose).
+            self.teardown_custom_visual(slot);
+        } else if let Some(entry_id) = slot.strip_prefix("entry:") {
+            ext.entry_leaves.remove(entry_id);
+            // The rendered lines stay (chat is append-only history).
+        }
+    }
+
+    /// `ui/done {slot}`: resolve the pending custom dialog.
+    fn resolve_custom(&mut self, slot: &str) {
+        self.teardown_custom_visual(slot);
+        if let Some(ext) = &mut self.extensions
+            && let Some(mut pending) = ext.pending_customs.remove(slot)
+            && let Some(respond) = pending.respond.take()
+        {
+            let _ = respond.send(());
+        }
+    }
+
+    /// Unmount a custom slot's visual (overlay or editor swap) without
+    /// resolving the request.
+    fn teardown_custom_visual(&mut self, slot: &str) {
+        let Some(ext) = &mut self.extensions else {
+            return;
+        };
+        ext.custom_leaves.remove(slot);
+        ext.overlay_options.remove(slot);
+        let overlay_id = ext.overlays.remove(slot);
+        let saved = ext
+            .pending_customs
+            .get_mut(slot)
+            .and_then(|pending| pending.saved_editor_text.take());
+        if let Some(id) = overlay_id {
+            self.tui.hide_overlay(id);
+        }
+        if let Some(text) = saved {
+            self.restore_editor();
+            self.editor.borrow_mut().set_text(&text);
+        }
+        self.tui.request_render(false);
+    }
+
+    /// `ui/overlay {slot, options}`: mount/update overlay state (hidden,
+    /// focus, layout at mount time).
+    fn apply_overlay_state(&mut self, slot: &str, options: serde_json::Value) {
+        let parsed = parse_overlay_options(&options);
+        let existing = {
+            let Some(ext) = &mut self.extensions else {
+                return;
+            };
+            ext.overlay_options.insert(slot.to_string(), options);
+            ext.overlays.get(slot).copied()
+        };
+        if let Some(id) = existing {
+            self.tui.set_overlay_hidden(id, parsed.hidden);
+            match parsed.focused {
+                Some(true) => self.tui.focus_overlay(id),
+                Some(false) => {
+                    // Mirror OverlayHandle.unfocus(): focus returns to the
+                    // editor slot.
+                    self.tui.set_focus_child(Some(IDX_EDITOR_SLOT));
+                }
+                None => {}
+            }
+            self.tui.request_render(false);
+        } else if self
+            .extensions
+            .as_ref()
+            .is_some_and(|e| e.pending_customs.contains_key(slot))
+        {
+            // Options arrived; mount if the frame beat the request.
+            self.mount_custom_slot(slot);
+        }
+    }
+
+    /// Coalesced content update for one slot: parse on this thread, mark
+    /// the owning container dirty.
+    fn sync_slot(&mut self, slot: &str) {
+        let Some(ext) = &self.extensions else { return };
+        let mut changed = false;
+        if let Some(key) = slot.strip_prefix("widget:") {
+            let _ = key;
+            if let Some((_, _, leaf)) = ext.widgets.iter().find(|(s, _, _)| s == slot) {
+                changed = leaf.borrow_mut().sync();
+                if changed {
+                    self.widgets_above.borrow_mut().mark_changed();
+                    self.widgets_below.borrow_mut().mark_changed();
+                }
+            } else {
+                self.ensure_slot_mounted(slot);
+                return;
+            }
+        } else if slot == "header" {
+            match &ext.header_leaf {
+                Some(leaf) => {
+                    changed = leaf.borrow_mut().sync();
+                    if changed {
+                        self.header.borrow_mut().mark_changed();
+                    }
+                }
+                None => {
+                    self.ensure_slot_mounted(slot);
+                    return;
+                }
+            }
+        } else if slot == "footer" {
+            match &ext.footer_leaf {
+                Some(leaf) => changed = leaf.borrow_mut().sync(),
+                None => {
+                    self.ensure_slot_mounted(slot);
+                    return;
+                }
+            }
+        } else if slot == "editor" {
+            match &ext.editor_leaf {
+                Some(wrapped) => {
+                    changed = wrapped.borrow_mut().inner.sync();
+                    if changed {
+                        wrapped.borrow_mut().invalidate();
+                    }
+                }
+                None => {
+                    self.ensure_slot_mounted(slot);
+                    return;
+                }
+            }
+        } else if slot.starts_with("custom:") {
+            match ext.custom_leaves.get(slot) {
+                Some(leaf) => changed = leaf.borrow_mut().sync(),
+                None => {
+                    self.ensure_slot_mounted(slot);
+                    return;
+                }
+            }
+        } else if let Some(entry_id) = slot.strip_prefix("entry:") {
+            match ext.entry_leaves.get(entry_id) {
+                Some(leaf) => {
+                    changed = leaf.borrow_mut().sync();
+                    if changed {
+                        self.chat.borrow_mut().mark_changed();
+                    }
+                }
+                None => {
+                    self.ensure_slot_mounted(slot);
+                    return;
+                }
+            }
+        }
+        if changed {
+            self.tui.request_render(false);
+        }
+    }
+
+    /// The editor slot's resting occupant: the extension editor when one is
+    /// set (oracle setCustomEditorComponent), the built-in otherwise.
+    fn resting_editor_component(&self) -> ComponentBox {
+        if let Some(ext) = &self.extensions
+            && let Some(leaf) = &ext.editor_leaf
+        {
+            return Box::new(Shared::new(leaf.clone()));
+        }
+        Box::new(Shared::new(self.custom_editor.clone()))
+    }
+
+    /// Dismiss the visible extension dialog (replaced/cancelled/expired);
+    /// dropping an unresolved reply resolves the caller with its fallback.
+    fn dismiss_ext_dialog(&mut self) {
+        if let Some(ext) = &mut self.extensions
+            && ext.dialog.take().is_some()
+        {
+            self.restore_editor();
+        }
+    }
+
+    fn show_ext_dialog(&mut self, dialog: ExtDialog, component: ComponentBox) {
+        self.dismiss_ext_dialog();
+        if let Some(ext) = &mut self.extensions {
+            ext.dialog = Some(dialog);
+        }
+        self.mount_selector(component);
+    }
+
+    fn handle_ui_host_request(&mut self, request: UiHostRequest) {
+        match request {
+            UiHostRequest::Select {
+                title,
+                options,
+                timeout_ms,
+                cancel,
+                respond,
+            } => {
+                let queue = self.commands.clone();
+                let cancel_queue = self.commands.clone();
+                let mut selector = ExtensionSelector::new(title, options);
+                if let Some(ms) = timeout_ms {
+                    selector = selector.with_timeout(Duration::from_millis(ms));
+                }
+                selector.on_submit = Some(Box::new(move |label| {
+                    queue
+                        .borrow_mut()
+                        .push_back(UiCommand::ExtDialogChoice(Some(label)));
+                }));
+                selector.on_cancel = Some(Box::new(move || {
+                    cancel_queue
+                        .borrow_mut()
+                        .push_back(UiCommand::ExtDialogChoice(None));
+                }));
+                self.show_ext_dialog(
+                    ExtDialog {
+                        reply: Some(ExtDialogReply::Select(respond)),
+                        cancel,
+                        has_timeout: timeout_ms.is_some(),
+                    },
+                    Box::new(selector),
+                );
+            }
+            UiHostRequest::Confirm {
+                title,
+                message,
+                timeout_ms,
+                cancel,
+                respond,
+            } => {
+                // Oracle: selector titled "title\nmessage" with Yes/No
+                // (interactive-mode.ts:2247).
+                let queue = self.commands.clone();
+                let cancel_queue = self.commands.clone();
+                let mut selector = ExtensionSelector::new(
+                    format!("{title}\n{message}"),
+                    vec!["Yes".to_string(), "No".to_string()],
+                );
+                if let Some(ms) = timeout_ms {
+                    selector = selector.with_timeout(Duration::from_millis(ms));
+                }
+                selector.on_submit = Some(Box::new(move |label| {
+                    queue
+                        .borrow_mut()
+                        .push_back(UiCommand::ExtDialogChoice(Some(label)));
+                }));
+                selector.on_cancel = Some(Box::new(move || {
+                    cancel_queue
+                        .borrow_mut()
+                        .push_back(UiCommand::ExtDialogChoice(None));
+                }));
+                self.show_ext_dialog(
+                    ExtDialog {
+                        reply: Some(ExtDialogReply::Confirm(respond)),
+                        cancel,
+                        has_timeout: timeout_ms.is_some(),
+                    },
+                    Box::new(selector),
+                );
+            }
+            UiHostRequest::Input {
+                title,
+                placeholder: _,
+                timeout_ms,
+                cancel,
+                respond,
+            } => {
+                let queue = self.commands.clone();
+                let cancel_queue = self.commands.clone();
+                let mut input = ExtensionInput::new(title);
+                if let Some(ms) = timeout_ms {
+                    input = input.with_timeout(Duration::from_millis(ms));
+                }
+                input.on_submit = Some(Box::new(move |value| {
+                    queue
+                        .borrow_mut()
+                        .push_back(UiCommand::ExtDialogChoice(Some(value)));
+                }));
+                input.on_cancel = Some(Box::new(move || {
+                    cancel_queue
+                        .borrow_mut()
+                        .push_back(UiCommand::ExtDialogChoice(None));
+                }));
+                let input = Rc::new(RefCell::new(input));
+                self.show_ext_dialog(
+                    ExtDialog {
+                        reply: Some(ExtDialogReply::Input(respond)),
+                        cancel,
+                        has_timeout: timeout_ms.is_some(),
+                    },
+                    Box::new(Shared::new(input)),
+                );
+            }
+            UiHostRequest::EditorDialog {
+                title,
+                prefill,
+                respond,
+            } => {
+                let queue = self.commands.clone();
+                let cancel_queue = self.commands.clone();
+                let mut editor = ExtensionEditor::with_shared_tui(
+                    self.editor_signal.clone() as Rc<dyn EditorTui>,
+                    title,
+                    prefill.as_deref(),
+                    None,
+                );
+                editor.on_submit = Some(Box::new(move |value| {
+                    queue
+                        .borrow_mut()
+                        .push_back(UiCommand::ExtDialogChoice(Some(value)));
+                }));
+                editor.on_cancel = Some(Box::new(move || {
+                    cancel_queue
+                        .borrow_mut()
+                        .push_back(UiCommand::ExtDialogChoice(None));
+                }));
+                let editor = Rc::new(RefCell::new(editor));
+                self.show_ext_dialog(
+                    ExtDialog {
+                        reply: Some(ExtDialogReply::Editor(respond)),
+                        cancel: None,
+                        has_timeout: false,
+                    },
+                    Box::new(Shared::new(editor)),
+                );
+            }
+            UiHostRequest::Custom {
+                slot,
+                overlay,
+                overlay_options,
+                cancel,
+                respond,
+            } => {
+                if let Some(ext) = &mut self.extensions {
+                    if let Some(options) = overlay_options {
+                        ext.overlay_options.entry(slot.clone()).or_insert(options);
+                    }
+                    ext.pending_customs.insert(
+                        slot.clone(),
+                        PendingCustom {
+                            overlay,
+                            respond: Some(respond),
+                            cancel,
+                            saved_editor_text: None,
+                            mounted: false,
+                        },
+                    );
+                }
+                // Mount immediately when the frame already arrived.
+                if self
+                    .extensions
+                    .as_ref()
+                    .is_some_and(|e| e.hub.snapshot(&slot).is_some())
+                {
+                    self.mount_custom_slot(&slot);
+                }
+            }
+            UiHostRequest::Notify { message, level } => match level {
+                Some(crate::extension_bridge::NotifyType::Error) => self.show_error(&message),
+                Some(crate::extension_bridge::NotifyType::Warning) => self.show_warning(&message),
+                _ => self.show_status(&message),
+            },
+            UiHostRequest::SetStatus { key, text } => {
+                self.apply_extension_status(key, text);
+            }
+            UiHostRequest::SetWidget {
+                key: _,
+                lines: _,
+                placement: _,
+            } => {
+                // Interactive widgets arrive as ui/frame slots; the trait
+                // path is RPC-only.
+            }
+            UiHostRequest::SetTitle(title) => {
+                self.tui.terminal_mut().set_title(&title);
+            }
+            UiHostRequest::SetEditorText(text) => {
+                self.set_active_editor_text(&text);
+            }
+        }
+        self.tui.request_render(false);
+    }
+
+    fn apply_extension_status(&mut self, key: String, text: Option<String>) {
+        let Some(ext) = &self.extensions else { return };
+        {
+            let mut statuses = ext.statuses.borrow_mut();
+            statuses.retain(|(k, _)| *k != key);
+            if let Some(text) = text {
+                statuses.push((key, text));
+            }
+        }
+        self.footer.borrow_mut().invalidate();
+        self.tui.request_render(false);
+    }
+
+    /// Replace the ACTIVE editor's text (bridged editor included).
+    fn set_active_editor_text(&mut self, text: &str) {
+        self.editor.borrow_mut().set_text(text);
+        if let Some(ext) = &self.extensions
+            && ext.editor_leaf.is_some()
+        {
+            (ext.outbound)(UiOutbound::EditorSetText {
+                text: text.to_string(),
+            });
+        }
+    }
+
+    /// Route one fallback-sink UI notification (working message/indicator,
+    /// theme, paste, tools-expanded, bridged editor callbacks, ...).
+    fn handle_ui_notification(&mut self, notification: pi_ext_protocol::Notification) {
+        use pi_ext_protocol::Notification as N;
+        match notification {
+            N::UiSetWorkingMessage(params) => {
+                self.working_message = params.text;
+                if let Some((StatusIndicatorKind::Working, indicator)) = &self.active_status {
+                    let message = self
+                        .working_message
+                        .clone()
+                        .unwrap_or_else(|| "Working...".to_owned());
+                    let message = format!("{message} ({} to interrupt)", key_text("app.interrupt"));
+                    indicator.borrow_mut().set_message(message);
+                    self.status.borrow_mut().mark_changed();
+                    self.tui.request_render(false);
+                }
+            }
+            N::UiSetWorkingVisible(params) => {
+                self.working_visible = params.visible;
+                if !params.visible {
+                    if matches!(&self.active_status, Some((StatusIndicatorKind::Working, _))) {
+                        self.clear_status_indicator(None);
+                        self.tui.request_render(false);
+                    }
+                } else if self.session.is_streaming() && self.active_status.is_none() {
+                    let message = self
+                        .working_message
+                        .clone()
+                        .unwrap_or_else(|| "Working...".to_owned());
+                    let message = format!("{message} ({} to interrupt)", key_text("app.interrupt"));
+                    self.show_status_indicator(StatusIndicator::working(message));
+                    self.tui.request_render(false);
+                }
+            }
+            N::UiSetWorkingIndicator(params) => {
+                if let Some(ext) = &mut self.extensions {
+                    ext.indicator_frames = params.options.map(|options| {
+                        (
+                            options.frames.unwrap_or_default(),
+                            options.interval_ms.unwrap_or(80),
+                        )
+                    });
+                }
+                let frames = self
+                    .extensions
+                    .as_ref()
+                    .and_then(|e| e.indicator_frames.clone());
+                if let Some((StatusIndicatorKind::Working, indicator)) = &self.active_status {
+                    indicator.borrow_mut().set_custom_frames(frames);
+                    self.status.borrow_mut().mark_changed();
+                    self.tui.request_render(false);
+                }
+            }
+            N::UiSetHiddenThinkingLabel(params) => {
+                if let Some(ext) = &mut self.extensions {
+                    ext.hidden_thinking_label = params.text;
+                }
+            }
+            N::UiPasteToEditor(params) => {
+                // Oracle: editor.handleInput bracketed paste (:2152).
+                let paste = format!("\u{1b}[200~{}\u{1b}[201~", params.text);
+                if let Some(ext) = &self.extensions
+                    && ext.editor_leaf.is_some()
+                {
+                    (ext.outbound)(UiOutbound::Input {
+                        slot: "editor".to_string(),
+                        data: paste,
+                    });
+                } else {
+                    self.editor.borrow_mut().handle_input(&paste);
+                }
+                self.tui.request_render(false);
+            }
+            N::UiSetTheme(params) => {
+                match set_theme(&params.theme, false) {
+                    Ok(()) => {
+                        // The theme-change flag drives invalidation + the
+                        // sidecar state sync on the next pump tick.
+                    }
+                    Err(error) => self.show_error(&error),
+                }
+            }
+            N::UiSetToolsExpanded(params) => {
+                self.set_tools_expanded(params.visible);
+            }
+            N::UiEditorSubmit(params) => {
+                // Bridged editor Enter: same path as the native on_submit;
+                // the host clears the sidecar editor like pi's handleSubmit.
+                self.commands
+                    .borrow_mut()
+                    .push_back(UiCommand::Submit(params.text));
+                if let Some(ext) = &self.extensions {
+                    (ext.outbound)(UiOutbound::EditorSetText {
+                        text: String::new(),
+                    });
+                }
+            }
+            N::UiEditorChange(params) => {
+                if let Some(ext) = &self.extensions {
+                    ext.state_overlay.lock().editor_text = params.text.clone();
+                }
+                self.commands
+                    .borrow_mut()
+                    .push_back(UiCommand::EditorChanged(params.text));
+            }
+            N::UiTerminalInputActive(params) => {
+                if let Some(ext) = &self.extensions {
+                    ext.terminal_input_active.set(params.active);
+                    if !params.active {
+                        ext.gate_queue.borrow_mut().clear();
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Push the current theme to the sidecar mirror (state overlay + a
+    /// `state/update` notification so factory `theme` params restyle).
+    fn sync_extension_theme(&mut self) {
+        let Some(ext) = &self.extensions else { return };
+        let dto = current_theme_dto();
+        ext.state_overlay.lock().theme = dto.clone();
+        let binding = ext.binding.clone();
+        self.ops.push(Box::pin(async move {
+            binding
+                .notify_state(pi_ext_protocol::StateUpdate {
+                    theme: Some(dto),
+                    ..Default::default()
+                })
+                .await;
+            OpOutcome::ExtShortcutDone(Ok(()))
+        }));
+    }
+
+    /// Cancellation + countdown upkeep for extension dialogs and pending
+    /// custom components.
+    fn poll_extension_cancellations(&mut self) {
+        let dialog_cancelled = self.extensions.as_ref().is_some_and(|ext| {
+            ext.dialog
+                .as_ref()
+                .and_then(|dialog| dialog.cancel.as_ref())
+                .is_some_and(CancellationToken::is_cancelled)
+        });
+        if dialog_cancelled {
+            self.dismiss_ext_dialog();
+        }
+        if self
+            .extensions
+            .as_ref()
+            .is_some_and(|ext| ext.dialog.as_ref().is_some_and(|d| d.has_timeout))
+        {
+            // Countdown dialogs advance in render (tick_countdown).
+            self.tui.request_render(false);
+        }
+        let cancelled_customs: Vec<String> = self
+            .extensions
+            .as_ref()
+            .map(|ext| {
+                ext.pending_customs
+                    .iter()
+                    .filter(|(_, pending)| pending.cancel.is_cancelled())
+                    .map(|(slot, _)| slot.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for slot in cancelled_customs {
+            self.resolve_custom(&slot);
+        }
+    }
+
+    /// Terminal-input gate: while ≥1 `onTerminalInput` listener is active,
+    /// raw input rides a `ui/terminal_input` round trip (50ms budget,
+    /// deviation R4); unconsumed input re-injects through the bypass.
+    fn pump_terminal_input_gate(&mut self) {
+        let Some(ext) = &mut self.extensions else {
+            return;
+        };
+        if ext.gate_in_flight || !ext.terminal_input_active.get() {
+            return;
+        }
+        let Some(original) = ext.gate_queue.borrow_mut().pop_front() else {
+            return;
+        };
+        ext.gate_in_flight = true;
+        let binding = ext.binding.clone();
+        self.ops.push(Box::pin(async move {
+            let result = binding.terminal_input(&original).await;
+            OpOutcome::ExtTerminalInput {
+                original,
+                consumed: result.consume.unwrap_or(false),
+                data: result.data,
+            }
+        }));
     }
 }
 
