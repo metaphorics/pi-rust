@@ -35,9 +35,9 @@ macro_rules! result_fixture {
 
 fn get_method_direction(method: &str) -> &'static str {
     match method {
-        "lifecycle/init" | "event/emit" | "ui/terminal_input" | "ui/focus" | "tool/execute"
-        | "provider/stream" | "command/execute" | "shortcut/invoke" | "session/setup"
-        | "session/sync" | "state/update" => "rust-to-sidecar",
+        "lifecycle/init" | "event/emit" | "ui/terminal_input" | "ui/focus" | "ui/resize"
+        | "tool/execute" | "provider/stream" | "command/execute" | "shortcut/invoke"
+        | "session/setup" | "session/sync" | "state/update" => "rust-to-sidecar",
 
         "lifecycle/initialized"
         | "action/sendUserMessage"
@@ -75,6 +75,7 @@ const METHOD_FIXTURES: &[MethodFixture] = &[
         "ui"
     ),
     fixture!("rust-to-sidecar-ui-focus.json", "rust-to-sidecar", "ui"),
+    fixture!("rust-to-sidecar-ui-resize.json", "rust-to-sidecar", "ui"),
     fixture!(
         "sidecar-to-rust-ui-editor-submit.json",
         "sidecar-to-rust",

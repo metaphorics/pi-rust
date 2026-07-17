@@ -32,6 +32,7 @@ const METHOD_DIRECTIONS: Record<string, "rust-to-sidecar" | "sidecar-to-rust"> =
   "event/emit": "rust-to-sidecar",
   "ui/terminal_input": "rust-to-sidecar",
   "ui/focus": "rust-to-sidecar",
+  "ui/resize": "rust-to-sidecar",
   "tool/execute": "rust-to-sidecar",
   "provider/stream": "rust-to-sidecar",
   "command/execute": "rust-to-sidecar",
@@ -66,7 +67,7 @@ function fixtureBytes(name: string): Uint8Array {
 
 describe("golden fixtures", () => {
   test("crate fixture directory is reachable and complete", () => {
-    expect(fixtureNames.length).toBe(25);
+    expect(fixtureNames.length).toBe(26);
   });
 
   for (const name of fixtureNames) {

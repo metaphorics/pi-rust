@@ -46,6 +46,19 @@ describe("widget frames", () => {
     expect(frame?.lines[0]).toContain("\u001b[");
   });
 
+  test("first frame uses lifecycle host width instead of the 80-column default", async () => {
+    const bridge = createTestBridge();
+    await bridge.init(
+      makeInitParams({
+        configuredPaths: [join(FIXTURES_DIR, "ui-widgets.ts")],
+        terminalSize: { width: 100, height: 30 },
+      }),
+    );
+    await bridge.peer.request("command/execute", { name: "show-widget", args: "" });
+    await flushMicrotasks();
+    expect(framesOf(bridge, "widget:counter")[0]?.lines[0]).toContain("count=0 w=100");
+  });
+
   test("static string[] widgets ship lines directly", async () => {
     const bridge = await bootWithUi();
     await bridge.peer.request("command/execute", { name: "show-static-widget", args: "" });
@@ -78,6 +91,19 @@ describe("widget frames", () => {
     const last = frames[frames.length - 1];
     expect(last?.lines[0]).toContain("count=1 w=42");
     expect(last?.version).toBeGreaterThan(1);
+  });
+
+  test("host resize mirrors the headless terminal grid without stale repaint", async () => {
+    const bridge = await bootWithUi();
+    await bridge.peer.request("command/execute", { name: "show-widget", args: "" });
+    await flushMicrotasks();
+    const before = framesOf(bridge, "widget:counter").length;
+
+    bridge.peer.notify("ui/resize", { width: 120, height: 40 });
+    await flushMicrotasks();
+
+    expect(bridge.host.uiBridge?.render("widget:counter", 120)[0]).toContain("w=120");
+    expect(framesOf(bridge, "widget:counter").length).toBe(before);
   });
 
   test("frame versions are monotonic and re-render bursts coalesce", async () => {
@@ -165,6 +191,16 @@ describe("dialogs", () => {
     });
   });
 
+  test("host editor replacement updates extension readback state", async () => {
+    const bridge = await bootWithUi();
+    bridge.peer.notify("ui/setEditorText", { text: "" });
+    await bridge.peer.request("command/execute", { name: "read-editor", args: "" });
+    expect(bridge.notificationsOf("action/appendEntry")).toContainEqual({
+      customType: "editor-read",
+      data: { text: "" },
+    });
+  });
+
   test("custom components stay in-sidecar; done() ships ui/done and resolves", async () => {
     const bridge = createTestBridge();
     const customRequests: JsonObject[] = [];
@@ -191,6 +227,22 @@ describe("dialogs", () => {
       customType: "custom-result",
       data: { result: "confirmed" },
     });
+  });
+
+  test("void custom done normalizes undefined to wire null", async () => {
+    const bridge = createTestBridge();
+    const customRequests: JsonObject[] = [];
+    bridge.peer.onRequest("ui/custom", (params) => {
+      customRequests.push(fromWire<JsonObject>(params));
+      return Promise.withResolvers<null>().promise;
+    });
+    await bridge.init(makeInitParams({ configuredPaths: [join(FIXTURES_DIR, "ui-widgets.ts")] }));
+    const commandDone = bridge.peer.request("command/execute", { name: "open-custom-void", args: "" });
+    await flushMicrotasks();
+    const slot = fromWire<{ slot: string }>(customRequests[0]).slot;
+    bridge.peer.notify("ui/input", { slot, data: "\r" });
+    await commandDone;
+    expect(bridge.notificationsOf("ui/done")).toContainEqual({ slot, result: null });
   });
 });
 
