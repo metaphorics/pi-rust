@@ -494,14 +494,27 @@ async fn strict_init_order_event_order_and_blocking_results() {
     );
 
     // Forward a run's worth of session events (serially, via the queue).
+    // message_end no longer rides the observer queue: it is a blocking hook
+    // at the session's persistence boundary (F10); the session flushes the
+    // queue first, exactly like this.
     let forwarder = fx.binding.forwarder();
     forwarder.enqueue_session_event(AgentSessionEvent::AgentStart);
     forwarder.enqueue_session_event(AgentSessionEvent::MessageStart {
         message: message_event("user", "hi"),
     });
-    forwarder.enqueue_session_event(AgentSessionEvent::MessageEnd {
-        message: message_event("user", "hi"),
-    });
+    forwarder.flush().await;
+    let _ = forwarder
+        .emit_blocking_or_default(
+            ExtensionEvent::MessageEnd {
+                message: pi_ext_protocol::AgentMessage::Custom(json!({
+                    "role": "user",
+                    "content": [{"type": "text", "text": "hi"}],
+                    "timestamp": 1,
+                })),
+            },
+            None,
+        )
+        .await;
     forwarder.enqueue_session_event(AgentSessionEvent::AgentEnd {
         messages: Vec::new(),
         will_retry: false,

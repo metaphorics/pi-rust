@@ -478,6 +478,9 @@ impl ExtensionBinding {
         session.bind_command_hooks(Some(Arc::new(BindingCommandHooks {
             binding: Arc::downgrade(self),
         })));
+        session.bind_message_hooks(Some(Arc::new(ForwarderMessageHooks {
+            forwarder: self.forwarder.clone(),
+        })));
     }
 
     /// Registered extension CLI flags in the shape the CLI help consumes
@@ -764,6 +767,80 @@ impl CompactHooks for ForwarderCompactHooks {
             forwarder
                 .session_compact(compaction_entry, from_extension, reason, will_retry)
                 .await;
+        })
+    }
+}
+
+/// [`crate::extension_bridge::MessageHooks`] routed through the forwarder
+/// (F10: blocking `message_end` with replacement application).
+struct ForwarderMessageHooks {
+    forwarder: Arc<EventForwarder>,
+}
+
+impl ForwarderMessageHooks {
+    /// Parse + normalize a `message_end` result. Untyped extension handlers
+    /// can return messages with null/missing content; the oracle normalizes
+    /// to `[]` before it enters state or history (agent-session.ts:716-725).
+    fn parse_replacement(
+        &self,
+        original_role: &str,
+        result: Value,
+    ) -> Option<pi_agent::AgentMessage> {
+        let mut message = result.get("message")?.clone();
+        if let Some(object) = message.as_object_mut() {
+            let role = object.get("role").and_then(Value::as_str).unwrap_or("");
+            if matches!(role, "user" | "assistant" | "toolResult" | "custom")
+                && object.get("content").is_none_or(Value::is_null)
+            {
+                object.insert("content".to_string(), Value::Array(Vec::new()));
+            }
+        }
+        let replacement: pi_agent::AgentMessage = match serde_json::from_value(message) {
+            Ok(replacement) => replacement,
+            Err(error) => {
+                (self.forwarder.error_sink())(pi_ext_protocol::ExtensionError {
+                    extension_path: "<bridge>".to_string(),
+                    event: "message_end".to_string(),
+                    error: format!("malformed replacement message: {error}"),
+                    stack: None,
+                });
+                return None;
+            }
+        };
+        // The sidecar runner already rejects per-handler role changes
+        // (runner.ts:804); this guards the aggregate result.
+        if replacement.role() != original_role {
+            (self.forwarder.error_sink())(pi_ext_protocol::ExtensionError {
+                extension_path: "<bridge>".to_string(),
+                event: "message_end".to_string(),
+                error: "message_end handlers must return a message with the same role".to_string(),
+                stack: None,
+            });
+            return None;
+        }
+        Some(replacement)
+    }
+}
+
+impl crate::extension_bridge::MessageHooks for ForwarderMessageHooks {
+    fn on_message_end(
+        &self,
+        message: pi_agent::AgentMessage,
+    ) -> BoxFuture<'static, Option<pi_agent::AgentMessage>> {
+        let forwarder = self.forwarder.clone();
+        let hooks = ForwarderMessageHooks {
+            forwarder: self.forwarder.clone(),
+        };
+        Box::pin(async move {
+            // Order: everything enqueued before this message dispatches
+            // first (same barrier as the compact hooks).
+            forwarder.flush().await;
+            let original_role = message.role().to_string();
+            let event = pi_ext_protocol::ExtensionEvent::MessageEnd {
+                message: super::events::wire_message(message),
+            };
+            let result = forwarder.emit_blocking_or_default(event, None).await?;
+            hooks.parse_replacement(&original_role, result)
         })
     }
 }

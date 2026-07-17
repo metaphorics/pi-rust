@@ -46,9 +46,9 @@ pub use export_html::{
 };
 pub use extension_bridge::{
     BeforeCompactDecision, CompactHooks, CompactionOverride, DiscoveredExtensions, ExtensionBridge,
-    ExtensionUiHost, ForkPosition, HookOutcome, NoopExtensionBridge, NotifyType, RegisteredCommand,
-    SessionLifecycleEvent, SessionShutdownReason, SessionStartReason, UiDialogOptions,
-    WidgetPlacement,
+    ExtensionUiHost, ForkPosition, HookOutcome, MessageHooks, NoopExtensionBridge, NotifyType,
+    RegisteredCommand, SessionLifecycleEvent, SessionShutdownReason, SessionStartReason,
+    ThemeCatalogItem, UiDialogOptions, WidgetPlacement,
 };
 pub use extensions::actions::{ActionServerConfig, HostActions, NotificationSink};
 pub use extensions::binding::{

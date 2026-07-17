@@ -207,6 +207,19 @@ pub trait ExtensionUiHost: Send + Sync {
     }
 }
 
+/// Blocking `message_end` hook (oracle `emitMessageEnd` +
+/// `_replaceMessageInPlace`, agent-session.ts:709-727): runs BEFORE the
+/// finalized message reaches agent state, listeners, or session
+/// persistence; a `Some` return replaces the message everywhere.
+pub trait MessageHooks: Send + Sync {
+    /// Returns the replacement message (same role, already validated and
+    /// normalized by the implementation) or `None` to keep the original.
+    fn on_message_end(
+        &self,
+        message: pi_agent::AgentMessage,
+    ) -> BoxFuture<'static, Option<pi_agent::AgentMessage>>;
+}
+
 /// Host-side extension runtime surface.
 ///
 /// Phase 6 plugs the Bun sidecar behind this trait. Until then,
