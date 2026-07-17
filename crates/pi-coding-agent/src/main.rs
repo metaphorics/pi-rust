@@ -35,6 +35,7 @@ use pi_coding_agent::extensions::actions::HostActions;
 use pi_coding_agent::extensions::binding::{
     BindOptions, ExtensionBinding, SessionHostActions, bind_extensions,
 };
+use pi_coding_agent::extensions::provider::{ExtensionProviders, extension_stream_fn};
 use pi_coding_agent::migrations::run_migrations;
 use pi_coding_agent::modes::interactive::components::config_selector::{
     ConfigSelectorComponent, ConfigWriteScope, ScopedResolvedPaths,
@@ -56,6 +57,7 @@ use pi_coding_agent::session::services::{
 };
 use pi_coding_agent::session::{
     AgentSession, AgentSessionConfig, format_no_models_available_message, parse_thinking_level,
+    registry_stream_fn,
 };
 use pi_coding_agent::settings_manager::SettingsManager;
 use pi_coding_agent::system_prompt::load_project_context_files;
@@ -277,6 +279,7 @@ struct FactoryConfig {
     default_project_trust: String,
     interactive_trust_prompt: bool,
     startup_settings: Arc<Mutex<SettingsManager>>,
+    extension_providers: Arc<ExtensionProviders>,
     /// Oracle `projectTrustByCwd` (main.ts:608): later runtimes for the
     /// same cwd (reload, /new, fork) reuse the resolved decision and never
     /// re-prompt.
@@ -508,7 +511,13 @@ fn build_runtime_factory(
                 settings_manager: services.settings_manager.clone(),
                 model_registry: services.model_registry.clone(),
                 cwd: services.cwd.clone(),
-                stream_fn: None,
+                stream_fn: Some(extension_stream_fn(
+                    config.extension_providers.clone(),
+                    registry_stream_fn(
+                        services.model_registry.clone(),
+                        services.settings_manager.clone(),
+                    ),
+                )),
                 model,
                 thinking_level,
                 scoped_models: built.options.scoped_models.clone(),
@@ -541,22 +550,14 @@ fn build_runtime_factory(
     })
 }
 
-/// Detect discovered extensions and bind the sidecar (decision 7 + Phase 6
-/// bind API). `None` when no extensions are discovered or startup fails
-/// (warned; the agent continues without extensions).
-///
-/// `--no-extensions` is NOT checked here: the resource loader already
-/// suppresses auto-discovery under `-ne` while keeping explicit `-e` paths
-/// (oracle main.ts:665-669 — `additionalExtensionPaths` load regardless of
-/// `noExtensions`). `-ne` alone therefore yields zero discovered paths and
-/// Bun is never resolved; `-ne -e <path>` still binds the sidecar.
-async fn bind_extensions_for_mode(
+fn prepare_extension_bind_options(
     runtime: &Arc<AgentSessionRuntime>,
     parsed: &Args,
     app_mode: AppMode,
     cwd: &Path,
     agent_dir: &Path,
-) -> Option<(Arc<ExtensionBinding>, Arc<SessionHostActions>)> {
+    providers: &Arc<ExtensionProviders>,
+) -> Option<(BindOptions, Arc<SessionHostActions>)> {
     let extension_paths = {
         let services = runtime.services();
         let loader = services.resource_loader.lock();
@@ -575,7 +576,7 @@ async fn bind_extensions_for_mode(
         }
     });
     let actions = SessionHostActions::new();
-    let mut bind_options = BindOptions::new(
+    let mut options = BindOptions::new(
         extension_paths,
         LauncherSource::detect(cwd.to_path_buf()),
         cwd.to_path_buf(),
@@ -589,17 +590,16 @@ async fn bind_extensions_for_mode(
         }),
         actions.clone(),
     );
-    bind_options.runtime = Some(runtime.clone());
-    bind_options.mode = match app_mode {
+    options.runtime = Some(runtime.clone());
+    options.providers = Some(providers.clone());
+    options.mode = match app_mode {
         AppMode::Interactive => pi_ext_protocol::ExtensionMode::Tui,
         AppMode::Rpc => pi_ext_protocol::ExtensionMode::Rpc,
         AppMode::Json => pi_ext_protocol::ExtensionMode::Json,
         AppMode::Print => pi_ext_protocol::ExtensionMode::Print,
     };
-    // Only RPC binds a host-side ExtensionUiHost today; other modes keep
-    // pi's in-runner no-op UI.
-    bind_options.has_ui = app_mode == AppMode::Rpc;
-    bind_options.flag_values = parsed
+    options.has_ui = app_mode == AppMode::Rpc;
+    options.flag_values = parsed
         .unknown_flags
         .iter()
         .map(|(name, value)| {
@@ -610,16 +610,14 @@ async fn bind_extensions_for_mode(
             (name.clone(), value)
         })
         .collect::<BTreeMap<_, _>>();
+    Some((options, actions))
+}
 
-    let binding = match bind_extensions(&runtime.session(), bind_options) {
-        Ok(Some(binding)) => binding,
-        Ok(None) => return None,
-        Err(error) => {
-            eprintln_yellow(&format!("Warning: {error}"));
-            eprintln_yellow("Hint: Start without extensions using \"pi -ne\".");
-            return None;
-        }
-    };
+async fn activate_extension_binding(
+    runtime: &Arc<AgentSessionRuntime>,
+    binding: Arc<ExtensionBinding>,
+    actions: Arc<SessionHostActions>,
+) -> Option<(Arc<ExtensionBinding>, Arc<SessionHostActions>)> {
     actions.attach(&binding);
     actions.attach_runtime(runtime.clone());
     if let Err(error) = binding.start(SessionStartReason::Startup).await {
@@ -630,6 +628,28 @@ async fn bind_extensions_for_mode(
         return None;
     }
     Some((binding, actions))
+}
+
+async fn bind_extensions_for_mode(
+    runtime: &Arc<AgentSessionRuntime>,
+    parsed: &Args,
+    app_mode: AppMode,
+    cwd: &Path,
+    agent_dir: &Path,
+    providers: &Arc<ExtensionProviders>,
+) -> Option<(Arc<ExtensionBinding>, Arc<SessionHostActions>)> {
+    let (options, actions) =
+        prepare_extension_bind_options(runtime, parsed, app_mode, cwd, agent_dir, providers)?;
+    let binding = match bind_extensions(&runtime.session(), options) {
+        Ok(Some(binding)) => binding,
+        Ok(None) => return None,
+        Err(error) => {
+            eprintln_yellow(&format!("Warning: {error}"));
+            eprintln_yellow("Hint: Start without extensions using \"pi -ne\".");
+            return None;
+        }
+    };
+    activate_extension_binding(runtime, binding, actions).await
 }
 
 #[tokio::main]
@@ -907,11 +927,13 @@ async fn main() {
         .get_default_project_trust()
         .to_string();
     let auth_storage = Arc::new(AuthStorage::new(agent_dir.join("auth.json")));
+    let extension_providers = ExtensionProviders::new();
     let factory_config = Arc::new(FactoryConfig {
         parsed: parsed.clone(),
         default_project_trust,
         interactive_trust_prompt: trust_prompt_interactive,
         startup_settings: startup_settings.clone(),
+        extension_providers: extension_providers.clone(),
         project_trust_by_cwd: Mutex::new(std::collections::HashMap::new()),
     });
     let factory = build_runtime_factory(factory_config, auth_storage.clone());
@@ -1000,8 +1022,32 @@ async fn main() {
     }
 
     // Extension detection + bind (Phase 6 bind API; zero extensions ⇒ no Bun).
-    let bound = bind_extensions_for_mode(&runtime, &parsed, app_mode, &cwd, &agent_dir).await;
-    let binding = bound.as_ref().map(|(binding, _)| binding.clone());
+    let mut interactive_extensions = (app_mode == AppMode::Interactive)
+        .then(|| {
+            prepare_extension_bind_options(
+                &runtime,
+                &parsed,
+                app_mode,
+                &cwd,
+                &agent_dir,
+                &extension_providers,
+            )
+        })
+        .flatten();
+    let bound = if app_mode == AppMode::Interactive {
+        None
+    } else {
+        bind_extensions_for_mode(
+            &runtime,
+            &parsed,
+            app_mode,
+            &cwd,
+            &agent_dir,
+            &extension_providers,
+        )
+        .await
+    };
+    let mut binding = bound.as_ref().map(|(binding, _)| binding.clone());
 
     let exit_code = match app_mode {
         AppMode::Rpc => {
@@ -1015,7 +1061,7 @@ async fn main() {
         }
         AppMode::Interactive => {
             let terminal = pi_tui::terminal::ProcessTerminal::new();
-            let mode = InteractiveMode::new(
+            let mut mode = InteractiveMode::new(
                 runtime.clone(),
                 terminal,
                 InteractiveModeOptions {
@@ -1026,23 +1072,34 @@ async fn main() {
                     model_fallback_message: runtime.model_fallback_message(),
                     verbose: parsed.verbose,
                     auto_trust_on_reload_cwd,
-                    // Extension-aware /reload: the full SessionHostActions
-                    // reload (forwarder reload + rebind + session_start)
-                    // when a sidecar is bound.
-                    reload_runtime: bound.as_ref().map(|(_, actions)| {
-                        let actions = actions.clone();
-                        let reload: ReloadRuntime = std::rc::Rc::new(move || {
-                            Box::pin(HostActions::reload(
-                                &*actions,
-                                pi_agent::CancellationToken::new(),
-                            ))
-                        });
-                        reload
-                    }),
                     handle_signals: true,
                     ..Default::default()
                 },
             );
+            if let Some((options, actions)) = interactive_extensions.take() {
+                match mode.bind_extensions(options) {
+                    Ok(Some(bound)) => {
+                        let reload_actions = actions.clone();
+                        if let Some((bound, _)) =
+                            activate_extension_binding(&runtime, bound, actions).await
+                        {
+                            let reload: ReloadRuntime = std::rc::Rc::new(move || {
+                                Box::pin(HostActions::reload(
+                                    &*reload_actions,
+                                    pi_agent::CancellationToken::new(),
+                                ))
+                            });
+                            mode.set_reload_runtime(reload);
+                            binding = Some(bound);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        eprintln_yellow(&format!("Warning: {error}"));
+                        eprintln_yellow("Hint: Start without extensions using \"pi -ne\".");
+                    }
+                }
+            }
             let outcome = mode.run().await;
             if let Some(farewell) = outcome.farewell {
                 println!("{farewell}");

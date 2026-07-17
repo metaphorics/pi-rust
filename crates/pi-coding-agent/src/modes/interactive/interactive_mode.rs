@@ -860,7 +860,6 @@ impl InteractiveMode {
             tui,
             header,
             chat,
-            header,
             loaded_resources,
             pending_messages,
             status,
@@ -4889,6 +4888,14 @@ struct ExtensionsUi {
 }
 
 impl InteractiveMode {
+    /// Install the extension-aware reload path after the sidecar has started.
+    ///
+    /// Bind/start failures deliberately leave this unset so `/reload` falls
+    /// back to [`AgentSessionRuntime::reload_session`].
+    pub fn set_reload_runtime(&mut self, reload_runtime: ReloadRuntime) {
+        self.options.reload_runtime = Some(reload_runtime);
+    }
+
     /// Bind discovered extensions to this interactive compositor in one call.
     ///
     /// This is the production integration seam: it forces the TUI mode/UI

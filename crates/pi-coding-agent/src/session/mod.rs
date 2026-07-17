@@ -601,7 +601,7 @@ impl AgentSession {
 
         let stream_fn = config
             .stream_fn
-            .unwrap_or_else(|| default_stream_fn(registry.clone(), settings.clone()));
+            .unwrap_or_else(|| registry_stream_fn(registry.clone(), settings.clone()));
 
         AgentSession {
             inner: Arc::new(SessionInner {
@@ -2036,7 +2036,7 @@ fn convert_to_llm_with_block_images(
 // Default stream fn (sdk.ts:302-345, registry-aware)
 // ============================================================================
 
-fn default_stream_fn(
+pub fn registry_stream_fn(
     registry: Arc<tokio::sync::RwLock<ModelRegistry>>,
     settings: Arc<Mutex<SettingsManager>>,
 ) -> StreamFn {
