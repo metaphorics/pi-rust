@@ -450,8 +450,14 @@ fn build_runtime_factory(
 }
 
 /// Detect discovered extensions and bind the sidecar (decision 7 + Phase 6
-/// bind API). `None` when extensions are disabled, none are discovered, or
-/// startup fails (warned; the agent continues without extensions).
+/// bind API). `None` when no extensions are discovered or startup fails
+/// (warned; the agent continues without extensions).
+///
+/// `--no-extensions` is NOT checked here: the resource loader already
+/// suppresses auto-discovery under `-ne` while keeping explicit `-e` paths
+/// (oracle main.ts:665-669 — `additionalExtensionPaths` load regardless of
+/// `noExtensions`). `-ne` alone therefore yields zero discovered paths and
+/// Bun is never resolved; `-ne -e <path>` still binds the sidecar.
 async fn bind_extensions_for_mode(
     runtime: &Arc<AgentSessionRuntime>,
     parsed: &Args,
@@ -459,9 +465,6 @@ async fn bind_extensions_for_mode(
     cwd: &Path,
     agent_dir: &Path,
 ) -> Option<Arc<ExtensionBinding>> {
-    if parsed.no_extensions {
-        return None;
-    }
     let extension_paths = {
         let services = runtime.services();
         let loader = services.resource_loader.lock();

@@ -244,3 +244,52 @@ fn no_session_flag_skips_session_files() {
         "no session dir expected"
     );
 }
+
+/// `-ne` suppresses extension auto-discovery only: an explicit `-e <path>`
+/// still binds the sidecar (oracle main.ts:665-669). With an unusable Bun
+/// the attempted bind surfaces as the degrade warning; without `-e` the
+/// same environment stays silent because Bun is never consulted.
+#[test]
+fn no_extensions_still_binds_explicit_extension_paths() {
+    let bin = Bin::new();
+    let ext = bin.project_dir.join("explicit-ext.ts");
+    std::fs::write(&ext, "export default function () {}").expect("write ext");
+
+    // -ne -e <path>: bind attempted, degrades with the sidecar warning.
+    let output = bin
+        .command()
+        .args([
+            "--mode",
+            "rpc",
+            "-ne",
+            "-e",
+            ext.to_str().expect("utf8 path"),
+        ])
+        .env("PI_RUST_BUN", "/nonexistent/bun")
+        .env("ANTHROPIC_API_KEY", "test-key")
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn pi");
+    assert_eq!(output.status.code(), Some(0));
+    let err = stderr(&output);
+    assert!(
+        err.contains("extensions disabled"),
+        "explicit -e under -ne must attempt the sidecar bind: {err}"
+    );
+
+    // -ne alone: no discovery, no bind, no warning.
+    let output = bin
+        .command()
+        .args(["--mode", "rpc", "-ne"])
+        .env("PI_RUST_BUN", "/nonexistent/bun")
+        .env("ANTHROPIC_API_KEY", "test-key")
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn pi");
+    assert_eq!(output.status.code(), Some(0));
+    let err = stderr(&output);
+    assert!(
+        !err.contains("extensions disabled"),
+        "-ne alone must never resolve Bun: {err}"
+    );
+}

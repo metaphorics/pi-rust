@@ -242,10 +242,16 @@ check_contains "ext-no-bun reply" "SMOKE-REPLY" "$out"
 check_contains "ext-no-bun warning" "extensions disabled" "$(cat "$WORK/nobun.err")"
 check_contains "ext-no-bun hint" 'Start without extensions using "pi -ne"' "$(cat "$WORK/nobun.err")"
 
-# -ne skips detection entirely even with the extension installed.
+# -ne suppresses auto-discovery even with the extension installed.
 out=$(printf 'ext ne' | PI_RUST_BUN=/nonexistent/bun "$BIN" -a -ne -p 2>"$WORK/ne.err"); rc=$?
 check "ext -ne exit" 0 "$rc"
 check_not_contains "ext -ne no warning" "extensions disabled" "$(cat "$WORK/ne.err")"
+
+# -ne -e <path>: explicit paths still bind — with a broken Bun the bind is
+# attempted and degrades (proof -ne did not skip it).
+out=$(printf 'ext ne -e' | PI_RUST_BUN=/nonexistent/bun "$BIN" -a -ne -e "$PROJ/.pi/extensions/smoke-ext.ts" -p 2>"$WORK/ne-e.err"); rc=$?
+check "ext -ne -e exit" 0 "$rc"
+check_contains "ext -ne -e attempts bind" "extensions disabled" "$(cat "$WORK/ne-e.err")"
 
 # Real sidecar startup when Bun is present (skipped when bun is missing).
 if command -v bun >/dev/null 2>&1 && [ -d "$REPO/sidecar/node_modules" ]; then
@@ -253,6 +259,15 @@ if command -v bun >/dev/null 2>&1 && [ -d "$REPO/sidecar/node_modules" ]; then
   check "ext-real exit" 0 "$rc"
   check_contains "ext-real reply" "SMOKE-REPLY" "$out"
   check_not_contains "ext-real no degrade warning" "extensions disabled" "$(cat "$WORK/ext.err")"
+
+  # -ne -e with a REAL sidecar: the explicit extension actually loads —
+  # its registered command is visible over RPC get_commands.
+  printf '{"type":"get_commands","id":"1"}\n' \
+    | PI_RUST_SIDECAR="$REPO/sidecar" "$BIN" -a -ne -e "$PROJ/.pi/extensions/smoke-ext.ts" --mode rpc \
+    >"$WORK/ne-e-real.out" 2>"$WORK/ne-e-real.err"; rc=$?
+  check "ext -ne -e real exit" 0 "$rc"
+  check_not_contains "ext -ne -e real no degrade" "extensions disabled" "$(cat "$WORK/ne-e-real.err")"
+  check_contains "ext -ne -e real registers command" "smoke-ext" "$(cat "$WORK/ne-e-real.out")"
 else
   echo "skip - real sidecar smoke (bun or sidecar/node_modules missing)"
 fi

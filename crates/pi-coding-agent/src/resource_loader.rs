@@ -733,6 +733,39 @@ mod tests {
         assert!(paths.iter().any(|p| p.ends_with("global.js")));
         assert!(loader.needs_sidecar());
     }
+    /// Oracle main.ts:665-669: `noExtensions` suppresses auto-discovery
+    /// only; explicit `-e` paths (additionalExtensionPaths) still load.
+    #[test]
+    fn no_extensions_keeps_explicit_cli_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("proj");
+        let agent = tmp.path().join("agent");
+        fs::create_dir_all(cwd.join(".pi/extensions")).unwrap();
+        fs::create_dir_all(agent.join("extensions")).unwrap();
+        fs::write(cwd.join(".pi/extensions/local.ts"), "export default {}").unwrap();
+        fs::write(agent.join("extensions/global.js"), "export default {}").unwrap();
+        let explicit = tmp.path().join("explicit-ext.ts");
+        fs::write(&explicit, "export default {}").unwrap();
+
+        let mut opts = ResourceLoaderOptions::new(&cwd);
+        opts.agent_dir = agent;
+        opts.no_extensions = true;
+        opts.additional_extension_paths = vec![explicit.to_string_lossy().into_owned()];
+        let loader = DefaultResourceLoader::new(opts);
+        let paths = loader.discovered().extension_paths();
+        assert!(paths.iter().any(|p| p.ends_with("explicit-ext.ts")));
+        assert!(!paths.iter().any(|p| p.ends_with("local.ts")));
+        assert!(!paths.iter().any(|p| p.ends_with("global.js")));
+        assert!(loader.needs_sidecar());
+
+        // -ne alone: nothing discovered, no sidecar needed.
+        let mut opts = ResourceLoaderOptions::new(&cwd);
+        opts.agent_dir = tmp.path().join("agent");
+        opts.no_extensions = true;
+        let loader = DefaultResourceLoader::new(opts);
+        assert!(loader.discovered().extension_paths().is_empty());
+        assert!(!loader.needs_sidecar());
+    }
 
     #[test]
     fn discovers_skill_md() {
