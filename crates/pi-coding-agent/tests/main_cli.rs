@@ -338,7 +338,11 @@ fn config_rejects_unknown_option_and_argument() {
 fn config_local_refuses_untrusted_project() {
     let bin = Bin::new();
     std::fs::create_dir_all(bin.project_dir.join(".pi")).expect("project config dir");
-    std::fs::write(bin.project_dir.join(".pi/settings.json"), "{}").expect("project settings");
+    std::fs::write(
+        bin.project_dir.join(".pi/settings.json"),
+        "{ malformed json",
+    )
+    .expect("project settings");
     for flags in [&["config", "-l"][..], &["config", "-l", "-na"][..]] {
         let output = bin.run(flags);
         assert_eq!(output.status.code(), Some(1), "{flags:?}");
@@ -348,5 +352,137 @@ fn config_local_refuses_untrusted_project() {
             "{flags:?}"
         );
         assert_eq!(stdout(&output), "", "{flags:?}");
+    }
+}
+
+#[test]
+fn package_manager_trust_scenarios() {
+    // 1. no-TTY untrusted local install refuses and writes nothing
+    {
+        let bin = Bin::new();
+        std::fs::create_dir_all(bin.project_dir.join(".pi")).expect("project config dir");
+        std::fs::write(
+            bin.project_dir.join(".pi/settings.json"),
+            "{ malformed json",
+        )
+        .expect("project settings");
+
+        let pkg = bin.project_dir.join("local-pkg");
+        std::fs::create_dir_all(pkg.join("skills/demo")).expect("pkg dirs");
+        std::fs::write(
+            pkg.join("skills/demo/SKILL.md"),
+            "---\nname: demo\ndescription: d\n---\nbody\n",
+        )
+        .expect("skill");
+
+        let output = bin.run(&["install", "--local", "./local-pkg"]);
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(
+            stderr(&output),
+            "Project is not trusted. Use --approve to modify local package config.\n"
+        );
+
+        let settings = std::fs::read_to_string(bin.project_dir.join(".pi/settings.json"))
+            .expect("project settings");
+        assert_eq!(settings, "{ malformed json");
+    }
+
+    // 2. approved succeeds
+    {
+        let bin = Bin::new();
+        std::fs::create_dir_all(bin.project_dir.join(".pi")).expect("project config dir");
+        std::fs::write(bin.project_dir.join(".pi/settings.json"), "{}").expect("project settings");
+
+        let pkg = bin.project_dir.join("local-pkg");
+        std::fs::create_dir_all(pkg.join("skills/demo")).expect("pkg dirs");
+        std::fs::write(
+            pkg.join("skills/demo/SKILL.md"),
+            "---\nname: demo\ndescription: d\n---\nbody\n",
+        )
+        .expect("skill");
+
+        let output = bin.run(&["install", "--local", "--approve", "./local-pkg"]);
+        assert!(output.status.success(), "stderr: {}", stderr(&output));
+
+        let settings = std::fs::read_to_string(bin.project_dir.join(".pi/settings.json"))
+            .expect("project settings");
+        assert!(settings.contains("local-pkg"), "settings: {settings}");
+    }
+
+    // 3. saved trust succeeds
+    {
+        let bin = Bin::new();
+        std::fs::create_dir_all(bin.project_dir.join(".pi")).expect("project config dir");
+        std::fs::write(bin.project_dir.join(".pi/settings.json"), "{}").expect("project settings");
+
+        let pkg = bin.project_dir.join("local-pkg");
+        std::fs::create_dir_all(pkg.join("skills/demo")).expect("pkg dirs");
+        std::fs::write(
+            pkg.join("skills/demo/SKILL.md"),
+            "---\nname: demo\ndescription: d\n---\nbody\n",
+        )
+        .expect("skill");
+
+        let trust_json = format!(
+            "{{\n  \"{}\": true\n}}\n",
+            bin.project_dir.canonicalize().unwrap().display()
+        );
+        std::fs::write(bin.agent_dir.join("trust.json"), trust_json).expect("trust.json");
+
+        let output = bin.run(&["install", "--local", "./local-pkg"]);
+        assert!(output.status.success(), "stderr: {}", stderr(&output));
+
+        let settings = std::fs::read_to_string(bin.project_dir.join(".pi/settings.json"))
+            .expect("project settings");
+        assert!(settings.contains("local-pkg"), "settings: {settings}");
+    }
+
+    // 4. explicit no overrides saved yes
+    {
+        let bin = Bin::new();
+        std::fs::create_dir_all(bin.project_dir.join(".pi")).expect("project config dir");
+        std::fs::write(bin.project_dir.join(".pi/settings.json"), "{}").expect("project settings");
+
+        let pkg = bin.project_dir.join("local-pkg");
+        std::fs::create_dir_all(pkg.join("skills/demo")).expect("pkg dirs");
+        std::fs::write(
+            pkg.join("skills/demo/SKILL.md"),
+            "---\nname: demo\ndescription: d\n---\nbody\n",
+        )
+        .expect("skill");
+
+        let trust_json = format!(
+            "{{\n  \"{}\": true\n}}\n",
+            bin.project_dir.canonicalize().unwrap().display()
+        );
+        std::fs::write(bin.agent_dir.join("trust.json"), trust_json).expect("trust.json");
+
+        let output = bin.run(&["install", "--local", "--no-approve", "./local-pkg"]);
+        assert_eq!(output.status.code(), Some(1));
+        assert!(
+            stderr(&output)
+                .contains("Project is not trusted. Use --approve to modify local package config.")
+        );
+
+        let settings = std::fs::read_to_string(bin.project_dir.join(".pi/settings.json"))
+            .expect("project settings");
+        assert!(!settings.contains("local-pkg"));
+    }
+
+    // 5. list/read behavior exact oracle
+    {
+        let bin = Bin::new();
+        std::fs::create_dir_all(bin.project_dir.join(".pi")).expect("project config dir");
+        std::fs::write(bin.project_dir.join(".pi/settings.json"), "{\n  \"packages\": [\n    {\n      \"source\": \"./project-pkg\",\n      \"scope\": \"project\"\n    }\n  ]\n}").expect("project settings");
+
+        std::fs::write(bin.agent_dir.join("settings.json"), "{\n  \"packages\": [\n    {\n      \"source\": \"./user-pkg\",\n      \"scope\": \"user\"\n    }\n  ]\n}").expect("user settings");
+
+        let output = bin.run(&["list"]);
+        assert!(output.status.success());
+        let text = stdout(&output);
+        assert!(text.contains("User packages:"));
+        assert!(text.contains("user-pkg"));
+        assert!(!text.contains("Project packages:"));
+        assert!(!text.contains("project-pkg"));
     }
 }

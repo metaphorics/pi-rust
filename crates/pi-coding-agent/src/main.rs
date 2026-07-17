@@ -43,9 +43,7 @@ use pi_coding_agent::modes::interactive::interactive_mode::{
     InteractiveMode, InteractiveModeOptions, ReloadRuntime,
 };
 use pi_coding_agent::modes::interactive::theme::init_theme;
-use pi_coding_agent::modes::interactive::trust_store::{
-    ProjectTrustStore, has_trust_requiring_project_resources,
-};
+use pi_coding_agent::modes::interactive::trust_store::has_trust_requiring_project_resources;
 use pi_coding_agent::modes::print::{PrintModeOptions, PrintOutputMode, run_print_mode};
 use pi_coding_agent::modes::rpc::{RpcModeOptions, run_rpc_mode};
 use pi_coding_agent::resource_loader::{ResourceLoaderOptions, load_prompt_templates, load_skills};
@@ -63,7 +61,7 @@ use pi_coding_agent::settings_manager::SettingsManager;
 use pi_coding_agent::system_prompt::load_project_context_files;
 use pi_coding_agent::{
     AuthStorage, DefaultPackageManager, get_config_command_help, get_config_command_usage,
-    handle_package_command, parse_config_command,
+    parse_config_command,
 };
 
 fn eprintln_red(message: &str) {
@@ -115,76 +113,6 @@ fn report_runtime_diagnostics(diagnostics: &[RuntimeDiagnostic]) {
     }
 }
 
-/// Oracle `resolveProjectTrusted` (core/project-trust.ts:46-99), minus the
-/// extension `project_trust` hook (extensions load after trust is known in
-/// the sidecar architecture).
-fn resolve_project_trusted(
-    cwd: &Path,
-    agent_dir: &Path,
-    trust_override: Option<bool>,
-    default_project_trust: &str,
-    interactive_ui: Option<&Arc<Mutex<SettingsManager>>>,
-) -> bool {
-    if let Some(overridden) = trust_override {
-        return overridden;
-    }
-    if !has_trust_requiring_project_resources(cwd) {
-        return true;
-    }
-    let store = ProjectTrustStore::new(agent_dir);
-    if let Ok(Some(entry)) = store.get_entry(cwd) {
-        return entry.decision;
-    }
-    match default_project_trust {
-        "always" => return true,
-        "never" => return false,
-        _ => {}
-    }
-    let Some(settings_manager) = interactive_ui else {
-        return false;
-    };
-
-    // Oracle prompt (project-trust.ts:24-27) over the startup selector with
-    // getProjectTrustOptions(includeSessionOnly).
-    let trust_path = cwd.display().to_string();
-    let parent = cwd.parent().map(|p| p.display().to_string());
-    let mut labels = vec!["Trust".to_string()];
-    if let Some(parent) = &parent {
-        labels.push(format!("Trust parent folder ({parent})"));
-    }
-    labels.push("Trust (this session only)".to_string());
-    labels.push("Do not trust".to_string());
-    labels.push("Do not trust (this session only)".to_string());
-
-    let title = format!(
-        "Trust project folder?\n{trust_path}\n\nThis allows pi to load {} settings and resources, install missing project packages, and execute project extensions.",
-        pi_coding_agent::config::CONFIG_DIR_NAME
-    );
-    let terminal = pi_tui::terminal::ProcessTerminal::new();
-    let mut ui = startup_ui::create_startup_tui(agent_dir, settings_manager, terminal);
-    let selected = startup_ui::show_startup_selector(&mut ui, &title, &labels);
-    ui.stop();
-    let Some(index) = selected else {
-        return false;
-    };
-    let label = labels[index].as_str();
-    let (trusted, saved): (bool, Option<(String, bool)>) = match label {
-        "Trust" => (true, Some((trust_path.clone(), true))),
-        "Trust (this session only)" => (true, None),
-        "Do not trust" => (false, Some((trust_path.clone(), false))),
-        "Do not trust (this session only)" => (false, None),
-        _ => (true, parent.map(|p| (p, true))),
-    };
-    if let Some((path, decision)) = saved {
-        let _ = store.set_many(&[
-            pi_coding_agent::modes::interactive::components::trust_selector::ProjectTrustUpdate {
-                path,
-                decision: Some(decision),
-            },
-        ]);
-    }
-    trusted
-}
 /// Oracle `selectConfig` (cli/config-selector.ts:20-56): standalone TUI
 /// hosting the config selector; returns when the selector is closed (Esc)
 /// or exited (q) — both exit the process with code 0 afterwards.
@@ -264,8 +192,8 @@ fn handle_config_command(raw_args: &[String], cwd: &Path, agent_dir: &Path) -> O
     // interactively only when both stdio ends are TTYs
     // (`getCommandAppMode`, package-manager-cli.ts:495-497).
     let startup_settings = {
-        let mut settings = SettingsManager::create(cwd, Some(agent_dir.to_path_buf()));
-        settings.set_project_trusted(false);
+        let settings =
+            SettingsManager::create_with_trust(cwd, Some(agent_dir.to_path_buf()), false);
         Arc::new(Mutex::new(settings))
     };
     let default_project_trust = startup_settings
@@ -273,11 +201,12 @@ fn handle_config_command(raw_args: &[String], cwd: &Path, agent_dir: &Path) -> O
         .get_default_project_trust()
         .to_string();
     let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-    let trusted = resolve_project_trusted(
+    let trusted = pi_coding_agent::resolve_command_project_trust(
         cwd,
         agent_dir,
         options.project_trust_override,
         &default_project_trust,
+        false,
         interactive.then_some(&startup_settings),
     );
     // Oracle sets projectTrusted on the command settings manager before
@@ -295,8 +224,8 @@ fn handle_config_command(raw_args: &[String], cwd: &Path, agent_dir: &Path) -> O
         ));
     }
 
-    let mut global_settings = SettingsManager::create(cwd, Some(agent_dir.to_path_buf()));
-    global_settings.set_project_trusted(false);
+    let global_settings =
+        SettingsManager::create_with_trust(cwd, Some(agent_dir.to_path_buf()), false);
     let mut global_manager = DefaultPackageManager::new(cwd, agent_dir, global_settings);
     let global_paths = match global_manager.resolve() {
         Ok(paths) => paths,
@@ -306,8 +235,7 @@ fn handle_config_command(raw_args: &[String], cwd: &Path, agent_dir: &Path) -> O
         }
     };
     let project_paths = if trusted {
-        let mut settings = SettingsManager::create(cwd, Some(agent_dir.to_path_buf()));
-        settings.set_project_trusted(true);
+        let settings = SettingsManager::create_with_trust(cwd, Some(agent_dir.to_path_buf()), true);
         match DefaultPackageManager::new(cwd, agent_dir, settings).resolve() {
             Ok(paths) => paths,
             Err(error) => {
@@ -320,8 +248,8 @@ fn handle_config_command(raw_args: &[String], cwd: &Path, agent_dir: &Path) -> O
     };
 
     let selector_settings = {
-        let mut settings = SettingsManager::create(cwd, Some(agent_dir.to_path_buf()));
-        settings.set_project_trusted(trusted);
+        let settings =
+            SettingsManager::create_with_trust(cwd, Some(agent_dir.to_path_buf()), trusted);
         Arc::new(Mutex::new(settings))
     };
     select_config(
@@ -381,11 +309,12 @@ fn build_runtime_factory(
                     let prompt_ui = (config.interactive_trust_prompt
                         && options.session_start_reason == SessionStartReason::Startup)
                         .then_some(&config.startup_settings);
-                    let trusted = resolve_project_trusted(
+                    let trusted = pi_coding_agent::resolve_command_project_trust(
                         &cwd,
                         &agent_dir,
                         parsed.project_trust_override,
                         &config.default_project_trust,
+                        false,
                         prompt_ui,
                     );
                     config
@@ -395,8 +324,8 @@ fn build_runtime_factory(
                     trusted
                 }
             };
-            let mut settings = SettingsManager::create(&cwd, Some(agent_dir.clone()));
-            settings.set_project_trusted(trusted);
+            let settings =
+                SettingsManager::create_with_trust(&cwd, Some(agent_dir.clone()), trusted);
             let settings = Arc::new(Mutex::new(settings));
 
             let mut loader_options = ResourceLoaderOptions::new(&cwd);
@@ -727,7 +656,7 @@ async fn main() {
     // Bootstrap settings: apply httpProxy before any HTTP client exists
     // (main.ts:487-489; reqwest honors these env vars).
     {
-        let bootstrap = SettingsManager::create(&cwd, Some(agent_dir.clone()));
+        let bootstrap = SettingsManager::create_with_trust(&cwd, Some(agent_dir.clone()), false);
         if let Some(proxy) = bootstrap.http_proxy() {
             unsafe {
                 std::env::set_var("HTTP_PROXY", proxy);
@@ -737,10 +666,51 @@ async fn main() {
     }
 
     // Package subcommands run before general arg parsing (main.ts:490-505).
-    {
-        let settings = SettingsManager::create(&cwd, Some(agent_dir.clone()));
-        let mut package_manager = DefaultPackageManager::new(&cwd, &agent_dir, settings);
-        if let Some(output) = handle_package_command(&raw_args, &mut package_manager) {
+    if let Some(options) = pi_coding_agent::parse_package_command(&raw_args) {
+        let is_valid = !options.help
+            && options.invalid_option.is_none()
+            && options.missing_option_value.is_none()
+            && options.invalid_argument.is_none()
+            && options.conflicting_options.is_none()
+            && (!matches!(
+                options.command,
+                pi_coding_agent::PackageCommand::Install | pi_coding_agent::PackageCommand::Remove
+            ) || options.source.is_some());
+
+        let resolved_settings = if is_valid {
+            let settings = SettingsManager::create_with_trust(&cwd, Some(agent_dir.clone()), false);
+            let settings_arc = Arc::new(Mutex::new(settings));
+
+            let default_project_trust = settings_arc.lock().get_default_project_trust().to_string();
+            let use_saved_project_trust_only =
+                options.command == pi_coding_agent::PackageCommand::Update;
+            let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+
+            let trusted = pi_coding_agent::resolve_command_project_trust(
+                &cwd,
+                &agent_dir,
+                options.project_trust_override,
+                &default_project_trust,
+                use_saved_project_trust_only,
+                interactive.then_some(&settings_arc),
+            );
+            settings_arc.lock().set_project_trusted(trusted);
+
+            match Arc::try_unwrap(settings_arc) {
+                Ok(mutex) => mutex.into_inner(),
+                Err(_) => panic!("Arc had multiple references"),
+            }
+        } else {
+            SettingsManager::create_with_trust(&cwd, Some(agent_dir.clone()), false)
+        };
+
+        let mut package_manager = DefaultPackageManager::new(&cwd, &agent_dir, resolved_settings);
+
+        if let Some(output) = pi_coding_agent::handle_package_command_with_self_updater(
+            &raw_args,
+            &mut package_manager,
+            &pi_coding_agent::ProcessSelfUpdater::default(),
+        ) {
             if !output.stdout.is_empty() {
                 print!("{}", output.stdout);
                 if !output.stdout.ends_with('\n') {
@@ -756,6 +726,7 @@ async fn main() {
             std::process::exit(output.exit_code);
         }
     }
+
     // `pi config` runs before general arg parsing (main.ts:504-506).
     if let Some(exit_code) = handle_config_command(&raw_args, &cwd, &agent_dir) {
         std::process::exit(exit_code);

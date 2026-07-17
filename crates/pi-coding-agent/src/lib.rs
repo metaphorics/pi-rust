@@ -76,6 +76,7 @@ pub use package_manager_cli::{
     detect_install_method, get_config_command_help, get_config_command_usage,
     get_package_command_help, get_package_command_usage, handle_package_command,
     handle_package_command_with_self_updater, parse_config_command, parse_package_command,
+    resolve_command_project_trust,
 };
 pub use resource_loader::{
     DefaultResourceLoader, DiscoveredResources, ResourceLoaderOptions, ResourcePath,

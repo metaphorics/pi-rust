@@ -4,11 +4,19 @@
 //! order. Returning a value instead of writing stdout makes the command path
 //! deterministic and keeps JSON/RPC stdout ownership separate.
 
+use crate::cli::startup_ui;
 use crate::config::{APP_NAME, CONFIG_DIR_NAME, PACKAGE_NAME};
+use crate::modes::interactive::components::trust_selector::ProjectTrustUpdate;
+use crate::modes::interactive::trust_store::{
+    ProjectTrustStore, has_trust_requiring_project_resources,
+};
 use crate::package_manager::{
     CommandRunner, DefaultPackageManager, PackageManagerError, ProcessCommandRunner,
 };
+use crate::settings_manager::SettingsManager;
+use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PackageCommand {
@@ -990,4 +998,76 @@ fn install_method_name(method: InstallMethod) -> &'static str {
         InstallMethod::BunBinary => "bun-binary",
         InstallMethod::Unknown => "unknown",
     }
+}
+
+pub fn resolve_command_project_trust(
+    cwd: &Path,
+    agent_dir: &Path,
+    trust_override: Option<bool>,
+    default_project_trust: &str,
+    use_saved_project_trust_only: bool,
+    interactive_ui: Option<&Arc<Mutex<SettingsManager>>>,
+) -> bool {
+    if let Some(overridden) = trust_override {
+        return overridden;
+    }
+    let store = ProjectTrustStore::new(agent_dir);
+    if use_saved_project_trust_only {
+        if let Ok(Some(entry)) = store.get_entry(cwd) {
+            return entry.decision;
+        }
+        return false;
+    }
+    if !has_trust_requiring_project_resources(cwd) {
+        return true;
+    }
+    if let Ok(Some(entry)) = store.get_entry(cwd) {
+        return entry.decision;
+    }
+    match default_project_trust {
+        "always" => return true,
+        "never" => return false,
+        _ => {}
+    }
+    let Some(settings_manager) = interactive_ui else {
+        return false;
+    };
+
+    let trust_path = cwd.display().to_string();
+    let parent = cwd.parent().map(|p| p.display().to_string());
+    let mut labels = vec!["Trust".to_string()];
+    if let Some(parent) = &parent {
+        labels.push(format!("Trust parent folder ({parent})"));
+    }
+    labels.push("Trust (this session only)".to_string());
+    labels.push("Do not trust".to_string());
+    labels.push("Do not trust (this session only)".to_string());
+
+    let title = format!(
+        "Trust project folder?\n{cwd_display}\n\nThis allows pi to load {config_dir_name} settings and resources, install missing project packages, and execute project extensions.",
+        cwd_display = trust_path,
+        config_dir_name = CONFIG_DIR_NAME
+    );
+    let terminal = pi_tui::terminal::ProcessTerminal::new();
+    let mut ui = startup_ui::create_startup_tui(agent_dir, settings_manager, terminal);
+    let selected = startup_ui::show_startup_selector(&mut ui, &title, &labels);
+    ui.stop();
+    let Some(index) = selected else {
+        return false;
+    };
+    let label = labels[index].as_str();
+    let (trusted, saved): (bool, Option<(String, bool)>) = match label {
+        "Trust" => (true, Some((trust_path.clone(), true))),
+        "Trust (this session only)" => (true, None),
+        "Do not trust" => (false, Some((trust_path.clone(), false))),
+        "Do not trust (this session only)" => (false, None),
+        _ => (true, parent.map(|p| (p, true))),
+    };
+    if let Some((path, decision)) = saved {
+        let _ = store.set_many(&[ProjectTrustUpdate {
+            path,
+            decision: Some(decision),
+        }]);
+    }
+    trusted
 }

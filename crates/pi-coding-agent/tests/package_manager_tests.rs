@@ -1,10 +1,11 @@
 use parking_lot::Mutex;
+use pi_coding_agent::modes::interactive::components::trust_selector::ProjectTrustUpdate;
 use pi_coding_agent::{
     CommandRunner, DefaultPackageManager, InstallMethod, LatestRelease, PackageCommand,
     PackageScope, PackageSource, ProcessSelfUpdater, SelfUpdater, Settings, SettingsManager,
     UpdateTarget, apply_patterns, detect_install_method, get_package_command_help,
     handle_package_command, handle_package_command_with_self_updater, parse_package_command,
-    parse_source,
+    parse_source, resolve_command_project_trust,
 };
 use serde_json::json;
 use std::fs;
@@ -1419,4 +1420,89 @@ fn git_update_reinstalls_dependencies_after_clean() {
             vec!["install".to_string(), "--omit=dev".to_string()],
         ]
     );
+}
+
+#[test]
+fn test_project_trust_precedence_and_refusal() {
+    let (_temp, cwd, agent) = fixture();
+    let package = cwd.join("fixture");
+    fs::create_dir_all(&package).unwrap();
+
+    // 1. no-TTY untrusted local install refuses and writes nothing
+    let mut manager = DefaultPackageManager::with_runner(
+        &cwd,
+        &agent,
+        SettingsManager::create_with_trust(&cwd, Some(agent.clone()), false),
+        RecordingRunner::default(),
+    );
+    let output = handle_package_command(
+        &[
+            "install".into(),
+            "--local".into(),
+            package.to_string_lossy().into_owned(),
+        ],
+        &mut manager,
+    )
+    .unwrap();
+    assert_eq!(output.exit_code, 1);
+    assert!(output.stderr.contains("Project is not trusted"));
+    let local_settings = cwd.join(".pi/settings.json");
+    assert!(!local_settings.exists());
+
+    // Create a trust-requiring resource so fast path resolves normal resolution as requiring trust
+    fs::create_dir_all(cwd.join(".pi")).unwrap();
+    fs::write(cwd.join(".pi/settings.json"), "{}").unwrap();
+
+    // 2. CLI approve/no-approve override
+    let store = pi_coding_agent::modes::interactive::trust_store::ProjectTrustStore::new(&agent);
+
+    // Explicit approve overrides no saved
+    let trusted = resolve_command_project_trust(&cwd, &agent, Some(true), "ask", false, None);
+    assert!(trusted);
+
+    // Explicit no-approve overrides no saved
+    let trusted = resolve_command_project_trust(&cwd, &agent, Some(false), "ask", false, None);
+    assert!(!trusted);
+
+    // 3. saved trust succeeds
+    store
+        .set_many(&[ProjectTrustUpdate {
+            path: cwd.display().to_string(),
+            decision: Some(true),
+        }])
+        .unwrap();
+
+    let trusted = resolve_command_project_trust(&cwd, &agent, None, "ask", false, None);
+    assert!(trusted);
+
+    // 4. explicit no overrides saved yes
+    let trusted = resolve_command_project_trust(&cwd, &agent, Some(false), "ask", false, None);
+    assert!(!trusted);
+
+    // 5. no-resources fast path checked before saved trust
+    let no_res_dir = tempfile::tempdir().unwrap().path().to_path_buf();
+    store
+        .set_many(&[ProjectTrustUpdate {
+            path: no_res_dir.display().to_string(),
+            decision: Some(false),
+        }])
+        .unwrap();
+
+    // Normal resolution returns true due to fast path
+    let trusted = resolve_command_project_trust(&no_res_dir, &agent, None, "ask", false, None);
+    assert!(trusted);
+
+    // Bypassed (update saved-only) resolution returns false
+    let trusted = resolve_command_project_trust(&no_res_dir, &agent, None, "ask", true, None);
+    assert!(!trusted);
+
+    // 6. list/read behavior exact oracle
+    let mut untrusted_manager = DefaultPackageManager::with_runner(
+        &cwd,
+        &agent,
+        SettingsManager::create_with_trust(&cwd, Some(agent.clone()), false),
+        RecordingRunner::default(),
+    );
+    let list_output = handle_package_command(&["list".into()], &mut untrusted_manager).unwrap();
+    assert_eq!(list_output.exit_code, 0);
 }
