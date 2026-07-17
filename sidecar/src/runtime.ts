@@ -45,6 +45,7 @@ import type {
   InitParamsDto,
   JsonValue,
   RegistrationsDto,
+  ThemeCatalogEntry,
   ThemeDto,
 } from "./protocol.ts";
 import type { RpcPeer } from "./rpc.ts";
@@ -70,6 +71,9 @@ export interface SidecarRuntime {
   mode: InitParamsDto["mode"];
   hasUi: boolean;
   cwd: string;
+  /** Host theme catalog fetched at boot (ui/getAllThemes); undefined when
+   * the host declined or the mode has no UI. */
+  hostThemeCatalog: ThemeCatalogEntry[] | undefined;
   loadErrors: ExtensionErrorDto[];
   /** Re-runs `loadExtensions` for extra paths (lifecycle/load). */
   loadMore: (paths: string[]) => Promise<{ registrations: RegistrationsDto; errors: ExtensionErrorDto[] }>;
@@ -80,6 +84,8 @@ export interface SidecarRuntime {
 export interface BootOptions {
   init: InitParamsDto;
   peer: RpcPeer;
+  /** Host theme catalog fetched before boot (host is authoritative). */
+  hostThemeCatalog?: ThemeCatalogEntry[];
   /** UI context factory (C4). When absent/declining the runner keeps its no-op UI. */
   uiContext?: (runtime: SidecarRuntime) => ExtensionUIContext | undefined;
 }
@@ -355,6 +361,7 @@ export async function bootRuntime(options: BootOptions): Promise<SidecarRuntime>
     mode: init.mode,
     hasUi: init.hasUi,
     cwd: init.cwd,
+    hostThemeCatalog: options.hostThemeCatalog,
     loadErrors: loadResult.errors.map((entry) => ({
       extensionPath: entry.path,
       event: "load",

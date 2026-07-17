@@ -91,17 +91,9 @@ export function createUi(runtime: SidecarRuntime): CreatedUi {
   const footerData = new FooterDataProvider(runtime.cwd);
 
 
-  // Theme catalog: Rust is authoritative; fetched once at boot, refreshed on
-  // demand. Sync getters serve the cache merged with pi's local catalog.
-  let hostThemeCatalog: ThemeCatalogEntry[] | undefined;
-  void peer
-    .request("ui/getAllThemes", {})
-    .then((catalog) => {
-      hostThemeCatalog = fromWire<ThemeCatalogEntry[]>(catalog);
-    })
-    .catch(() => {
-      // Host catalog unavailable; local catalog remains the fallback.
-    });
+  // Theme catalog: Rust is authoritative; fetched by the host BEFORE the
+  // runtime booted (lifecycle/init), so sync getters never race the boot.
+  const hostThemeCatalog: ThemeCatalogEntry[] | undefined = runtime.hostThemeCatalog;
 
   const autocompleteFactories: AutocompleteProviderFactory[] = [];
   let editorFactory: EditorFactory | undefined;
@@ -238,12 +230,16 @@ export function createUi(runtime: SidecarRuntime): CreatedUi {
         if (options?.onHandle !== undefined) {
           // The REAL headless-TUI overlay handle keeps pi's focus/visibility
           // semantics; every observable change re-ships the overlay options
-          // (with `hidden`) so Rust mirrors the state.
+          // (with `hidden`/`focused`) so Rust mirrors the state.
           const handle = bridge.tui.showOverlay(component, resolveOverlayOptions());
           const shipOverlayState = () => {
             peer.notify("ui/overlay", {
               slot,
-              options: toWire({ ...resolveOverlayOptions(), hidden: handle.isHidden() }),
+              options: toWire({
+                ...resolveOverlayOptions(),
+                hidden: handle.isHidden(),
+                focused: handle.isFocused(),
+              }),
             });
           };
           options.onHandle({
@@ -266,8 +262,10 @@ export function createUi(runtime: SidecarRuntime): CreatedUi {
             },
             isFocused: () => handle.isFocused(),
           });
+          shipOverlayState();
+        } else {
+          peer.notify("ui/overlay", { slot, options: toWire(resolveOverlayOptions()) });
         }
-        peer.notify("ui/overlay", { slot, options: toWire(resolveOverlayOptions()) });
       }
 
       // Rust hosts the dialog; its response finalizes the slot's lifetime.
@@ -298,7 +296,20 @@ export function createUi(runtime: SidecarRuntime): CreatedUi {
         bridge.disposeSlot("editor");
         return;
       }
-      bridge.registerComponent("editor", factory(bridge.tui, getEditorTheme(), runtime.keybindings), {
+      const component = factory(bridge.tui, getEditorTheme(), runtime.keybindings);
+      // Oracle wires the default editor's onSubmit/onChange onto the custom
+      // editor (interactive-mode.ts:2370-2372); here the host owns those
+      // handlers, so submit/change cross the wire as leaf notifications.
+      component.onSubmit = (text: string) => {
+        peer.notify("ui/editorSubmit", { text });
+      };
+      component.onChange = (text: string) => {
+        state.setEditorText(text);
+        peer.notify("ui/editorChange", { text });
+      };
+      // Oracle copies the draft into the replacement editor (:2375).
+      component.setText(state.current.editorText);
+      bridge.registerComponent("editor", component, {
         focusable: true,
       });
     },
@@ -350,14 +361,19 @@ export function createUi(runtime: SidecarRuntime): CreatedUi {
       peer.notify("ui/setToolsExpanded", { visible: expanded });
     },
   };
-
   const uiBridge: UiBridge = {
     render: (slot, width) => bridge.render(slot, width),
     input: (slot, data) => {
       bridge.input(slot, data);
     },
+    focus: (slot, focused) => {
+      bridge.focus(slot, focused);
+    },
     dispose: (slot) => {
       bridge.dispose(slot);
+    },
+    editorSetText: (text) => {
+      bridge.editorSetText(text);
     },
     terminalInput: (data) => bridge.terminalInput(data),
     autocomplete: (text, cursor, commandName) =>

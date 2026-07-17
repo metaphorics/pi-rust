@@ -552,6 +552,90 @@ impl ExtensionBinding {
             })
     }
 
+    /// Build the TUI-thread outbound sender for bridged frames (C8).
+    ///
+    /// Messages are relayed through one ordered queue task (key input MUST
+    /// NOT reorder); `ui/render` responses land back in `hub` guarded by
+    /// revision + request generation. MUST be called from within a tokio
+    /// runtime context; the sender itself never blocks and is safe to call
+    /// from the TUI thread.
+    pub fn ui_outbound(
+        self: &Arc<Self>,
+        hub: &Arc<super::frames::FrameHub>,
+    ) -> super::frames::UiOutboundSender {
+        use super::frames::UiOutbound;
+        let (tx, mut rx) = mpsc::unbounded_channel::<UiOutbound>();
+        let binding = Arc::downgrade(self);
+        let hub = hub.clone();
+        tokio::spawn(async move {
+            while let Some(message) = rx.recv().await {
+                let Some(binding) = binding.upgrade() else {
+                    return;
+                };
+                let Some(connection) = binding.host.current_connection().await else {
+                    continue; // Sidecar down; frames are gone anyway.
+                };
+                match message {
+                    UiOutbound::Render {
+                        slot,
+                        width,
+                        revision,
+                        generation,
+                    } => {
+                        // Detached: a slow render must not stall key input
+                        // behind it. Concurrent responses for one slot are
+                        // resolved by the revision+generation guard.
+                        let hub = hub.clone();
+                        let connection = connection.clone();
+                        tokio::spawn(async move {
+                            let request =
+                                pi_ext_protocol::Request::UiRender(pi_ext_protocol::RenderParams {
+                                    slot: slot.clone(),
+                                    width,
+                                });
+                            if let Ok(value) = connection.request(request).await
+                                && let Ok(lines) = serde_json::from_value::<Vec<String>>(value)
+                            {
+                                hub.apply_render_response(&slot, revision, generation, lines);
+                            }
+                        });
+                    }
+                    UiOutbound::Input { slot, data } => {
+                        let _ = connection
+                            .notify(pi_ext_protocol::Notification::UiComponentInput(
+                                pi_ext_protocol::ComponentInputParams { slot, data },
+                            ))
+                            .await;
+                    }
+                    UiOutbound::Focus { slot, focused } => {
+                        let _ = connection
+                            .notify(pi_ext_protocol::Notification::UiFocus(
+                                pi_ext_protocol::FocusParams { slot, focused },
+                            ))
+                            .await;
+                    }
+                    UiOutbound::Dispose { slot } => {
+                        let _ = connection
+                            .notify(pi_ext_protocol::Notification::UiDispose(
+                                pi_ext_protocol::SlotParams { slot },
+                            ))
+                            .await;
+                    }
+                    UiOutbound::EditorSetText { text } => {
+                        let _ = connection
+                            .notify(pi_ext_protocol::Notification::UiSetEditorText(
+                                pi_ext_protocol::TextParams { text },
+                            ))
+                            .await;
+                    }
+                }
+            }
+        });
+        Arc::new(move |message| {
+            let _ = tx.send(message);
+        })
+    }
+
     /// Graceful teardown: flush the queue, then bounded sidecar shutdown.
     pub async fn shutdown(&self) {
         self.forwarder.flush().await;

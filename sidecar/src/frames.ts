@@ -12,7 +12,7 @@
  * monotonic per slot and Rust drops stale frames.
  */
 
-import { TUI } from "@earendil-works/pi-tui";
+import { TUI, isFocusable } from "@earendil-works/pi-tui";
 import type { Component } from "@earendil-works/pi-tui";
 import type { RegisteredTool } from "@earendil-works/pi-coding-agent";
 import type { AgentToolResult } from "@earendil-works/pi-coding-agent";
@@ -205,6 +205,35 @@ export class FrameBridge {
     this.markDirty(slot);
   }
 
+  /** `ui/focus {slot,focused}`: mirror host focus onto the component so it
+   * renders its cursor marker exactly like a locally focused component.
+   * pi-tui `Focusable` is a `focused: boolean` PROPERTY (tui.ts:104-107);
+   * the TUI assigns it directly, so the bridge does the same. */
+  focus(slot: string, focused: boolean): void {
+    const entry = this.slots.get(slot);
+    if (entry === undefined || entry.kind !== "component") return;
+    if (isFocusable(entry.component)) {
+      entry.component.focused = focused;
+      this.markDirty(slot);
+    }
+  }
+
+  /** `ui/setEditorText` (host→sidecar): update the bridged editor's text. */
+  editorSetText(text: string): void {
+    const entry = this.slots.get("editor");
+    if (entry === undefined || entry.kind !== "component") return;
+    const component: unknown = entry.component;
+    if (
+      component !== null &&
+      typeof component === "object" &&
+      "setText" in component &&
+      typeof component.setText === "function"
+    ) {
+      component.setText(text);
+      this.markDirty("editor");
+    }
+  }
+
   dispose(slot: string): void {
     // Initiated by Rust; do not echo a ui/dispose back.
     this.disposeSlot(slot, { notify: false });
@@ -220,9 +249,16 @@ export class FrameBridge {
 
   addTerminalInputListener(handler: (data: string) => { consume?: boolean; data?: string } | undefined): () => void {
     this.terminalInputListeners.push(handler);
+    if (this.terminalInputListeners.length === 1) {
+      this.deps.peer.notify("ui/terminalInputActive", { active: true });
+    }
     return () => {
       const index = this.terminalInputListeners.indexOf(handler);
-      if (index >= 0) this.terminalInputListeners.splice(index, 1);
+      if (index < 0) return; // Idempotent: already removed.
+      this.terminalInputListeners.splice(index, 1);
+      if (this.terminalInputListeners.length === 0) {
+        this.deps.peer.notify("ui/terminalInputActive", { active: false });
+      }
     };
   }
 

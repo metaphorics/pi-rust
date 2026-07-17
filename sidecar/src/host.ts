@@ -40,6 +40,7 @@ import type {
   StateBlockDto,
   StateUpdateDto,
   TerminalInputResultDto,
+  ThemeCatalogEntry,
 } from "./protocol.ts";
 import type { RpcPeer } from "./rpc.ts";
 
@@ -59,7 +60,9 @@ function asObject(value: JsonValue): JsonObject {
 export interface UiBridge {
   render(slot: string, width: number): string[];
   input(slot: string, data: string): void;
+  focus(slot: string, focused: boolean): void;
   dispose(slot: string): void;
+  editorSetText(text: string): void;
   terminalInput(data: string): Promise<TerminalInputResultDto>;
   autocomplete(text: string, cursor: number, commandName?: string): Promise<JsonValue>;
   recordToolCall(toolCallId: string, toolName: string, args: unknown): void;
@@ -119,9 +122,27 @@ export function attachHost(options: HostOptions): SidecarHost {
       });
     }
     const createUi = options.createUi;
+    let hostThemeCatalog: ThemeCatalogEntry[] | undefined;
+    if (createUi !== undefined && init.hasUi) {
+      // Bounded: a host that cannot serve the catalog (older host, wedged
+      // dialog surface) degrades to the sidecar-local catalog after 2s
+      // instead of wedging lifecycle/init.
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 2000);
+      try {
+        hostThemeCatalog = fromWire<ThemeCatalogEntry[]>(
+          await peer.request("ui/getAllThemes", {}, { signal: controller.signal }),
+        );
+      } catch {
+        hostThemeCatalog = undefined;
+      } finally {
+        clearTimeout(timer);
+      }
+    }
     const runtime = await bootRuntime({
       init,
       peer,
+      hostThemeCatalog,
       uiContext:
         createUi === undefined
           ? undefined
@@ -283,6 +304,14 @@ export function attachHost(options: HostOptions): SidecarHost {
   peer.onNotification("ui/dispose", (params) => {
     const { slot } = fromWire<{ slot: string }>(asObject(params));
     host.uiBridge?.dispose(slot);
+  });
+  peer.onNotification("ui/focus", (params) => {
+    const { slot, focused } = fromWire<{ slot: string; focused: boolean }>(asObject(params));
+    host.uiBridge?.focus(slot, focused);
+  });
+  peer.onNotification("ui/setEditorText", (params) => {
+    const { text } = fromWire<{ text: string }>(asObject(params));
+    host.uiBridge?.editorSetText(text);
   });
   peer.onRequest("ui/terminal_input", async (params) => {
     const { data } = fromWire<{ data: string }>(asObject(params));

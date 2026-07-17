@@ -254,6 +254,14 @@ pub enum Notification {
     UiDone(DoneParams),
     #[serde(rename = "ui/overlay")]
     UiOverlay(OverlayParams),
+    #[serde(rename = "ui/focus")]
+    UiFocus(FocusParams),
+    #[serde(rename = "ui/editorSubmit")]
+    UiEditorSubmit(TextParams),
+    #[serde(rename = "ui/editorChange")]
+    UiEditorChange(TextParams),
+    #[serde(rename = "ui/terminalInputActive")]
+    UiTerminalInputActive(ActiveParams),
     #[serde(rename = "tool/update")]
     ToolUpdate(ToolUpdateParams),
     #[serde(rename = "provider/register")]
@@ -1333,6 +1341,15 @@ pub struct OverlayParams {
     pub options: Value,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FocusParams {
+    pub slot: String,
+    pub focused: bool,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveParams {
+    pub active: bool,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NotifyParams {
     pub message: String,
     pub level: NotificationLevel,
@@ -1866,6 +1883,13 @@ mod tests {
                 slot: "x".into(),
                 options: json!({"width":10}),
             }),
+            Notification::UiFocus(FocusParams {
+                slot: "editor".into(),
+                focused: true,
+            }),
+            Notification::UiEditorSubmit(TextParams { text: "go".into() }),
+            Notification::UiEditorChange(TextParams { text: "g".into() }),
+            Notification::UiTerminalInputActive(ActiveParams { active: true }),
             Notification::ToolUpdate(ToolUpdateParams {
                 tool_call_id: "t".into(),
                 partial: json!({"content":"x"}),

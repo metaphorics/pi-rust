@@ -418,6 +418,9 @@ async fn handle_notification(
         | Notification::UiDispose(_)
         | Notification::UiDone(_)
         | Notification::UiOverlay(_)
+        | Notification::UiEditorSubmit(_)
+        | Notification::UiEditorChange(_)
+        | Notification::UiTerminalInputActive(_)
         | Notification::UiSetWorkingMessage(_)
         | Notification::UiSetWorkingVisible(_)
         | Notification::UiSetWorkingIndicator(_)
@@ -431,8 +434,8 @@ async fn handle_notification(
         }
 
         // Control-plane notifications never reach the incoming queue
-        // (client.rs routes them inline); session/sync and ui/input are
-        // host→sidecar only.
+        // (client.rs routes them inline); session/sync, ui/input, and
+        // ui/focus are host→sidecar only.
         Notification::LifecycleHello(_)
         | Notification::LifecycleInitialized(_)
         | Notification::LifecyclePing(_)
@@ -440,6 +443,7 @@ async fn handle_notification(
         | Notification::EventNotify(_)
         | Notification::SessionSync(_)
         | Notification::StateUpdate(_)
-        | Notification::UiComponentInput(_) => {}
+        | Notification::UiComponentInput(_)
+        | Notification::UiFocus(_) => {}
     }
 }

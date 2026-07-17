@@ -58,6 +58,9 @@ pub use extensions::events::{
     DEFAULT_HOOK_TIMEOUT, EmitError, EventForwarder, ExtensionErrorSink, StateOverlay, StateSource,
     agent_thinking_level, session_state_block, wire_thinking_level,
 };
+pub use extensions::frames::{
+    BridgedLeaf, FrameHub, HubEvent, SlotSnapshot, UiOutbound, UiOutboundSender, noop_outbound,
+};
 pub use extensions::session_sync::{SessionSync, session_file_string};
 pub use extensions::{
     BridgeState, BunEnvironment, ClientConfig, ClientError, DeadReason, DisabledReason,
