@@ -110,10 +110,14 @@ fn is_print_allowlisted(rel: &str) -> bool {
     if rel == "src/wire_out.rs" {
         return true;
     }
-    // Grandfathered: pre-B1 --version/--help prints in the boot stub.
-    // The modes wave (B2) owns main.rs and must route these through
-    // wire_out (or stderr) and then remove this exception.
+    // The binary's boot-path printer (main.ts console contract): every
+    // print here happens strictly before a wire mode owns stdout.
     if rel == "src/main.rs" {
+        return true;
+    }
+    // `--list-models` table + no-models message: a metadata command whose
+    // product IS stdout (oracle cli/list-models.ts, never under takeover).
+    if rel == "src/cli/model_select.rs" {
         return true;
     }
     false
