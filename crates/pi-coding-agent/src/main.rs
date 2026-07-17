@@ -36,6 +36,9 @@ use pi_coding_agent::extensions::binding::{
     BindOptions, ExtensionBinding, SessionHostActions, bind_extensions,
 };
 use pi_coding_agent::migrations::run_migrations;
+use pi_coding_agent::modes::interactive::components::config_selector::{
+    ConfigSelectorComponent, ConfigWriteScope, ScopedResolvedPaths,
+};
 use pi_coding_agent::modes::interactive::interactive_mode::{
     InteractiveMode, InteractiveModeOptions,
 };
@@ -58,9 +61,6 @@ use pi_coding_agent::session::{
 };
 use pi_coding_agent::settings_manager::SettingsManager;
 use pi_coding_agent::system_prompt::load_project_context_files;
-use pi_coding_agent::modes::interactive::components::config_selector::{
-    ConfigSelectorComponent, ConfigWriteScope, ScopedResolvedPaths,
-};
 use pi_coding_agent::{
     AuthStorage, DefaultPackageManager, get_config_command_help, get_config_command_usage,
     handle_package_command, parse_config_command,
@@ -1053,6 +1053,7 @@ async fn main() {
                     initial_messages: std::mem::take(&mut parsed.messages),
                     migrated_providers: migration.migrated_auth_providers.clone(),
                     model_fallback_message: runtime.model_fallback_message(),
+                    verbose: parsed.verbose,
                     auto_trust_on_reload_cwd,
                     // Extension-aware /reload: the full SessionHostActions
                     // reload (forwarder reload + rebind + session_start)
@@ -1060,9 +1061,7 @@ async fn main() {
                     reload_runtime: bound.as_ref().map(|(_, actions)| {
                         let actions = actions.clone();
                         let reload: std::rc::Rc<
-                            dyn Fn() -> std::pin::Pin<
-                                Box<dyn Future<Output = Result<(), String>>>,
-                            >,
+                            dyn Fn() -> std::pin::Pin<Box<dyn Future<Output = Result<(), String>>>>,
                         > = std::rc::Rc::new(move || {
                             Box::pin(HostActions::reload(
                                 &*actions,

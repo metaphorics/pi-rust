@@ -42,6 +42,7 @@ use super::components::compaction_summary_message::CompactionSummaryMessageCompo
 use super::components::custom_editor::CustomEditor;
 use super::components::custom_entry::CustomEntryComponent;
 use super::components::dynamic_border::DynamicBorder;
+use super::components::expandable_text::ExpandableText;
 use super::components::extension_selector::ExtensionSelector;
 use super::components::footer::{FooterComponent, FooterData, FooterStats};
 use super::components::keybinding_hints::{key_display_text, key_text};
@@ -124,6 +125,10 @@ pub struct InteractiveModeOptions {
     /// `migratedProviders`; startup warning, interactive-mode.ts:876-878).
     pub migrated_providers: Vec<String>,
     pub model_fallback_message: Option<String>,
+    /// Force verbose startup — overrides the `quietStartup` setting for the
+    /// startup header and loaded-resource listing, and starts tool output
+    /// expanded (oracle `verbose`).
+    pub verbose: bool,
     /// Install SIGTERM/SIGHUP handlers (binary entry points only).
     pub handle_signals: bool,
     /// Time source for double-press windows (tests inject a fake clock).
@@ -538,6 +543,8 @@ pub struct InteractiveMode {
     tui: Tui,
 
     // Shared mounted components (root order mirrors the oracle).
+    header: Rc<RefCell<Container>>,
+    loaded_resources: Rc<RefCell<Container>>,
     chat: Rc<RefCell<Container>>,
     pending_messages: Rc<RefCell<Container>>,
     status: Rc<RefCell<Container>>,
@@ -556,6 +563,10 @@ pub struct InteractiveMode {
     streaming_component: Option<(usize, Rc<RefCell<AssistantMessageComponent>>)>,
     pending_tools: HashMap<String, Rc<RefCell<ToolExecutionComponent>>>,
     tool_output_expanded: bool,
+    /// Startup header (oracle `builtInHeader`) — refreshed on tools-expand.
+    header_expandable: Option<Rc<RefCell<ExpandableText>>>,
+    /// Loaded-resource sections — refreshed on tools-expand.
+    resource_sections: Vec<Rc<RefCell<ExpandableText>>>,
     hide_thinking_block: bool,
     output_pad: usize,
 
@@ -760,8 +771,8 @@ impl InteractiveMode {
         // Mount (oracle init() :726-736 order).
         let editor_slot =
             SlotHandle::new(Box::new(Shared::new(custom_editor.clone())) as ComponentBox);
-        tui.add_child(Shared::new(header));
-        tui.add_child(Shared::new(loaded_resources));
+        tui.add_child(Shared::new(header.clone()));
+        tui.add_child(Shared::new(loaded_resources.clone()));
         tui.add_child(Shared::new(chat.clone()));
         tui.add_child(Shared::new(pending_messages.clone()));
         tui.add_child(Shared::new(status.clone()));
@@ -800,6 +811,8 @@ impl InteractiveMode {
             session,
             tui,
             chat,
+            header,
+            loaded_resources,
             pending_messages,
             status,
             footer,
@@ -813,7 +826,9 @@ impl InteractiveMode {
             unsubscribe: Some(Box::new(unsubscribe)),
             streaming_component: None,
             pending_tools: HashMap::new(),
-            tool_output_expanded: false,
+            tool_output_expanded: options.verbose,
+            header_expandable: None,
+            resource_sections: Vec::new(),
             hide_thinking_block,
             output_pad,
             active_status: None,
@@ -858,6 +873,13 @@ impl InteractiveMode {
             return;
         }
         self.initialized = true;
+        // "Model scope: ..." console line before the TUI takes over
+        // (oracle init :709-722).
+        self.print_model_scope_line();
+        // Startup header + loaded-resource listing (oracle init :748-807 +
+        // showLoadedResources), both gated on `verbose || !quietStartup`.
+        self.populate_startup_header();
+        self.show_loaded_resources(false);
         self.update_editor_border_color();
         self.update_terminal_title();
         self.render_current_session_state();
@@ -875,6 +897,354 @@ impl InteractiveMode {
         }
         self.maybe_warn_about_anthropic_subscription_auth(None);
         self.tui.start_render_loop_hooks();
+    }
+
+    /// Oracle `getStartupExpansionState` (interactive-mode.ts:1079-1081).
+    fn startup_expansion_state(&self) -> bool {
+        self.options.verbose || self.tool_output_expanded
+    }
+
+    /// Re-evaluate the header and resource sections after a tools-expand
+    /// toggle (oracle setExpanded on Expandable components).
+    fn refresh_startup_expansion(&mut self) {
+        let expanded = self.startup_expansion_state();
+        if let Some(header) = &self.header_expandable {
+            header.borrow_mut().set_expanded(expanded);
+        }
+        for section in &self.resource_sections {
+            section.borrow_mut().set_expanded(expanded);
+        }
+    }
+
+    fn quiet_startup(&self) -> bool {
+        self.runtime
+            .services()
+            .settings_manager
+            .lock()
+            .get_quiet_startup()
+    }
+
+    /// Oracle init :709-722: scoped models print one dim console line
+    /// above the TUI unless silenced.
+    fn print_model_scope_line(&mut self) {
+        let scoped = self.session.scoped_models();
+        if scoped.is_empty() || !(self.options.verbose || !self.quiet_startup()) {
+            return;
+        }
+        let model_list = scoped
+            .iter()
+            .map(|scoped_model| {
+                let thinking = scoped_model
+                    .thinking_level
+                    .map(|level| format!(":{}", agent_thinking_level_str(level)))
+                    .unwrap_or_default();
+                format!("{}{}", scoped_model.model.id, thinking)
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let cycle_keys = pi_tui::keybindings::get_keybindings().get_keys("app.model.cycleForward");
+        let cycle_hint = if cycle_keys.is_empty() {
+            String::new()
+        } else {
+            theme().fg(
+                ThemeColor::Muted,
+                &format!(
+                    " ({} to cycle)",
+                    super::components::keybinding_hints::format_key_text(
+                        &cycle_keys.join("/"),
+                        true
+                    )
+                ),
+            )
+        };
+        let line = theme().fg(
+            ThemeColor::Dim,
+            &format!("Model scope: {model_list}{cycle_hint}"),
+        );
+        self.tui.terminal_mut().write(&format!("{line}\r\n"));
+    }
+
+    /// Oracle init :748-807: the startup header — logo plus keybinding
+    /// instructions (compact by default, full when expanded) — unless
+    /// silenced, in which case a minimal empty header mounts.
+    fn populate_startup_header(&mut self) {
+        use super::components::keybinding_hints::{key_hint, raw_key_hint};
+
+        let show_header = self.options.verbose || !self.quiet_startup();
+        let mut header = self.header.borrow_mut();
+        header.clear();
+        self.header_expandable = None;
+        if !show_header {
+            // Minimal header when silenced (oracle :803-807).
+            header.add_child(pi_tui::components::Text::new("", 0, 0, None));
+            return;
+        }
+        let logo = || {
+            let t = theme();
+            format!(
+                "{}{}",
+                t.bold(&t.fg(ThemeColor::Accent, crate::config::APP_NAME)),
+                t.fg(ThemeColor::Dim, &format!(" v{}", crate::config::VERSION))
+            )
+        };
+        let expanded_instructions = || {
+            [
+                key_hint("app.interrupt", "to interrupt"),
+                key_hint("app.clear", "to clear"),
+                raw_key_hint(&format!("{} twice", key_text("app.clear")), "to exit"),
+                key_hint("app.exit", "to exit (empty)"),
+                key_hint("app.suspend", "to suspend"),
+                key_hint("tui.editor.deleteToLineEnd", "to delete to end"),
+                key_hint("app.thinking.cycle", "to cycle thinking level"),
+                raw_key_hint(
+                    &format!(
+                        "{}/{}",
+                        key_text("app.model.cycleForward"),
+                        key_text("app.model.cycleBackward")
+                    ),
+                    "to cycle models",
+                ),
+                key_hint("app.model.select", "to select model"),
+                key_hint("app.tools.expand", "to expand tools"),
+                key_hint("app.thinking.toggle", "to expand thinking"),
+                key_hint("app.editor.external", "for external editor"),
+                raw_key_hint("/", "for commands"),
+                raw_key_hint("!", "to run bash"),
+                raw_key_hint("!!", "to run bash (no context)"),
+                key_hint("app.message.followUp", "to queue follow-up"),
+                key_hint("app.message.dequeue", "to edit all queued messages"),
+                key_hint(
+                    "app.clipboard.pasteImage",
+                    "to paste image (with text fallback)",
+                ),
+                raw_key_hint("drop files", "to attach"),
+            ]
+            .join("\n")
+        };
+        let compact_instructions = || {
+            [
+                key_hint("app.interrupt", "interrupt"),
+                raw_key_hint(
+                    &format!("{}/{}", key_text("app.clear"), key_text("app.exit")),
+                    "clear/exit",
+                ),
+                raw_key_hint("/", "commands"),
+                raw_key_hint("!", "bash"),
+                key_hint("app.tools.expand", "more"),
+            ]
+            .join(&theme().fg(ThemeColor::Muted, " · "))
+        };
+        let compact_onboarding = || {
+            theme().fg(
+                ThemeColor::Dim,
+                &format!(
+                    "Press {} to show full startup help and loaded resources.",
+                    key_text("app.tools.expand")
+                ),
+            )
+        };
+        let onboarding = || {
+            theme().fg(
+                ThemeColor::Dim,
+                "Pi can explain its own features and look up its docs. Ask it how to use or extend Pi.",
+            )
+        };
+        let component = Rc::new(RefCell::new(ExpandableText::new(
+            Box::new(move || {
+                format!(
+                    "{}\n{}\n{}\n\n{}",
+                    logo(),
+                    compact_instructions(),
+                    compact_onboarding(),
+                    onboarding()
+                )
+            }),
+            Box::new(move || {
+                format!(
+                    "{}\n{}\n\n{}",
+                    logo(),
+                    expanded_instructions(),
+                    onboarding()
+                )
+            }),
+            self.options.verbose || self.tool_output_expanded,
+            1,
+            0,
+        )));
+        header.add_child(Spacer::new(1));
+        header.add_child(Shared::new(component.clone()));
+        header.add_child(Spacer::new(1));
+        drop(header);
+        self.header_expandable = Some(component);
+    }
+
+    /// Oracle `showLoadedResources` (interactive-mode.ts:1415-1565), over
+    /// the resources this runtime carries: context files, skills, prompt
+    /// templates, extensions, and custom themes. Listing is gated on
+    /// `force || verbose || !quietStartup`; sections render compact
+    /// summaries collapsed and per-path lists expanded.
+    fn show_loaded_resources(&mut self, force: bool) {
+        use super::components::expandable_text::ExpandableText;
+
+        let loaded_resources = self.loaded_resources.clone();
+        let mut container = loaded_resources.borrow_mut();
+        container.clear();
+        self.resource_sections.clear();
+        let show_listing = force || self.options.verbose || !self.quiet_startup();
+        if !show_listing {
+            return;
+        }
+        let expanded_now = self.startup_expansion_state();
+        let cwd = self.session.cwd().to_path_buf();
+
+        let compact_list = |mut labels: Vec<String>, sort: bool| {
+            labels = labels
+                .into_iter()
+                .map(|label| label.trim().to_string())
+                .filter(|label| !label.is_empty())
+                .collect();
+            if sort {
+                labels.sort();
+            }
+            theme().fg(ThemeColor::Dim, &format!("  {}", labels.join(", ")))
+        };
+        let path_list = |paths: &[String]| {
+            paths
+                .iter()
+                .map(|path| theme().fg(ThemeColor::Dim, &format!("  {path}")))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let mut sections = Vec::new();
+        let mut add_section =
+            |container: &mut Container, name: &'static str, collapsed: String, expanded: String| {
+                let section = Rc::new(RefCell::new(ExpandableText::new(
+                    Box::new(move || {
+                        format!(
+                            "{}\n{collapsed}",
+                            theme().fg(ThemeColor::MdHeading, &format!("[{name}]"))
+                        )
+                    }),
+                    Box::new(move || {
+                        format!(
+                            "{}\n{expanded}",
+                            theme().fg(ThemeColor::MdHeading, &format!("[{name}]"))
+                        )
+                    }),
+                    expanded_now,
+                    0,
+                    0,
+                )));
+                container.add_child(Shared::new(section.clone()));
+                container.add_child(Spacer::new(1));
+                sections.push(section);
+            };
+
+        let context_files = self.session.context_files();
+        if !context_files.is_empty() {
+            container.add_child(Spacer::new(1));
+            let compact = compact_list(
+                context_files
+                    .iter()
+                    .map(|file| format_context_path(&file.path, &cwd))
+                    .collect(),
+                false,
+            );
+            let expanded = path_list(
+                &context_files
+                    .iter()
+                    .map(|file| format_display_path(&file.path))
+                    .collect::<Vec<_>>(),
+            );
+            add_section(&mut container, "Context", compact, expanded);
+        }
+
+        let skills = self.session.skills();
+        if !skills.is_empty() {
+            let compact = compact_list(
+                skills.iter().map(|skill| skill.name.clone()).collect(),
+                true,
+            );
+            let expanded = path_list(
+                &skills
+                    .iter()
+                    .map(|skill| format_display_path(&skill.file_path.to_string_lossy()))
+                    .collect::<Vec<_>>(),
+            );
+            add_section(&mut container, "Skills", compact, expanded);
+        }
+
+        let templates = self.session.prompt_templates();
+        if !templates.is_empty() {
+            let names: Vec<String> = templates
+                .iter()
+                .map(|template| format!("/{}", template.name))
+                .collect();
+            let compact = compact_list(names.clone(), true);
+            let expanded = path_list(
+                &templates
+                    .iter()
+                    .map(|template| format_display_path(&template.file_path.to_string_lossy()))
+                    .collect::<Vec<_>>(),
+            );
+            add_section(&mut container, "Prompts", compact, expanded);
+        }
+
+        let extensions = {
+            let services = self.runtime.services();
+            let loader = services.resource_loader.lock();
+            loader.discovered().extension_paths()
+        };
+        if !extensions.is_empty() {
+            let compact = compact_list(
+                extensions
+                    .iter()
+                    .map(|path| {
+                        format_display_path(&path.to_string_lossy())
+                            .split('/')
+                            .rfind(|segment| !segment.is_empty() && *segment != "~")
+                            .unwrap_or_default()
+                            .to_string()
+                    })
+                    .collect(),
+                true,
+            );
+            let expanded = path_list(
+                &extensions
+                    .iter()
+                    .map(|path| {
+                        let display = format_display_path(&path.to_string_lossy());
+                        display
+                            .strip_suffix("/index.ts")
+                            .or_else(|| display.strip_suffix("/index.js"))
+                            .unwrap_or(&display)
+                            .to_string()
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            add_section(&mut container, "Extensions", compact, expanded);
+        }
+
+        let custom_themes: Vec<_> = super::theme::get_available_themes_with_paths()
+            .into_iter()
+            .filter(|info| info.path.is_some())
+            .collect();
+        if !custom_themes.is_empty() {
+            let compact = compact_list(
+                custom_themes.iter().map(|info| info.name.clone()).collect(),
+                true,
+            );
+            let expanded = path_list(
+                &custom_themes
+                    .iter()
+                    .filter_map(|info| info.path.as_ref())
+                    .map(|path| format_display_path(&path.to_string_lossy()))
+                    .collect::<Vec<_>>(),
+            );
+            add_section(&mut container, "Themes", compact, expanded);
+        }
+        drop(container);
+        self.resource_sections = sections;
     }
 
     /// Run until quit; returns the exit code and farewell line.
@@ -3760,6 +4130,7 @@ impl InteractiveMode {
             let _ = set_theme(&name, false);
         }
         self.rebind_session();
+        self.show_loaded_resources(false);
         let saved_implicit_project_trust = self.maybe_save_implicit_project_trust_after_reload();
         self.tui.invalidate();
         self.show_status(if saved_implicit_project_trust {
@@ -4071,6 +4442,7 @@ impl InteractiveMode {
         for tool in self.pending_tools.values() {
             tool.borrow_mut().set_expanded(expanded);
         }
+        self.refresh_startup_expansion();
         self.chat.borrow_mut().mark_changed();
         self.tui.request_render(false);
     }
@@ -4376,5 +4748,44 @@ fn footer_stats(session: &AgentSession) -> FooterStats {
         ),
         using_subscription: false,
         experimental: false,
+    }
+}
+
+/// Oracle `formatDisplayPath` (interactive-mode.ts:1050-1060): home prefix
+/// shortened to `~`.
+fn format_display_path(path: &str) -> String {
+    if let Some(home) = dirs::home_dir() {
+        let home = home.to_string_lossy().into_owned();
+        if let Some(rest) = path.strip_prefix(&home) {
+            return format!("~{rest}");
+        }
+    }
+    path.to_string()
+}
+
+/// Oracle `formatContextPath` (interactive-mode.ts:1068-1077): cwd-relative
+/// when inside the cwd, display path otherwise.
+fn format_context_path(path: &str, cwd: &std::path::Path) -> String {
+    let absolute = if std::path::Path::new(path).is_absolute() {
+        std::path::PathBuf::from(path)
+    } else {
+        cwd.join(path)
+    };
+    match absolute.strip_prefix(cwd) {
+        Ok(relative) if !relative.as_os_str().is_empty() => relative.to_string_lossy().into_owned(),
+        _ => format_display_path(&absolute.to_string_lossy()),
+    }
+}
+
+/// Wire string of an [`AgentThinkingLevel`] (serde camelCase names).
+fn agent_thinking_level_str(level: AgentThinkingLevel) -> &'static str {
+    match level {
+        AgentThinkingLevel::Off => "off",
+        AgentThinkingLevel::Minimal => "minimal",
+        AgentThinkingLevel::Low => "low",
+        AgentThinkingLevel::Medium => "medium",
+        AgentThinkingLevel::High => "high",
+        AgentThinkingLevel::Xhigh => "xhigh",
+        AgentThinkingLevel::Max => "max",
     }
 }

@@ -715,6 +715,11 @@ impl AgentSession {
     pub fn skills(&self) -> Vec<Skill> {
         self.inner.state.lock().skills.clone()
     }
+    /// Loaded project context files (oracle `resourceLoader.getAgentsFiles`
+    /// surface as carried by the session config).
+    pub fn context_files(&self) -> Vec<ContextFile> {
+        self.inner.state.lock().context_files.clone()
+    }
 
     /// Run a closure with the session manager (read-only access patterns).
     pub fn with_session_manager<R>(&self, f: impl FnOnce(&SessionManager) -> R) -> R {

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use pi_agent::StreamFn;
+use pi_agent::{AgentThinkingLevel, StreamFn};
 use pi_ai::{
     AssistantMessage, AssistantMessageEvent, Content, Message, StopReason, TextContent, ToolCall,
     UserContent,
@@ -15,6 +15,8 @@ use pi_coding_agent::modes::interactive::dispatch::{
 use pi_coding_agent::modes::interactive::interactive_mode::{
     InteractiveMode, InteractiveModeOptions,
 };
+use pi_coding_agent::session::{PromptTemplate, ScopedModel};
+use pi_coding_agent::system_prompt::Skill;
 use pi_coding_agent::{ExtensionBridge, RegisteredCommand, SourceInfo};
 
 use common::vt_terminal::{VtHandle, VtTerminal};
@@ -1377,7 +1379,10 @@ async fn editor_history_recalls_in_memory_and_persists_nothing() {
         .collect();
     assert_eq!(
         user_texts,
-        vec!["alpha-one prompt".to_string(), "alpha-one prompt".to_string()],
+        vec![
+            "alpha-one prompt".to_string(),
+            "alpha-one prompt".to_string()
+        ],
         "Up-arrow recall must resubmit the in-memory history entry"
     );
 
@@ -1398,8 +1403,8 @@ async fn editor_history_recalls_in_memory_and_persists_nothing() {
 /// the first user message.
 #[tokio::test(flavor = "current_thread")]
 async fn initial_message_carries_initial_images_to_the_provider() {
-    use std::collections::VecDeque;
     use parking_lot::Mutex;
+    use std::collections::VecDeque;
 
     let contexts: Arc<Mutex<Vec<pi_ai::Context>>> = Arc::new(Mutex::new(Vec::new()));
     let seed = make_runtime(TestRuntimeOptions {
@@ -1505,6 +1510,100 @@ async fn migrated_providers_show_startup_warning() {
     assert!(screen.contains("Migrated credentials to auth.json: anthropic, openai"));
 }
 
+/// Oracle `verbose || !quietStartup`: quiet mode hides the startup header,
+/// model-scope line, and resource sections; `--verbose` reveals all three
+/// and expands resource entries to their source paths.
+#[tokio::test(flavor = "current_thread")]
+async fn verbose_overrides_quiet_startup_and_expands_resources() {
+    let resources = || {
+        (
+            Skill {
+                name: "demo-skill".to_string(),
+                description: "demo".to_string(),
+                file_path: PathBuf::from("/tmp/resources/demo-skill/SKILL.md"),
+                base_dir: PathBuf::from("/tmp/resources/demo-skill"),
+                ..Default::default()
+            },
+            PromptTemplate {
+                name: "hello".to_string(),
+                description: "hello prompt".to_string(),
+                argument_hint: None,
+                content: "hello".to_string(),
+                file_path: PathBuf::from("/tmp/resources/prompts/hello.md"),
+                source_info: Default::default(),
+            },
+        )
+    };
+
+    let (skill, prompt) = resources();
+    let quiet = make_runtime(TestRuntimeOptions {
+        global_settings: Some(serde_json::json!({ "quietStartup": true })),
+        skills: vec![skill],
+        prompt_templates: vec![prompt],
+        ..Default::default()
+    })
+    .await;
+    quiet.runtime.session().set_scoped_models(vec![ScopedModel {
+        model: quiet.model.clone(),
+        thinking_level: Some(AgentThinkingLevel::Low),
+    }]);
+    let (terminal, handle) = VtTerminal::new(120, 40);
+    let mut mode = InteractiveMode::new(
+        quiet.runtime.clone(),
+        terminal,
+        InteractiveModeOptions::default(),
+    );
+    mode.init();
+    mode.pump();
+    let quiet_screen = handle.screen(|screen| screen.serialize());
+    assert!(!quiet_screen.contains("pi v0.80.7"), "{quiet_screen}");
+    assert!(!quiet_screen.contains("Model scope:"), "{quiet_screen}");
+    assert!(!quiet_screen.contains("[Skills]"), "{quiet_screen}");
+    assert!(!quiet_screen.contains("[Prompts]"), "{quiet_screen}");
+
+    let (skill, prompt) = resources();
+    let verbose = make_runtime(TestRuntimeOptions {
+        global_settings: Some(serde_json::json!({ "quietStartup": true })),
+        skills: vec![skill],
+        prompt_templates: vec![prompt],
+        ..Default::default()
+    })
+    .await;
+    verbose
+        .runtime
+        .session()
+        .set_scoped_models(vec![ScopedModel {
+            model: verbose.model.clone(),
+            thinking_level: Some(AgentThinkingLevel::Low),
+        }]);
+    let (terminal, handle) = VtTerminal::new(120, 40);
+    let mut mode = InteractiveMode::new(
+        verbose.runtime.clone(),
+        terminal,
+        InteractiveModeOptions {
+            verbose: true,
+            ..Default::default()
+        },
+    );
+    mode.init();
+    let verbose_screen = pump_until(&mut mode, &handle, Duration::from_secs(2), |screen| {
+        screen.contains("pi v0.80.7")
+            && screen.contains("Model scope:")
+            && screen.contains("[Skills]")
+            && screen.contains("[Prompts]")
+    })
+    .await;
+    assert!(
+        verbose_screen.contains("~/")
+            || verbose_screen.contains("/tmp/resources/demo-skill/SKILL.md"),
+        "verbose skill listing must show its source path:\n{verbose_screen}"
+    );
+    assert!(
+        verbose_screen.contains("/tmp/resources/prompts/hello.md"),
+        "verbose prompt listing must show its source path:\n{verbose_screen}"
+    );
+}
+
 /// Oracle `maybeSaveImplicitProjectTrustAfterReload` (interactive-mode.ts:
 /// 4378-4402): a cwd implicitly trusted at startup that gained a `.pi`
 /// directory during the session gets its trust persisted by the first
@@ -1562,13 +1661,18 @@ async fn reload_persists_implicit_project_trust_once() {
     send(&mut mode, &handle, "/reload");
     send(&mut mode, &handle, "\r");
     let screen = pump_until(&mut mode, &handle, Duration::from_secs(5), |screen| {
-        screen.contains("Reloaded keybindings, extensions, skills, prompts, themes, and context files")
-            && !screen.contains("; saved project trust")
+        screen.contains(
+            "Reloaded keybindings, extensions, skills, prompts, themes, and context files",
+        ) && !screen.contains("; saved project trust")
     })
     .await;
     assert!(!screen.contains("; saved project trust"), "{screen}");
-    let trust_json_after = std::fs::read_to_string(agent_dir.join("trust.json")).expect("trust.json");
-    assert_eq!(trust_json, trust_json_after, "second reload must not rewrite trust.json");
+    let trust_json_after =
+        std::fs::read_to_string(agent_dir.join("trust.json")).expect("trust.json");
+    assert_eq!(
+        trust_json, trust_json_after,
+        "second reload must not rewrite trust.json"
+    );
 }
 
 /// Without `autoTrustOnReloadCwd` (explicit override or trust-requiring
@@ -1596,7 +1700,9 @@ async fn reload_without_auto_trust_saves_nothing() {
     send(&mut mode, &handle, "/reload");
     send(&mut mode, &handle, "\r");
     let screen = pump_until(&mut mode, &handle, Duration::from_secs(5), |screen| {
-        screen.contains("Reloaded keybindings, extensions, skills, prompts, themes, and context files")
+        screen.contains(
+            "Reloaded keybindings, extensions, skills, prompts, themes, and context files",
+        )
     })
     .await;
     assert!(!screen.contains("; saved project trust"), "{screen}");

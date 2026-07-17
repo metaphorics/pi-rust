@@ -335,6 +335,33 @@ EOF
   # Interactive selector: reinstall the local package so a resource row
   # exists, open the TUI, toggle it off with Space, close with Esc.
   "$BIN" install "$WORK/local-pkg" >/dev/null 2>&1
+  # quietStartup suppresses the startup header/resources, while --verbose
+  # overrides it and expands resource entries to source paths.
+  python3 - "$AGENT/settings.json" <<'EOF'
+import json, sys
+path = sys.argv[1]
+with open(path, encoding="utf-8") as f:
+    settings = json.load(f)
+settings["quietStartup"] = True
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(settings, f, indent=2)
+    f.write("\n")
+EOF
+  tmux new-session -d -s pi-main-smoke -x 120 -y 80 \
+    "env PI_CODING_AGENT_DIR='$AGENT' PI_OFFLINE=1 '$BIN' --verbose --no-session"
+  sleep 2
+  verbose_pane=$(tmux capture-pane -t pi-main-smoke -p 2>/dev/null)
+  check_contains "verbose overrides quietStartup header" "pi v0.80.7" "$verbose_pane"
+  check_contains "verbose overrides quietStartup resources" "[Skills]" "$verbose_pane"
+  check_contains "verbose expands resource paths" "SKILL.md" "$verbose_pane"
+  tmux kill-session -t pi-main-smoke 2>/dev/null
+  tmux new-session -d -s pi-main-smoke -x 120 -y 40 \
+    "env PI_CODING_AGENT_DIR='$AGENT' PI_OFFLINE=1 '$BIN' --no-session"
+  sleep 2
+  quiet_pane=$(tmux capture-pane -t pi-main-smoke -p 2>/dev/null)
+  check_not_contains "quietStartup hides header" "pi v0.80.7" "$quiet_pane"
+  check_not_contains "quietStartup hides resources" "[Skills]" "$quiet_pane"
+  tmux kill-session -t pi-main-smoke 2>/dev/null
   tmux kill-session -t pi-config-smoke 2>/dev/null
   tmux new-session -d -s pi-config-smoke -x 100 -y 30 \
     "env PI_CODING_AGENT_DIR='$AGENT' PI_OFFLINE=1 '$BIN' config; echo config-exit=\$?; sleep 30"
