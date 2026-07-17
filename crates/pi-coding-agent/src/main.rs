@@ -808,15 +808,12 @@ async fn main() {
         std::process::exit(1);
     }
 
-    // Startup migrations (idempotent; main.ts:554).
+    // Startup migrations (idempotent; main.ts:554). Migrated providers
+    // surface as the interactive startup warning (interactive-mode.ts:
+    // 876-878); the oracle prints nothing for them in wire modes.
     let migration = run_migrations(&cwd);
     for warning in &migration.deprecation_warnings {
         eprintln_yellow(&format!("Warning: {warning}"));
-    }
-    for provider in &migration.migrated_auth_providers {
-        eprintln_yellow(&format!(
-            "Warning: migrated {provider} credentials to auth.json"
-        ));
     }
 
     let startup_settings = Arc::new(Mutex::new(SettingsManager::create(
@@ -1043,6 +1040,7 @@ async fn main() {
                     initial_message: initial.initial_message,
                     initial_images: initial.initial_images,
                     initial_messages: std::mem::take(&mut parsed.messages),
+                    migrated_providers: migration.migrated_auth_providers.clone(),
                     model_fallback_message: runtime.model_fallback_message(),
                     handle_signals: true,
                     ..Default::default()

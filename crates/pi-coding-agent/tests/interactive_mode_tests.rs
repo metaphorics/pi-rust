@@ -1478,3 +1478,29 @@ async fn initial_message_carries_initial_images_to_the_provider() {
         Content::Text(text) if text.text.to_string().contains("describe the attachment")
     )));
 }
+
+/// Oracle interactive-mode.ts:876-878: migrated credentials surface as a
+/// TUI startup warning with the exact oracle string.
+#[tokio::test(flavor = "current_thread")]
+async fn migrated_providers_show_startup_warning() {
+    let test = make_runtime(TestRuntimeOptions {
+        with_auth: true,
+        ..Default::default()
+    })
+    .await;
+    let (terminal, handle) = VtTerminal::new(100, 30);
+    let mut mode = InteractiveMode::new(
+        test.runtime.clone(),
+        terminal,
+        InteractiveModeOptions {
+            migrated_providers: vec!["anthropic".to_string(), "openai".to_string()],
+            ..Default::default()
+        },
+    );
+    mode.init();
+    let screen = pump_until(&mut mode, &handle, Duration::from_secs(2), |screen| {
+        screen.contains("Migrated credentials to auth.json: anthropic, openai")
+    })
+    .await;
+    assert!(screen.contains("Migrated credentials to auth.json: anthropic, openai"));
+}

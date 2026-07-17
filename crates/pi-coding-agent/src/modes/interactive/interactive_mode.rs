@@ -120,6 +120,9 @@ pub struct InteractiveModeOptions {
     /// only with the initial message, interactive-mode.ts:892-894).
     pub initial_images: Vec<pi_ai::ImageContent>,
     pub initial_messages: Vec<String>,
+    /// Providers whose credentials were migrated to auth.json (oracle
+    /// `migratedProviders`; startup warning, interactive-mode.ts:876-878).
+    pub migrated_providers: Vec<String>,
     pub model_fallback_message: Option<String>,
     /// Install SIGTERM/SIGHUP handlers (binary entry points only).
     pub handle_signals: bool,
@@ -838,6 +841,15 @@ impl InteractiveMode {
         self.update_editor_border_color();
         self.update_terminal_title();
         self.render_current_session_state();
+        // Startup warnings in oracle order (interactive-mode.ts:874-887):
+        // migrated providers, then the model fallback.
+        let migrated = std::mem::take(&mut self.options.migrated_providers);
+        if !migrated.is_empty() {
+            self.show_warning(&format!(
+                "Migrated credentials to auth.json: {}",
+                migrated.join(", ")
+            ));
+        }
         if let Some(fallback) = self.options.model_fallback_message.take() {
             self.show_warning(&fallback);
         }
