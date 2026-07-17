@@ -915,7 +915,9 @@ async fn replacements_emit_shutdown_then_start_with_previous_file() {
         .expect("do-switch");
     assert_eq!(fx.session().session_file().as_deref(), Some(f0.as_path()));
 
-    fx.execute_command("do-fork", &user_id).await.expect("do-fork");
+    fx.execute_command("do-fork", &user_id)
+        .await
+        .expect("do-fork");
     let f2 = fx.session().session_file().expect("fork file");
     assert_ne!(f2, f0, "fork replaced the session");
 

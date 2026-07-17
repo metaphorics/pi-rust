@@ -15,8 +15,8 @@ use common::{
 };
 use parking_lot::Mutex;
 use pi_coding_agent::extension_bridge::UiDialogOptions;
-use pi_coding_agent::rpc_export_html_handler;
 use pi_coding_agent::modes::rpc::{RpcModeOptions, run_rpc_mode_with_io};
+use pi_coding_agent::rpc_export_html_handler;
 use pi_coding_agent::session::PromptTemplate;
 use pi_coding_agent::source_info::{SourceInfo, SourceScope};
 use pi_coding_agent::system_prompt::Skill;

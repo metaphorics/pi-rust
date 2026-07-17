@@ -1319,7 +1319,10 @@ async fn runtime_switch_new_and_fork_replace_sessions() {
     );
 
     // new_session replaces with a fresh persisted session.
-    let fresh = runtime.new_session(None, &never).await.expect("new session");
+    let fresh = runtime
+        .new_session(None, &never)
+        .await
+        .expect("new session");
     assert!(!fresh.cancelled);
     assert_ne!(runtime.session().session_id(), branched.session_id());
     assert_eq!(

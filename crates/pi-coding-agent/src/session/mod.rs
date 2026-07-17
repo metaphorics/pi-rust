@@ -728,10 +728,7 @@ impl AgentSession {
 
     /// Run a closure with mutable session-manager access (runtime fork path,
     /// extension `appendEntry`/`setLabel` bindings, test seeding).
-    pub fn with_session_manager_mut<R>(
-        &self,
-        f: impl FnOnce(&mut SessionManager) -> R,
-    ) -> R {
+    pub fn with_session_manager_mut<R>(&self, f: impl FnOnce(&mut SessionManager) -> R) -> R {
         f(&mut self.inner.state.lock().session_manager)
     }
 
@@ -4006,7 +4003,10 @@ impl AgentSession {
                 .into_iter()
                 .filter_map(value_to_agent_message)
                 .collect();
-            (estimate_context_tokens(&state.messages).tokens, compaction_entry)
+            (
+                estimate_context_tokens(&state.messages).tokens,
+                compaction_entry,
+            )
         };
         result.estimated_tokens_after = Some(estimated_tokens_after);
 
@@ -4288,7 +4288,10 @@ impl AgentSession {
                 .into_iter()
                 .filter_map(value_to_agent_message)
                 .collect();
-            (estimate_context_tokens(&state.messages).tokens, compaction_entry)
+            (
+                estimate_context_tokens(&state.messages).tokens,
+                compaction_entry,
+            )
         };
         result.estimated_tokens_after = Some(estimated_tokens_after);
 

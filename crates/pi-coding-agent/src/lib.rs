@@ -5,8 +5,8 @@
 pub mod auth_storage;
 pub mod cli;
 pub mod config;
-pub mod extension_bridge;
 pub mod export_html;
+pub mod extension_bridge;
 pub mod extensions;
 pub mod migrations;
 pub mod model_registry;
@@ -40,29 +40,29 @@ pub use config::{
     env_session_dir_key, get_agent_dir, get_auth_path, get_default_session_dir_path,
     get_package_dir, get_sessions_dir, get_settings_path,
 };
+pub use export_html::{
+    ExportHtmlOptions, RenderedToolResult, ToolHtmlRenderer, export_session_file_to_html,
+    export_session_to_html, rpc_export_html_handler,
+};
 pub use extension_bridge::{
-    BeforeCompactDecision, CompactHooks, CompactionOverride, DiscoveredExtensions,
-    ExtensionBridge, ExtensionUiHost, ForkPosition, HookOutcome, NoopExtensionBridge, NotifyType,
-    RegisteredCommand, SessionLifecycleEvent, SessionShutdownReason, SessionStartReason,
-    UiDialogOptions, WidgetPlacement,
+    BeforeCompactDecision, CompactHooks, CompactionOverride, DiscoveredExtensions, ExtensionBridge,
+    ExtensionUiHost, ForkPosition, HookOutcome, NoopExtensionBridge, NotifyType, RegisteredCommand,
+    SessionLifecycleEvent, SessionShutdownReason, SessionStartReason, UiDialogOptions,
+    WidgetPlacement,
 };
 pub use extensions::actions::{ActionServerConfig, HostActions, NotificationSink};
 pub use extensions::binding::{
     BindOptions, ExtensionBinding, SessionHostActions, SidecarBridge, bind_extensions,
 };
 pub use extensions::events::{
-    DEFAULT_HOOK_TIMEOUT, EmitError, EventForwarder, ExtensionErrorSink, StateOverlay,
-    StateSource, agent_thinking_level, session_state_block, wire_thinking_level,
+    DEFAULT_HOOK_TIMEOUT, EmitError, EventForwarder, ExtensionErrorSink, StateOverlay, StateSource,
+    agent_thinking_level, session_state_block, wire_thinking_level,
 };
 pub use extensions::session_sync::{SessionSync, session_file_string};
 pub use extensions::{
     BridgeState, BunEnvironment, ClientConfig, ClientError, DeadReason, DisabledReason,
     ExtensionHost, ExtensionHostConfig, ExtensionPathError, HostError, Incoming, LauncherSource,
     LoadOutcome, SidecarConnection, SidecarLauncher, SidecarTimeouts,
-};
-pub use export_html::{
-    ExportHtmlOptions, RenderedToolResult, ToolHtmlRenderer, export_session_file_to_html,
-    export_session_to_html, rpc_export_html_handler,
 };
 pub use migrations::{MigrationResult, run_migrations, run_migrations_with_agent_dir};
 pub use package_manager::{

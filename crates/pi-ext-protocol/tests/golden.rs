@@ -4,8 +4,7 @@ use std::path::Path;
 
 use pi_ext_protocol::{
     Envelope, GetAllThemesResult, GetThemeResult, ResponseResult, TerminalInputResult,
-    ToolExecuteResult,
-    decode_frame, encode_frame,
+    ToolExecuteResult, decode_frame, encode_frame,
 };
 use serde::de::DeserializeOwned;
 use serde_json::Value;
