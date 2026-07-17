@@ -126,6 +126,9 @@ pub struct InteractiveModeOptions {
     /// The default ignores SIGINT, sends SIGTSTP to the process group, and
     /// restores SIGINT after SIGCONT resumes execution.
     pub suspend_signal: Option<Rc<dyn Fn()>>,
+    /// Persist editor prompt history to this file (`~/.pi/agent/
+    /// history.jsonl`); loaded on init, appended on each submission.
+    pub history_path: Option<std::path::PathBuf>,
 }
 
 // ============================================================================
@@ -832,6 +835,13 @@ impl InteractiveMode {
             return;
         }
         self.initialized = true;
+        if let Some(history_path) = &self.options.history_path {
+            let entries = crate::cli::history::load_history(history_path);
+            let mut editor = self.editor.borrow_mut();
+            for entry in &entries {
+                editor.add_to_history(entry);
+            }
+        }
         self.update_editor_border_color();
         self.update_terminal_title();
         self.render_current_session_state();
@@ -1535,7 +1545,7 @@ impl InteractiveMode {
             DispatchAction::Nothing => {}
             DispatchAction::Builtin(command) => self.execute_builtin(command),
             DispatchAction::Bash { command, excluded } => {
-                self.editor.borrow_mut().add_to_history(text.trim());
+                self.record_history(text.trim());
                 self.editor.borrow_mut().set_text("");
                 self.handle_bash_command(command, excluded);
                 self.is_bash_mode = false;
@@ -1548,7 +1558,7 @@ impl InteractiveMode {
                 self.editor.borrow_mut().set_text(&original_text);
             }
             DispatchAction::ExtensionDuringCompaction { text } => {
-                self.editor.borrow_mut().add_to_history(&text);
+                self.record_history(&text);
                 self.editor.borrow_mut().set_text("");
                 self.spawn_prompt(text);
             }
@@ -1556,7 +1566,7 @@ impl InteractiveMode {
                 self.queue_compaction_message(text, StreamingBehavior::Steer);
             }
             DispatchAction::SteerStreaming { text } => {
-                self.editor.borrow_mut().add_to_history(&text);
+                self.record_history(&text);
                 self.editor.borrow_mut().set_text("");
                 let session = self.session.clone();
                 self.ops.push(Box::pin(async move {
@@ -1576,7 +1586,7 @@ impl InteractiveMode {
                 self.tui.request_render(false);
             }
             DispatchAction::Prompt { text } => {
-                self.editor.borrow_mut().add_to_history(&text);
+                self.record_history(&text);
                 self.editor.borrow_mut().set_text("");
                 self.spawn_prompt(text);
             }
@@ -3222,11 +3232,7 @@ impl InteractiveMode {
             let signal = CancellationToken::new();
             OpOutcome::NewSessionCreated(
                 runtime
-                    .fork(
-                        &leaf,
-                        crate::extension_bridge::ForkPosition::At,
-                        &signal,
-                    )
+                    .fork(&leaf, crate::extension_bridge::ForkPosition::At, &signal)
                     .await,
             )
         }));
@@ -3294,7 +3300,7 @@ impl InteractiveMode {
         // immediately, oracle :3677-3686).
         if self.session.is_compacting() {
             if self.dispatch_context().is_extension_command(&text) {
-                self.editor.borrow_mut().add_to_history(&text);
+                self.record_history(&text);
                 self.editor.borrow_mut().set_text("");
                 self.spawn_prompt(text);
             } else {
@@ -3304,7 +3310,7 @@ impl InteractiveMode {
         }
         // Streaming: queue a follow-up message (oracle :3690-3696).
         if self.session.is_streaming() {
-            self.editor.borrow_mut().add_to_history(&text);
+            self.record_history(&text);
             self.editor.borrow_mut().set_text("");
             self.session.follow_up(&text, Vec::new());
             self.update_pending_messages_display();
@@ -3768,8 +3774,18 @@ impl InteractiveMode {
         }));
     }
 
+    /// Editor history for a genuine user submission: in-memory (Up-arrow)
+    /// plus persistent history.jsonl. Session-replay population
+    /// (`render_session_entries`) deliberately stays in-memory only.
+    fn record_history(&self, text: &str) {
+        self.editor.borrow_mut().add_to_history(text);
+        if let Some(path) = &self.options.history_path {
+            crate::cli::history::append_history(path, text);
+        }
+    }
+
     fn queue_compaction_message(&mut self, text: String, mode: StreamingBehavior) {
-        self.editor.borrow_mut().add_to_history(&text);
+        self.record_history(&text);
         self.editor.borrow_mut().set_text("");
         self.compaction_queued
             .push(CompactionQueuedMessage { text, mode });
