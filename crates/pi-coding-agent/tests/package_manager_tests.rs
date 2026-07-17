@@ -845,7 +845,9 @@ fn cli_parser_preserves_aliases_conflicts_and_help() {
 /// stops parsing, non-`config` argv is not a config invocation.
 #[test]
 fn config_parser_matches_oracle_precedence() {
-    use pi_coding_agent::{get_config_command_help, get_config_command_usage, parse_config_command};
+    use pi_coding_agent::{
+        get_config_command_help, get_config_command_usage, parse_config_command,
+    };
 
     assert!(parse_config_command(&["install", "x"]).is_none());
     assert!(parse_config_command(&[] as &[&str]).is_none());
