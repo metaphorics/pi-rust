@@ -132,6 +132,18 @@ pub struct InteractiveModeOptions {
     /// The default ignores SIGINT, sends SIGTSTP to the process group, and
     /// restores SIGINT after SIGCONT resumes execution.
     pub suspend_signal: Option<Rc<dyn Fn()>>,
+    /// Cwd to trust after `/reload` if it gained a `.pi` directory during
+    /// this implicitly trusted session (oracle `autoTrustOnReloadCwd`).
+    pub auto_trust_on_reload_cwd: Option<std::path::PathBuf>,
+    /// Extension-aware runtime reload (P6 attach point): when a sidecar
+    /// binding is attached this runs the full `SessionHostActions::reload`
+    /// (forwarder reload + rebind + session_start(reload)); without it
+    /// `/reload` recreates the runtime extension-less via
+    /// [`AgentSessionRuntime::reload_session`].
+    #[allow(clippy::type_complexity)]
+    pub reload_runtime: Option<
+        Rc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<(), String>> + 'static>> + 'static>,
+    >,
 }
 
 // ============================================================================
@@ -439,6 +451,7 @@ enum OpOutcome {
     NewSessionCreated(Result<crate::session::runtime::ReplaceResult, String>),
     ForkFinished(Result<crate::session::runtime::ReplaceResult, String>),
     TreeNavigated(Result<crate::session::NavigateTreeResult, String>),
+    ReloadFinished(Result<(), String>),
     FlushQueuePromptFailed(String),
     AnthropicKeyChecked(Option<String>),
     AuthChanged {
@@ -557,6 +570,11 @@ pub struct InteractiveMode {
     last_sigint_time: Option<Instant>,
     last_escape_time: Option<Instant>,
     anthropic_subscription_warning_shown: bool,
+    /// Oracle `autoTrustOnReloadCwd` (copied from options; cleared once
+    /// consumed or once a saved decision exists).
+    auto_trust_on_reload_cwd: Option<std::path::PathBuf>,
+    /// True while a `/reload` runtime replacement op is pending.
+    reload_in_flight: bool,
     /// Monotonic time source (defaults to `Instant::now`).
     now: Rc<dyn Fn() -> Instant>,
     /// Ctrl+Z process-stop step (see `InteractiveModeOptions::suspend_signal`).
@@ -806,6 +824,8 @@ impl InteractiveMode {
             last_sigint_time: None,
             last_escape_time: None,
             anthropic_subscription_warning_shown: false,
+            auto_trust_on_reload_cwd: options.auto_trust_on_reload_cwd.clone(),
+            reload_in_flight: false,
             now: clock,
             suspend_signal,
             is_bash_mode: false,
@@ -2277,6 +2297,7 @@ impl InteractiveMode {
                     Err(error) => self.show_error(&format!("Logout failed: {error}")),
                 }
             }
+            OpOutcome::ReloadFinished(result) => self.finish_reload(result),
             OpOutcome::FlushQueuePromptFailed(error) => {
                 self.show_error(&error);
             }
@@ -3690,7 +3711,45 @@ impl InteractiveMode {
         self.show_error("Share failed: HTML export is not available in this build");
     }
 
+    /// Oracle `handleReloadCommand` (interactive-mode.ts:5279-5381): guard
+    /// against active work, recreate the runtime (settings, resources,
+    /// models, context files re-resolve through the runtime factory), then
+    /// refresh UI state and persist implicit project trust when eligible.
     fn handle_reload_command(&mut self) {
+        if self.session.is_streaming() {
+            self.show_warning("Wait for the current response to finish before reloading.");
+            return;
+        }
+        if self.session.is_compacting() {
+            self.show_warning("Wait for compaction to finish before reloading.");
+            return;
+        }
+        // One reload at a time: slash-command Enter can dispatch twice in
+        // one pump (autocomplete accept + plain submit); a second
+        // concurrent runtime teardown must never start.
+        if self.reload_in_flight {
+            return;
+        }
+        self.reload_in_flight = true;
+        if let Some(reload_runtime) = self.options.reload_runtime.clone() {
+            self.ops.push(Box::pin(async move {
+                OpOutcome::ReloadFinished(reload_runtime().await)
+            }));
+            return;
+        }
+        let runtime = self.runtime.clone();
+        self.ops.push(Box::pin(async move {
+            OpOutcome::ReloadFinished(runtime.reload_session(async { Ok(()) }).await)
+        }));
+    }
+
+    /// Completion of the async `/reload` (oracle handleReloadCommand tail).
+    fn finish_reload(&mut self, result: Result<(), String>) {
+        self.reload_in_flight = false;
+        if let Err(error) = result {
+            self.show_error(&format!("Reload failed: {error}"));
+            return;
+        }
         let services = self.runtime.services();
         set_keybindings(create_app_keybindings(&services.agent_dir));
         let theme_setting = {
@@ -3700,9 +3759,63 @@ impl InteractiveMode {
         if let Some(name) = theme_setting {
             let _ = set_theme(&name, false);
         }
+        self.rebind_session();
+        let saved_implicit_project_trust = self.maybe_save_implicit_project_trust_after_reload();
         self.tui.invalidate();
-        self.show_status("Reloaded keybindings and themes");
+        self.show_status(if saved_implicit_project_trust {
+            "Reloaded keybindings, extensions, skills, prompts, themes, and context files; saved project trust"
+        } else {
+            "Reloaded keybindings, extensions, skills, prompts, themes, and context files"
+        });
         self.tui.request_render(false);
+    }
+
+    /// Oracle `maybeSaveImplicitProjectTrustAfterReload` (interactive-mode.
+    /// ts:4378-4402): a cwd implicitly trusted at startup (no trust-
+    /// requiring resources then) that gained them during the session gets
+    /// its trust persisted after the first reload that loads them.
+    fn maybe_save_implicit_project_trust_after_reload(&mut self) -> bool {
+        let cwd = self.session.cwd().to_path_buf();
+        if self.auto_trust_on_reload_cwd.as_deref() != Some(cwd.as_path()) {
+            return false;
+        }
+        let services = self.runtime.services();
+        if !services.settings_manager.lock().is_project_trusted()
+            || !super::trust_store::has_trust_requiring_project_resources(&cwd)
+        {
+            return false;
+        }
+        let store = super::trust_store::ProjectTrustStore::new(&services.agent_dir);
+        match store.get_entry(&cwd) {
+            Ok(Some(_)) => {
+                self.auto_trust_on_reload_cwd = None;
+                false
+            }
+            Ok(None) => {
+                let update = super::components::trust_selector::ProjectTrustUpdate {
+                    path: cwd.display().to_string(),
+                    decision: Some(true),
+                };
+                match store.set_many(&[update]) {
+                    Ok(()) => {
+                        self.auto_trust_on_reload_cwd = None;
+                        true
+                    }
+                    Err(error) => {
+                        self.show_warning(&format!(
+                            "Could not save project trust after reload: {error}"
+                        ));
+                        false
+                    }
+                }
+            }
+            Err(error) => {
+                self.show_warning(&format!(
+                    "Could not save project trust after reload: {error}"
+                ));
+                false
+            }
+        }
     }
 
     fn handle_debug_command(&mut self) {

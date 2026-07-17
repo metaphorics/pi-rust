@@ -1504,3 +1504,104 @@ async fn migrated_providers_show_startup_warning() {
     .await;
     assert!(screen.contains("Migrated credentials to auth.json: anthropic, openai"));
 }
+
+/// Oracle `maybeSaveImplicitProjectTrustAfterReload` (interactive-mode.ts:
+/// 4378-4402): a cwd implicitly trusted at startup that gained a `.pi`
+/// directory during the session gets its trust persisted by the first
+/// `/reload`; a second reload does not re-save.
+#[tokio::test(flavor = "multi_thread")]
+async fn reload_persists_implicit_project_trust_once() {
+    let test = make_runtime(TestRuntimeOptions {
+        with_auth: true,
+        ..Default::default()
+    })
+    .await;
+    let session = test.runtime.session();
+    let cwd = session.cwd().to_path_buf();
+    let agent_dir = test.runtime.services().agent_dir.clone();
+    let (terminal, handle) = VtTerminal::new(160, 30);
+    let mut mode = InteractiveMode::new(
+        test.runtime.clone(),
+        terminal,
+        InteractiveModeOptions {
+            auto_trust_on_reload_cwd: Some(cwd.clone()),
+            ..Default::default()
+        },
+    );
+    mode.init();
+
+    // The project gains trust-requiring resources mid-session.
+    std::fs::create_dir_all(cwd.join(".pi")).expect(".pi dir");
+    std::fs::write(cwd.join(".pi/settings.json"), "{}").expect("project settings");
+
+    send(&mut mode, &handle, "/reload");
+    send(&mut mode, &handle, "\r");
+    pump_until(&mut mode, &handle, Duration::from_secs(5), |screen| {
+        screen.contains(
+            "Reloaded keybindings, extensions, skills, prompts, themes, and context files; saved project trust",
+        )
+    })
+    .await;
+
+    let trust_json =
+        std::fs::read_to_string(agent_dir.join("trust.json")).expect("trust.json written");
+    let parsed: serde_json::Value = serde_json::from_str(&trust_json).expect("valid trust.json");
+    let canonical = cwd.canonicalize().unwrap_or(cwd.clone());
+    let entry = parsed
+        .get(canonical.to_string_lossy().as_ref())
+        .or_else(|| parsed.get(cwd.to_string_lossy().as_ref()));
+    assert_eq!(
+        entry.and_then(serde_json::Value::as_bool),
+        Some(true),
+        "trust.json must record the cwd as trusted: {trust_json}"
+    );
+
+    // Second reload: the saved decision short-circuits — the status is the
+    // plain string (it REPLACES the previous status) and trust.json is
+    // byte-identical.
+    send(&mut mode, &handle, "/reload");
+    send(&mut mode, &handle, "\r");
+    let screen = pump_until(&mut mode, &handle, Duration::from_secs(5), |screen| {
+        screen.contains("Reloaded keybindings, extensions, skills, prompts, themes, and context files")
+            && !screen.contains("; saved project trust")
+    })
+    .await;
+    assert!(!screen.contains("; saved project trust"), "{screen}");
+    let trust_json_after = std::fs::read_to_string(agent_dir.join("trust.json")).expect("trust.json");
+    assert_eq!(trust_json, trust_json_after, "second reload must not rewrite trust.json");
+}
+
+/// Without `autoTrustOnReloadCwd` (explicit override or trust-requiring
+/// resources present at startup) `/reload` never writes trust.json.
+#[tokio::test(flavor = "multi_thread")]
+async fn reload_without_auto_trust_saves_nothing() {
+    let test = make_runtime(TestRuntimeOptions {
+        with_auth: true,
+        ..Default::default()
+    })
+    .await;
+    let session = test.runtime.session();
+    let cwd = session.cwd().to_path_buf();
+    let agent_dir = test.runtime.services().agent_dir.clone();
+    let (terminal, handle) = VtTerminal::new(100, 30);
+    let mut mode = InteractiveMode::new(
+        test.runtime.clone(),
+        terminal,
+        InteractiveModeOptions::default(),
+    );
+    mode.init();
+    std::fs::create_dir_all(cwd.join(".pi")).expect(".pi dir");
+    std::fs::write(cwd.join(".pi/settings.json"), "{}").expect("project settings");
+
+    send(&mut mode, &handle, "/reload");
+    send(&mut mode, &handle, "\r");
+    let screen = pump_until(&mut mode, &handle, Duration::from_secs(5), |screen| {
+        screen.contains("Reloaded keybindings, extensions, skills, prompts, themes, and context files")
+    })
+    .await;
+    assert!(!screen.contains("; saved project trust"), "{screen}");
+    assert!(
+        !agent_dir.join("trust.json").exists(),
+        "no implicit trust may be persisted without autoTrustOnReloadCwd"
+    );
+}

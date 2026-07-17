@@ -31,6 +31,7 @@ use pi_coding_agent::export_html::{
 };
 use pi_coding_agent::extension_bridge::{NoopExtensionBridge, SessionStartReason};
 use pi_coding_agent::extensions::LauncherSource;
+use pi_coding_agent::extensions::actions::HostActions;
 use pi_coding_agent::extensions::binding::{
     BindOptions, ExtensionBinding, SessionHostActions, bind_extensions,
 };
@@ -39,7 +40,9 @@ use pi_coding_agent::modes::interactive::interactive_mode::{
     InteractiveMode, InteractiveModeOptions,
 };
 use pi_coding_agent::modes::interactive::theme::init_theme;
-use pi_coding_agent::modes::interactive::trust_store::ProjectTrustStore;
+use pi_coding_agent::modes::interactive::trust_store::{
+    ProjectTrustStore, has_trust_requiring_project_resources,
+};
 use pi_coding_agent::modes::print::{PrintModeOptions, PrintOutputMode, run_print_mode};
 use pi_coding_agent::modes::rpc::{RpcModeOptions, run_rpc_mode};
 use pi_coding_agent::resource_loader::{ResourceLoaderOptions, load_prompt_templates, load_skills};
@@ -108,30 +111,6 @@ fn report_runtime_diagnostics(diagnostics: &[RuntimeDiagnostic]) {
                 eprintln_yellow(&format!("Warning: {}", diagnostic.message));
             }
             DiagnosticLevel::Info => eprintln!("\x1b[2m{}\x1b[22m", diagnostic.message),
-        }
-    }
-}
-
-/// Oracle `hasTrustRequiringProjectResources` (trust-manager.ts:184-206).
-fn has_trust_requiring_project_resources(cwd: &Path) -> bool {
-    const TRUST_REQUIRING: [&str; 5] =
-        ["settings.json", "extensions", "skills", "prompts", "themes"];
-    let config_dir = cwd.join(pi_coding_agent::config::CONFIG_DIR_NAME);
-    if TRUST_REQUIRING
-        .iter()
-        .any(|entry| config_dir.join(entry).exists())
-    {
-        return true;
-    }
-    let user_agents_skills = dirs::home_dir().map(|home| home.join(".agents").join("skills"));
-    let mut current = cwd.to_path_buf();
-    loop {
-        let agents_skills = current.join(".agents").join("skills");
-        if Some(&agents_skills) != user_agents_skills.as_ref() && agents_skills.exists() {
-            return true;
-        }
-        if !current.pop() {
-            return false;
         }
     }
 }
@@ -370,6 +349,10 @@ struct FactoryConfig {
     default_project_trust: String,
     interactive_trust_prompt: bool,
     startup_settings: Arc<Mutex<SettingsManager>>,
+    /// Oracle `projectTrustByCwd` (main.ts:608): later runtimes for the
+    /// same cwd (reload, /new, fork) reuse the resolved decision and never
+    /// re-prompt.
+    project_trust_by_cwd: Mutex<std::collections::HashMap<PathBuf, bool>>,
 }
 
 fn build_runtime_factory(
@@ -384,16 +367,34 @@ fn build_runtime_factory(
             let cwd = options.cwd.clone();
             let agent_dir = options.agent_dir.clone();
 
-            // Project trust before any project resource loads.
-            let trusted = resolve_project_trusted(
-                &cwd,
-                &agent_dir,
-                parsed.project_trust_override,
-                &config.default_project_trust,
-                config
-                    .interactive_trust_prompt
-                    .then_some(&config.startup_settings),
-            );
+            // Project trust before any project resource loads. Oracle
+            // main.ts:622-632: the interactive prompt is reserved for the
+            // INITIAL runtime; reload/new/fork reuse the cached decision or
+            // fall back to override → saved store → not-required.
+            // Cache key = resolve_path form (services normalize cwd the same
+            // way, so startup and reload hit the same entry).
+            let cwd = pi_coding_agent::config::resolve_path(&cwd.to_string_lossy(), None);
+            let cached = config.project_trust_by_cwd.lock().get(&cwd).copied();
+            let trusted = match cached {
+                Some(trusted) => trusted,
+                None => {
+                    let prompt_ui = (config.interactive_trust_prompt
+                        && options.session_start_reason == SessionStartReason::Startup)
+                        .then_some(&config.startup_settings);
+                    let trusted = resolve_project_trusted(
+                        &cwd,
+                        &agent_dir,
+                        parsed.project_trust_override,
+                        &config.default_project_trust,
+                        prompt_ui,
+                    );
+                    config
+                        .project_trust_by_cwd
+                        .lock()
+                        .insert(cwd.clone(), trusted);
+                    trusted
+                }
+            };
             let mut settings = SettingsManager::create(&cwd, Some(agent_dir.clone()));
             settings.set_project_trusted(trusted);
             let settings = Arc::new(Mutex::new(settings));
@@ -626,7 +627,7 @@ async fn bind_extensions_for_mode(
     app_mode: AppMode,
     cwd: &Path,
     agent_dir: &Path,
-) -> Option<Arc<ExtensionBinding>> {
+) -> Option<(Arc<ExtensionBinding>, Arc<SessionHostActions>)> {
     let extension_paths = {
         let services = runtime.services();
         let loader = services.resource_loader.lock();
@@ -699,7 +700,7 @@ async fn bind_extensions_for_mode(
         eprintln_yellow("Hint: Start without extensions using \"pi -ne\".");
         return None;
     }
-    Some(binding)
+    Some((binding, actions))
 }
 
 #[tokio::main]
@@ -922,6 +923,14 @@ async fn main() {
     // Runtime factory + initial runtime (main.ts:614-745).
     let trust_prompt_interactive =
         app_mode == AppMode::Interactive && !parsed.help && parsed.list_models.is_none();
+    // Oracle main.ts:603-606: a session cwd without trust-requiring
+    // resources (and no explicit override) is implicitly trusted; if it
+    // gains a .pi directory during this session, the first /reload that
+    // loads it persists the trust.
+    let session_cwd = session_manager.get_cwd().to_path_buf();
+    let auto_trust_on_reload_cwd = (parsed.project_trust_override.is_none()
+        && !has_trust_requiring_project_resources(&session_cwd))
+    .then(|| session_cwd.clone());
     let default_project_trust = startup_settings
         .lock()
         .get_default_project_trust()
@@ -932,6 +941,7 @@ async fn main() {
         default_project_trust,
         interactive_trust_prompt: trust_prompt_interactive,
         startup_settings: startup_settings.clone(),
+        project_trust_by_cwd: Mutex::new(std::collections::HashMap::new()),
     });
     let factory = build_runtime_factory(factory_config, auth_storage.clone());
     let runtime = match AgentSessionRuntime::create(
@@ -1019,7 +1029,8 @@ async fn main() {
     }
 
     // Extension detection + bind (Phase 6 bind API; zero extensions ⇒ no Bun).
-    let binding = bind_extensions_for_mode(&runtime, &parsed, app_mode, &cwd, &agent_dir).await;
+    let bound = bind_extensions_for_mode(&runtime, &parsed, app_mode, &cwd, &agent_dir).await;
+    let binding = bound.as_ref().map(|(binding, _)| binding.clone());
 
     let exit_code = match app_mode {
         AppMode::Rpc => {
@@ -1042,6 +1053,24 @@ async fn main() {
                     initial_messages: std::mem::take(&mut parsed.messages),
                     migrated_providers: migration.migrated_auth_providers.clone(),
                     model_fallback_message: runtime.model_fallback_message(),
+                    auto_trust_on_reload_cwd,
+                    // Extension-aware /reload: the full SessionHostActions
+                    // reload (forwarder reload + rebind + session_start)
+                    // when a sidecar is bound.
+                    reload_runtime: bound.as_ref().map(|(_, actions)| {
+                        let actions = actions.clone();
+                        let reload: std::rc::Rc<
+                            dyn Fn() -> std::pin::Pin<
+                                Box<dyn Future<Output = Result<(), String>>>,
+                            >,
+                        > = std::rc::Rc::new(move || {
+                            Box::pin(HostActions::reload(
+                                &*actions,
+                                pi_agent::CancellationToken::new(),
+                            ))
+                        });
+                        reload
+                    }),
                     handle_signals: true,
                     ..Default::default()
                 },
