@@ -80,6 +80,9 @@ pub struct BindOptions {
     pub mode: ExtensionMode,
     pub has_ui: bool,
     pub flag_values: BTreeMap<String, FlagValue>,
+    /// Initial interactive grid, carried in lifecycle/init so UI factories
+    /// cannot observe the headless terminal's 80×24 default before resize.
+    pub terminal_size: Option<pi_ext_protocol::ResizeParams>,
     /// Mode-owned state-block fields, updated in place by the mode (theme,
     /// editor text, commands, footer, trust).
     pub overlay: Arc<parking_lot::Mutex<StateOverlay>>,
@@ -123,6 +126,7 @@ impl BindOptions {
             mode: ExtensionMode::Rpc,
             has_ui: false,
             flag_values: BTreeMap::new(),
+            terminal_size: None,
             overlay: Arc::new(parking_lot::Mutex::new(StateOverlay::default())),
             error_sink,
             actions,
@@ -142,6 +146,8 @@ pub struct ExtensionBinding {
     forwarder: Arc<EventForwarder>,
     shared: Arc<SharedSessionState>,
     config: Arc<ActionServerConfig>,
+    /// Live host grid replayed on sidecar respawn.
+    terminal_size: Arc<parking_lot::Mutex<Option<pi_ext_protocol::ResizeParams>>>,
     paths: Vec<PathBuf>,
     queue_task: JoinHandle<()>,
     server_task: JoinHandle<()>,
@@ -176,6 +182,7 @@ pub fn bind_extensions(
 
     let shared = Arc::new(SharedSessionState::new(session.clone()));
     let overlay = options.overlay.clone();
+    let terminal_size = Arc::new(parking_lot::Mutex::new(options.terminal_size));
     let state_source: StateSource = {
         let shared = shared.clone();
         let overlay = overlay.clone();
@@ -195,6 +202,7 @@ pub fn bind_extensions(
         let mode = options.mode;
         let has_ui = options.has_ui;
         let flag_values = options.flag_values.clone();
+        let init_terminal_size = terminal_size.clone();
         let overlay = overlay.clone();
         Arc::new(move || {
             // Hoisted on purpose: a guard temporary inside the struct
@@ -203,6 +211,7 @@ pub fn bind_extensions(
             let theme = overlay.lock().theme.clone();
             let session = shared.snapshot();
             let state = (state_source)();
+            let terminal_size = *init_terminal_size.lock();
             InitParams {
                 cwd: cwd.to_string_lossy().into_owned(),
                 agent_dir: agent_dir.to_string_lossy().into_owned(),
@@ -212,6 +221,7 @@ pub fn bind_extensions(
                 has_ui,
                 flag_values: flag_values.clone(),
                 theme,
+                terminal_size,
                 session,
                 state,
             }
@@ -309,6 +319,7 @@ pub fn bind_extensions(
         forwarder,
         shared,
         config,
+        terminal_size,
         paths: options.extension_paths,
         queue_task,
         server_task,
@@ -595,6 +606,7 @@ impl ExtensionBinding {
         let (tx, mut rx) = mpsc::unbounded_channel::<UiOutbound>();
         let binding = Arc::downgrade(self);
         let hub = hub.clone();
+        let terminal_size = self.terminal_size.clone();
         tokio::spawn(async move {
             while let Some(message) = rx.recv().await {
                 let Some(binding) = binding.upgrade() else {
@@ -642,6 +654,13 @@ impl ExtensionBinding {
                             ))
                             .await;
                     }
+                    UiOutbound::Resize { width, height } => {
+                        let _ = connection
+                            .notify(pi_ext_protocol::Notification::UiResize(
+                                pi_ext_protocol::ResizeParams { width, height },
+                            ))
+                            .await;
+                    }
                     UiOutbound::Dispose { slot } => {
                         let _ = connection
                             .notify(pi_ext_protocol::Notification::UiDispose(
@@ -660,6 +679,12 @@ impl ExtensionBinding {
             }
         });
         Arc::new(move |message| {
+            if let UiOutbound::Resize { width, height } = &message {
+                *terminal_size.lock() = Some(pi_ext_protocol::ResizeParams {
+                    width: *width,
+                    height: *height,
+                });
+            }
             let _ = tx.send(message);
         })
     }

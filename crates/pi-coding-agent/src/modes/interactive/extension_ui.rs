@@ -341,6 +341,9 @@ fn anchor(value: &Value) -> OverlayAnchor {
 #[must_use]
 pub fn parse_overlay_options(value: &Value) -> ParsedOverlay {
     let get = |key: &str| value.get(key);
+    let margin = |value: Option<&Value>| -> usize {
+        value.and_then(Value::as_i64).unwrap_or_default().max(0) as usize
+    };
     let mut options = OverlayOptions::default();
     if let Some(v) = get("width") {
         options.width = size_value(v);
@@ -366,6 +369,24 @@ pub fn parse_overlay_options(value: &Value) -> ParsedOverlay {
     if let Some(v) = get("col") {
         options.col = size_value(v);
     }
+    if let Some(value) = get("margin") {
+        match value {
+            Value::Number(_) => {
+                let all = margin(Some(value));
+                options.margin_top = all;
+                options.margin_right = all;
+                options.margin_bottom = all;
+                options.margin_left = all;
+            }
+            Value::Object(sides) => {
+                options.margin_top = margin(sides.get("top"));
+                options.margin_right = margin(sides.get("right"));
+                options.margin_bottom = margin(sides.get("bottom"));
+                options.margin_left = margin(sides.get("left"));
+            }
+            _ => {}
+        }
+    }
     if let Some(v) = get("nonCapturing").and_then(Value::as_bool) {
         options.non_capturing = v;
     }
@@ -390,6 +411,7 @@ mod tests {
             "anchor": "top-right",
             "offsetX": -2,
             "offsetY": 1,
+            "margin": {"top": 1, "right": 2, "bottom": 3, "left": 4},
             "hidden": true,
             "focused": false,
         }));
@@ -399,6 +421,10 @@ mod tests {
         assert_eq!(parsed.options.anchor, OverlayAnchor::TopRight);
         assert_eq!(parsed.options.offset_x, -2);
         assert_eq!(parsed.options.offset_y, 1);
+        assert_eq!(parsed.options.margin_top, 1);
+        assert_eq!(parsed.options.margin_right, 2);
+        assert_eq!(parsed.options.margin_bottom, 3);
+        assert_eq!(parsed.options.margin_left, 4);
         assert!(parsed.hidden);
         assert_eq!(parsed.focused, Some(false));
 

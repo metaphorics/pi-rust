@@ -58,6 +58,9 @@ pub enum UiOutbound {
     /// `ui/focus {slot,focused}` — focus mirror so the sidecar component
     /// renders its cursor marker exactly like a locally focused component.
     Focus { slot: String, focused: bool },
+    /// `ui/resize {width,height}` — mirror the host grid into headless
+    /// pi-tui so responsive components/overlay predicates match the host.
+    Resize { width: u16, height: u16 },
     /// `ui/dispose {slot}` — host-initiated slot teardown.
     Dispose { slot: String },
     /// `ui/editorSetText {text}` — host-driven text replacement for the
@@ -355,6 +358,11 @@ impl BridgedLeaf {
         self.revision = snapshot.revision;
         self.lines = lines_from_ansi(&snapshot.lines);
         self.pending_changed = true;
+        // Adapters such as interactive `Shared<T>` consult
+        // `last_render_status` before calling `render`. Make the newly
+        // ingested generation observable immediately; `render` consumes
+        // `pending_changed` back to `Unchanged` on the following pass.
+        self.status = RenderStatus::Changed;
         true
     }
 
@@ -568,6 +576,8 @@ mod tests {
         // New frame → Changed after sync.
         hub.apply(frame("w", 2, &["blue"]));
         assert!(leaf.sync());
+        // `Shared<T>` consults this before deciding to call `render`.
+        assert_eq!(leaf.last_render_status(), RenderStatus::Changed);
         let lines = leaf.render(40);
         assert_eq!(lines[0].plain_text(), "blue");
         assert_eq!(leaf.last_render_status(), RenderStatus::Changed);

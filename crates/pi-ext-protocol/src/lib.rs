@@ -256,6 +256,8 @@ pub enum Notification {
     UiOverlay(OverlayParams),
     #[serde(rename = "ui/focus")]
     UiFocus(FocusParams),
+    #[serde(rename = "ui/resize")]
+    UiResize(ResizeParams),
     #[serde(rename = "ui/editorSubmit")]
     UiEditorSubmit(TextParams),
     #[serde(rename = "ui/editorChange")]
@@ -494,6 +496,8 @@ pub struct InitParams {
     pub has_ui: bool,
     pub flag_values: BTreeMap<String, FlagValue>,
     pub theme: ThemeDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_size: Option<ResizeParams>,
     pub session: SessionSnapshot,
     pub state: StateBlock,
 }
@@ -1291,6 +1295,11 @@ pub struct RenderParams {
     pub slot: String,
     pub width: u16,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResizeParams {
+    pub width: u16,
+    pub height: u16,
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AutocompleteParams {
@@ -1670,6 +1679,10 @@ mod tests {
                     name: "default".into(),
                     json: json!({}),
                 },
+                terminal_size: Some(ResizeParams {
+                    width: 120,
+                    height: 40,
+                }),
                 session: SessionSnapshot {
                     epoch: 1,
                     session_file: "s".into(),
@@ -1886,6 +1899,10 @@ mod tests {
             Notification::UiFocus(FocusParams {
                 slot: "editor".into(),
                 focused: true,
+            }),
+            Notification::UiResize(ResizeParams {
+                width: 120,
+                height: 40,
             }),
             Notification::UiEditorSubmit(TextParams { text: "go".into() }),
             Notification::UiEditorChange(TextParams { text: "g".into() }),

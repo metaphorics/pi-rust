@@ -80,6 +80,7 @@ export class FrameBridge {
   private readonly slots = new Map<string, Slot>();
   private readonly toolRecords = new Map<string, ToolRenderRecord>();
   private flushScheduled = false;
+  private readonly resizeListeners = new Set<(columns: number, rows: number) => void>();
   private readonly deps: FrameBridgeDeps;
 
   constructor(deps: FrameBridgeDeps) {
@@ -102,7 +103,7 @@ export class FrameBridge {
     this.slots.set(slot, {
       kind: "component",
       component,
-      width: DEFAULT_WIDTH,
+      width: this.terminal.columns || DEFAULT_WIDTH,
       version: 0,
       focusable: options?.focusable === true,
       ...(options?.placement !== undefined ? { placement: options.placement } : {}),
@@ -117,7 +118,7 @@ export class FrameBridge {
     this.slots.set(slot, {
       kind: "static",
       lines,
-      width: DEFAULT_WIDTH,
+      width: this.terminal.columns || DEFAULT_WIDTH,
       version: 0,
       ...(options?.placement !== undefined ? { placement: options.placement } : {}),
       dirty: false,
@@ -192,9 +193,25 @@ export class FrameBridge {
       throw new Error(`unknown UI slot: ${slot}`);
     }
     entry.width = width;
-    this.terminal.resize(Math.max(width, this.terminal.columns));
     if (entry.kind === "static") return entry.lines;
     return entry.component.render(width);
+  }
+
+  /** Mirror the host grid into headless pi-tui and notify responsive UI. */
+  resize(columns: number, rows: number): void {
+    const width = Math.max(1, columns);
+    const height = Math.max(1, rows);
+    if (width === this.terminal.columns && height === this.terminal.rows) return;
+    this.terminal.resize(width, height);
+    for (const listener of [...this.resizeListeners]) listener(width, height);
+  }
+
+  /** Observe host-grid changes (used by responsive overlay `visible`). */
+  onResize(listener: (columns: number, rows: number) => void): () => void {
+    this.resizeListeners.add(listener);
+    return () => {
+      this.resizeListeners.delete(listener);
+    };
   }
 
   /** `ui/input {slot,data}`: forwarded key input for a focused slot. */
@@ -331,7 +348,7 @@ export class FrameBridge {
     const entry: ComponentSlot = {
       kind: "component",
       component,
-      width: DEFAULT_WIDTH,
+      width: this.terminal.columns || DEFAULT_WIDTH,
       version: 0,
       focusable: false,
       dirty: false,

@@ -61,6 +61,7 @@ export interface UiBridge {
   render(slot: string, width: number): string[];
   input(slot: string, data: string): void;
   focus(slot: string, focused: boolean): void;
+  resize(width: number, height: number): void;
   dispose(slot: string): void;
   editorSetText(text: string): void;
   terminalInput(data: string): Promise<TerminalInputResultDto>;
@@ -149,6 +150,9 @@ export function attachHost(options: HostOptions): SidecarHost {
           : (booted) => {
               const ui = createUi(booted);
               host.uiBridge = ui?.bridge;
+              if (init.terminalSize !== undefined) {
+                host.uiBridge?.resize(init.terminalSize.width, init.terminalSize.height);
+              }
               return ui?.context;
             },
     });
@@ -308,6 +312,10 @@ export function attachHost(options: HostOptions): SidecarHost {
   peer.onNotification("ui/focus", (params) => {
     const { slot, focused } = fromWire<{ slot: string; focused: boolean }>(asObject(params));
     host.uiBridge?.focus(slot, focused);
+  });
+  peer.onNotification("ui/resize", (params) => {
+    const { width, height } = fromWire<{ width: number; height: number }>(asObject(params));
+    host.uiBridge?.resize(width, height);
   });
   peer.onNotification("ui/setEditorText", (params) => {
     const { text } = fromWire<{ text: string }>(asObject(params));

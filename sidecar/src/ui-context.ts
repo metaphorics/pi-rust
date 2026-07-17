@@ -212,10 +212,12 @@ export function createUi(runtime: SidecarRuntime): CreatedUi {
       const slot = `custom:${++customSlotCounter}`;
       const { promise, resolve } = Promise.withResolvers<T>();
       let settled = false;
+      let removeResizeListener = (): void => {};
       const done = (result: T): void => {
         if (settled) return;
         settled = true;
-        peer.notify("ui/done", { slot, result: toWire(result) });
+        removeResizeListener();
+        peer.notify("ui/done", { slot, result: toWire(result === undefined ? null : result) });
         resolve(result);
       };
       const component = await factory(bridge.tui, activeTheme, runtime.keybindings, done);
@@ -226,6 +228,13 @@ export function createUi(runtime: SidecarRuntime): CreatedUi {
         const overlayOptions = options?.overlayOptions;
         return typeof overlayOptions === "function" ? overlayOptions() : (overlayOptions ?? {});
       };
+      const serializableOverlayOptions = (overlayOptions: OverlayOptions): OverlayOptions => {
+        const wireOptions = { ...overlayOptions };
+        delete wireOptions.visible;
+        return wireOptions;
+      };
+      const isVisible = (overlayOptions: OverlayOptions): boolean =>
+        overlayOptions.visible?.(bridge.terminal.columns, bridge.terminal.rows) ?? true;
       if (overlay) {
         if (options?.onHandle !== undefined) {
           // The REAL headless-TUI overlay handle keeps pi's focus/visibility
@@ -233,11 +242,12 @@ export function createUi(runtime: SidecarRuntime): CreatedUi {
           // (with `hidden`/`focused`) so Rust mirrors the state.
           const handle = bridge.tui.showOverlay(component, resolveOverlayOptions());
           const shipOverlayState = () => {
+            const overlayOptions = resolveOverlayOptions();
             peer.notify("ui/overlay", {
               slot,
               options: toWire({
-                ...resolveOverlayOptions(),
-                hidden: handle.isHidden(),
+                ...serializableOverlayOptions(overlayOptions),
+                hidden: handle.isHidden() || !isVisible(overlayOptions),
                 focused: handle.isFocused(),
               }),
             });
@@ -262,17 +272,34 @@ export function createUi(runtime: SidecarRuntime): CreatedUi {
             },
             isFocused: () => handle.isFocused(),
           });
+          removeResizeListener = bridge.onResize(shipOverlayState);
           shipOverlayState();
         } else {
-          peer.notify("ui/overlay", { slot, options: toWire(resolveOverlayOptions()) });
+          const shipOverlayState = () => {
+            const overlayOptions = resolveOverlayOptions();
+            peer.notify("ui/overlay", {
+              slot,
+              options: toWire({
+                ...serializableOverlayOptions(overlayOptions),
+                hidden: !isVisible(overlayOptions),
+              }),
+            });
+          };
+          removeResizeListener = bridge.onResize(shipOverlayState);
+          shipOverlayState();
         }
       }
 
       // Rust hosts the dialog; its response finalizes the slot's lifetime.
       void peer
-        .request("ui/custom", { slot, overlay, overlayOptions: toWire(resolveOverlayOptions()) })
+        .request("ui/custom", {
+          slot,
+          overlay,
+          overlayOptions: toWire(serializableOverlayOptions(resolveOverlayOptions())),
+        })
         .catch(() => undefined)
         .finally(() => {
+          removeResizeListener();
           bridge.disposeSlot(slot, { notify: false });
         });
       return promise;
@@ -369,10 +396,14 @@ export function createUi(runtime: SidecarRuntime): CreatedUi {
     focus: (slot, focused) => {
       bridge.focus(slot, focused);
     },
+    resize: (width, height) => {
+      bridge.resize(width, height);
+    },
     dispose: (slot) => {
       bridge.dispose(slot);
     },
     editorSetText: (text) => {
+      state.setEditorText(text);
       bridge.editorSetText(text);
     },
     terminalInput: (data) => bridge.terminalInput(data),

@@ -70,13 +70,15 @@ use super::components::trust_selector::{
 use super::components::user_message::UserMessageComponent;
 use super::components::user_message_selector::{UserMessageItem, UserMessageSelectorComponent};
 use super::dispatch::{BuiltinCommand, DispatchAction, DispatchContext, dispatch_input};
-use super::extension_ui::{UiHostRequest, current_theme_dto, parse_overlay_options};
+use super::extension_ui::{
+    InteractiveUiHost, UiHostRequest, current_theme_dto, parse_overlay_options,
+};
 use super::shared::{Shared, SlotHandle, SwapSlot};
 use super::theme::{
     ThemeColor, current_theme_name, detect_terminal_background_from_env, get_available_themes,
     on_theme_change, set_theme, theme,
 };
-use crate::extensions::binding::ExtensionBinding;
+use crate::extensions::binding::{BindOptions, ExtensionBinding};
 use crate::extensions::events::StateOverlay;
 use crate::extensions::frames::{BridgedLeaf, FrameHub, HubEvent, UiOutbound, UiOutboundSender};
 use crate::session::events::{AgentSessionEvent, CompactionReason};
@@ -1477,7 +1479,7 @@ impl InteractiveMode {
             return;
         }
         if self.is_bash_mode {
-            self.editor.borrow_mut().set_text("");
+            self.set_active_editor_text("");
             self.is_bash_mode = false;
             self.update_editor_border_color();
             return;
@@ -1519,7 +1521,7 @@ impl InteractiveMode {
         {
             self.exit = Some(ExitReason::Quit);
         } else {
-            self.editor.borrow_mut().set_text("");
+            self.set_active_editor_text("");
             self.last_sigint_time = Some(now);
         }
     }
@@ -1628,7 +1630,7 @@ impl InteractiveMode {
             DispatchAction::Builtin(command) => self.execute_builtin(command),
             DispatchAction::Bash { command, excluded } => {
                 self.editor.borrow_mut().add_to_history(text.trim());
-                self.editor.borrow_mut().set_text("");
+                self.set_active_editor_text("");
                 self.handle_bash_command(command, excluded);
                 self.is_bash_mode = false;
                 self.update_editor_border_color();
@@ -1637,11 +1639,11 @@ impl InteractiveMode {
                 self.show_warning(
                     "A bash command is already running. Press Esc to cancel it first.",
                 );
-                self.editor.borrow_mut().set_text(&original_text);
+                self.set_active_editor_text(&original_text);
             }
             DispatchAction::ExtensionDuringCompaction { text } => {
                 self.editor.borrow_mut().add_to_history(&text);
-                self.editor.borrow_mut().set_text("");
+                self.set_active_editor_text("");
                 self.spawn_prompt(text);
             }
             DispatchAction::QueueCompaction { text } => {
@@ -1649,7 +1651,7 @@ impl InteractiveMode {
             }
             DispatchAction::SteerStreaming { text } => {
                 self.editor.borrow_mut().add_to_history(&text);
-                self.editor.borrow_mut().set_text("");
+                self.set_active_editor_text("");
                 let session = self.session.clone();
                 self.ops.push(Box::pin(async move {
                     OpOutcome::PromptFinished(
@@ -1669,7 +1671,7 @@ impl InteractiveMode {
             }
             DispatchAction::Prompt { text } => {
                 self.editor.borrow_mut().add_to_history(&text);
-                self.editor.borrow_mut().set_text("");
+                self.set_active_editor_text("");
                 self.spawn_prompt(text);
             }
         }
@@ -1704,35 +1706,35 @@ impl InteractiveMode {
     fn execute_builtin(&mut self, command: BuiltinCommand) {
         match command {
             BuiltinCommand::Quit => {
-                self.editor.borrow_mut().set_text("");
+                self.set_active_editor_text("");
                 self.exit = Some(ExitReason::Quit);
             }
             BuiltinCommand::Theme => {
-                self.editor.borrow_mut().set_text("");
+                self.set_active_editor_text("");
                 self.show_theme_selector();
             }
             BuiltinCommand::Thinking => {
-                self.editor.borrow_mut().set_text("");
+                self.set_active_editor_text("");
                 self.show_thinking_selector();
             }
             BuiltinCommand::Images => {
-                self.editor.borrow_mut().set_text("");
+                self.set_active_editor_text("");
                 self.show_images_selector();
             }
             BuiltinCommand::Help => {
                 self.handle_hotkeys_command();
-                self.editor.borrow_mut().set_text("");
+                self.set_active_editor_text("");
             }
             BuiltinCommand::Model { search } => {
-                self.editor.borrow_mut().set_text("");
+                self.set_active_editor_text("");
                 self.show_model_selector(search);
             }
             BuiltinCommand::New => {
-                self.editor.borrow_mut().set_text("");
+                self.set_active_editor_text("");
                 self.handle_clear_command();
             }
             BuiltinCommand::Compact { instructions } => {
-                self.editor.borrow_mut().set_text("");
+                self.set_active_editor_text("");
                 self.clear_status_indicator(None);
                 let session = self.session.clone();
                 self.ops.push(Box::pin(async move {
@@ -1740,93 +1742,93 @@ impl InteractiveMode {
                 }));
             }
             BuiltinCommand::Fork => {
-                self.editor.borrow_mut().set_text("");
+                self.set_active_editor_text("");
                 self.show_user_message_selector();
             }
             BuiltinCommand::Tree => {
-                self.editor.borrow_mut().set_text("");
+                self.set_active_editor_text("");
                 self.show_tree_selector();
             }
             BuiltinCommand::Resume => {
-                self.editor.borrow_mut().set_text("");
+                self.set_active_editor_text("");
                 self.show_session_selector();
             }
             BuiltinCommand::Clone => {
-                self.editor.borrow_mut().set_text("");
+                self.set_active_editor_text("");
                 self.handle_clone_command();
             }
             BuiltinCommand::Name { raw } => {
                 self.handle_name_command(&raw);
-                self.editor.borrow_mut().set_text("");
+                self.set_active_editor_text("");
             }
             BuiltinCommand::Session => {
                 self.handle_session_command();
-                self.editor.borrow_mut().set_text("");
+                self.set_active_editor_text("");
             }
             BuiltinCommand::Hotkeys => {
                 self.handle_hotkeys_command();
-                self.editor.borrow_mut().set_text("");
+                self.set_active_editor_text("");
             }
             BuiltinCommand::Changelog => {
                 self.handle_changelog_command();
-                self.editor.borrow_mut().set_text("");
+                self.set_active_editor_text("");
             }
             BuiltinCommand::Copy => {
                 self.handle_copy_command();
-                self.editor.borrow_mut().set_text("");
+                self.set_active_editor_text("");
             }
             BuiltinCommand::Export { raw } => {
                 self.handle_export_command(&raw);
-                self.editor.borrow_mut().set_text("");
+                self.set_active_editor_text("");
             }
             BuiltinCommand::Import { raw } => {
                 self.handle_import_command(&raw);
-                self.editor.borrow_mut().set_text("");
+                self.set_active_editor_text("");
             }
             BuiltinCommand::Settings => {
                 self.show_settings_selector();
-                self.editor.borrow_mut().set_text("");
+                self.set_active_editor_text("");
             }
             BuiltinCommand::ScopedModels => {
-                self.editor.borrow_mut().set_text("");
+                self.set_active_editor_text("");
                 self.show_theme_or_status("Model scoping requires configured models");
             }
             BuiltinCommand::Trust => {
                 self.show_trust_selector();
-                self.editor.borrow_mut().set_text("");
+                self.set_active_editor_text("");
             }
             BuiltinCommand::Login { provider } => {
-                self.editor.borrow_mut().set_text("");
+                self.set_active_editor_text("");
                 self.show_auth_selector(OAuthSelectorMode::Login, provider.as_deref());
             }
             BuiltinCommand::Logout => {
-                self.editor.borrow_mut().set_text("");
+                self.set_active_editor_text("");
                 self.show_auth_selector(OAuthSelectorMode::Logout, None);
             }
             BuiltinCommand::Share => {
-                self.editor.borrow_mut().set_text("");
+                self.set_active_editor_text("");
                 self.handle_share_command();
             }
             BuiltinCommand::Reload => {
-                self.editor.borrow_mut().set_text("");
+                self.set_active_editor_text("");
                 self.handle_reload_command();
             }
             BuiltinCommand::Debug => {
                 self.handle_debug_command();
-                self.editor.borrow_mut().set_text("");
+                self.set_active_editor_text("");
             }
             BuiltinCommand::ArminSaysHi => {
                 self.chat
                     .borrow_mut()
                     .add_child(super::components::armin::Armin::new());
-                self.editor.borrow_mut().set_text("");
+                self.set_active_editor_text("");
                 self.tui.request_render(false);
             }
             BuiltinCommand::DementedElves => {
                 self.chat.borrow_mut().add_child(
                     super::components::earendil_announcement::EarendilAnnouncement::new(),
                 );
-                self.editor.borrow_mut().set_text("");
+                self.set_active_editor_text("");
                 self.tui.request_render(false);
             }
         }
@@ -2277,7 +2279,7 @@ impl InteractiveMode {
                     } else {
                         self.rebind_session();
                         if let Some(text) = replace.selected_text {
-                            self.editor.borrow_mut().set_text(&text);
+                            self.set_active_editor_text(&text);
                         }
                         self.show_status("Forked to new session");
                     }
@@ -3423,7 +3425,7 @@ impl InteractiveMode {
         if self.session.is_compacting() {
             if self.dispatch_context().is_extension_command(&text) {
                 self.editor.borrow_mut().add_to_history(&text);
-                self.editor.borrow_mut().set_text("");
+                self.set_active_editor_text("");
                 self.spawn_prompt(text);
             } else {
                 self.queue_compaction_message(text, StreamingBehavior::FollowUp);
@@ -3433,14 +3435,14 @@ impl InteractiveMode {
         // Streaming: queue a follow-up message (oracle :3690-3696).
         if self.session.is_streaming() {
             self.editor.borrow_mut().add_to_history(&text);
-            self.editor.borrow_mut().set_text("");
+            self.set_active_editor_text("");
             self.session.follow_up(&text, Vec::new());
             self.update_pending_messages_display();
             self.tui.request_render(false);
             return;
         }
         // Idle: Alt+Enter acts like regular Enter (oracle :3697-3701).
-        self.editor.borrow_mut().set_text("");
+        self.set_active_editor_text("");
         self.on_submit(&text);
     }
 
@@ -3880,7 +3882,7 @@ impl InteractiveMode {
             .into_iter()
             .filter(|t| !t.trim().is_empty())
             .collect();
-        self.editor.borrow_mut().set_text(&combined.join("\n\n"));
+        self.set_active_editor_text(&combined.join("\n\n"));
         self.update_pending_messages_display();
         if abort {
             self.spawn_abort();
@@ -3898,7 +3900,7 @@ impl InteractiveMode {
 
     fn queue_compaction_message(&mut self, text: String, mode: StreamingBehavior) {
         self.editor.borrow_mut().add_to_history(&text);
-        self.editor.borrow_mut().set_text("");
+        self.set_active_editor_text("");
         self.compaction_queued
             .push(CompactionQueuedMessage { text, mode });
         self.update_pending_messages_display();
@@ -4326,6 +4328,7 @@ struct ExtensionsUi {
     hub: Arc<FrameHub>,
     outbound: UiOutboundSender,
     state_overlay: Arc<parking_lot::Mutex<StateOverlay>>,
+    last_terminal_size: (u16, u16),
     host_rx: std::sync::mpsc::Receiver<UiHostRequest>,
     /// Mounted widget leaves in registration order (oracle Map order).
     widgets: Vec<(String, WidgetPlacement, Rc<RefCell<BridgedLeaf>>)>,
@@ -4355,6 +4358,41 @@ struct ExtensionsUi {
 }
 
 impl InteractiveMode {
+    /// Bind discovered extensions to this interactive compositor in one call.
+    ///
+    /// This is the production integration seam: it forces the TUI mode/UI
+    /// flags, installs the real theme/state overlay, frame coalescer, dialog
+    /// host, and input/resize routing, then attaches them to this mode. The
+    /// caller owns lifecycle (`binding.start(...)` / shutdown) and may attach
+    /// its concrete `SessionHostActions` to the returned binding.
+    pub fn bind_extensions(
+        &mut self,
+        mut options: BindOptions,
+    ) -> Result<Option<Arc<ExtensionBinding>>, crate::extensions::ExtensionPathError> {
+        let hub = FrameHub::new();
+        let (ui, host_rx) = InteractiveUiHost::channel();
+        let overlay = Arc::new(parking_lot::Mutex::new(StateOverlay::default()));
+
+        options.mode = pi_ext_protocol::ExtensionMode::Tui;
+        options.has_ui = true;
+        options.ui = Some(ui);
+        options.terminal_size = Some(pi_ext_protocol::ResizeParams {
+            width: self.tui.terminal().columns(),
+            height: self.tui.terminal().rows(),
+        });
+        options.fallback = Some(hub.sink());
+        options.overlay = overlay.clone();
+        options.runtime = Some(self.runtime.clone());
+
+        let binding = crate::extensions::binding::bind_extensions(&self.session, options)?;
+        if let Some(binding) = &binding {
+            self.attach_extensions(binding.clone(), hub, host_rx, overlay);
+        }
+        Ok(binding)
+    }
+}
+
+impl InteractiveMode {
     /// Attach a live extension binding (call before `run()`, after
     /// `bind_extensions`): binds frame slots, dialogs, statuses, shortcuts,
     /// and input routing. `host_rx` comes from `InteractiveUiHost::channel`;
@@ -4367,6 +4405,7 @@ impl InteractiveMode {
         state_overlay: Arc<parking_lot::Mutex<StateOverlay>>,
     ) {
         let outbound = binding.ui_outbound(&hub);
+        let initial_terminal_size = (self.tui.terminal().columns(), self.tui.terminal().rows());
         // Real theme JSON baseline (F8): the init snapshot must never carry
         // the empty-object placeholder pi's loader rejects.
         state_overlay.lock().theme = current_theme_dto();
@@ -4406,6 +4445,7 @@ impl InteractiveMode {
             hub,
             outbound,
             state_overlay,
+            last_terminal_size: initial_terminal_size,
             host_rx,
             widgets: Vec::new(),
             header_leaf: None,
@@ -4444,6 +4484,16 @@ impl InteractiveMode {
     fn drain_extension_ui(&mut self) {
         if self.extensions.is_none() {
             return;
+        }
+        let terminal_size = (self.tui.terminal().columns(), self.tui.terminal().rows());
+        if let Some(ext) = &mut self.extensions
+            && ext.last_terminal_size != terminal_size
+        {
+            ext.last_terminal_size = terminal_size;
+            (ext.outbound)(UiOutbound::Resize {
+                width: terminal_size.0,
+                height: terminal_size.1,
+            });
         }
 
         // 1. Host requests (dialogs / statuses / notifications).
@@ -4694,7 +4744,14 @@ impl InteractiveMode {
             }
         } else {
             // Editor-area swap (oracle :2501-2506); draft saved for restore.
-            let saved = self.editor.borrow().get_text();
+            let saved = self
+                .extensions
+                .as_ref()
+                .expect("extensions attached")
+                .state_overlay
+                .lock()
+                .editor_text
+                .clone();
             self.extensions
                 .as_mut()
                 .expect("checked")
@@ -4776,13 +4833,13 @@ impl InteractiveMode {
         }
         if let Some(text) = saved {
             self.restore_editor();
-            self.editor.borrow_mut().set_text(&text);
+            self.set_active_editor_text(&text);
         }
         self.tui.request_render(false);
     }
 
-    /// `ui/overlay {slot, options}`: mount/update overlay state (hidden,
-    /// focus, layout at mount time).
+    /// `ui/overlay {slot, options}`: mount/update live overlay layout,
+    /// visibility, and focus state.
     fn apply_overlay_state(&mut self, slot: &str, options: serde_json::Value) {
         let parsed = parse_overlay_options(&options);
         let existing = {
@@ -4793,6 +4850,7 @@ impl InteractiveMode {
             ext.overlays.get(slot).copied()
         };
         if let Some(id) = existing {
+            self.tui.set_overlay_options(id, parsed.options);
             self.tui.set_overlay_hidden(id, parsed.hidden);
             match parsed.focused {
                 Some(true) => self.tui.focus_overlay(id),
@@ -5131,12 +5189,12 @@ impl InteractiveMode {
     /// Replace the ACTIVE editor's text (bridged editor included).
     fn set_active_editor_text(&mut self, text: &str) {
         self.editor.borrow_mut().set_text(text);
-        if let Some(ext) = &self.extensions
-            && ext.editor_leaf.is_some()
-        {
-            (ext.outbound)(UiOutbound::EditorSetText {
-                text: text.to_string(),
-            });
+        if let Some(ext) = &self.extensions {
+            let text = text.to_owned();
+            ext.state_overlay.lock().editor_text.clone_from(&text);
+            if ext.editor_leaf.is_some() {
+                (ext.outbound)(UiOutbound::EditorSetText { text });
+            }
         }
     }
 
@@ -5232,11 +5290,7 @@ impl InteractiveMode {
                 self.commands
                     .borrow_mut()
                     .push_back(UiCommand::Submit(params.text));
-                if let Some(ext) = &self.extensions {
-                    (ext.outbound)(UiOutbound::EditorSetText {
-                        text: String::new(),
-                    });
-                }
+                self.set_active_editor_text("");
             }
             N::UiEditorChange(params) => {
                 if let Some(ext) = &self.extensions {

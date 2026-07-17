@@ -146,6 +146,7 @@ export const NOTIFICATION_METHODS = [
   "ui/done",
   "ui/overlay",
   "ui/focus",
+  "ui/resize",
   "ui/editorSubmit",
   "ui/editorChange",
   "ui/terminalInputActive",
@@ -247,6 +248,7 @@ export interface InitParamsDto {
   hasUi: boolean;
   flagValues: Record<string, FlagValueDto>;
   theme: ThemeDto;
+  terminalSize?: { width: number; height: number };
   session: SessionSnapshotDto;
   state: StateBlockDto;
 }
