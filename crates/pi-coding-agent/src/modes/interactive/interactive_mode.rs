@@ -4523,6 +4523,10 @@ impl InteractiveMode {
                 HubEvent::Done { slot, .. } => self.resolve_custom(&slot),
                 HubEvent::Overlay { slot, options } => self.apply_overlay_state(&slot, options),
                 HubEvent::Ui(notification) => self.handle_ui_notification(notification),
+                HubEvent::ResyncAll => self.reconcile_extension_slots(),
+                HubEvent::Overflow { dropped } => self.show_error(&format!(
+                    "Extension UI event buffer overflowed; dropped {dropped} event(s)"
+                )),
             }
         }
         for slot in dirty {
@@ -5389,6 +5393,42 @@ impl InteractiveMode {
                 data: result.data,
             }
         }));
+    }
+
+    /// Recover after bounded pending-key storage overflows. This exceptional
+    /// path is authoritative: the hub's live slot table wins over queued
+    /// mount/dispose deltas.
+    fn reconcile_extension_slots(&mut self) {
+        let Some(ext) = &self.extensions else {
+            return;
+        };
+        let live: HashSet<String> = ext.hub.slot_names().into_iter().collect();
+        let mut mounted: Vec<String> = ext
+            .widgets
+            .iter()
+            .map(|(slot, _, _)| slot.clone())
+            .collect();
+        if ext.header_leaf.is_some() {
+            mounted.push("header".to_string());
+        }
+        if ext.footer_leaf.is_some() {
+            mounted.push("footer".to_string());
+        }
+        if ext.editor_leaf.is_some() {
+            mounted.push("editor".to_string());
+        }
+        mounted.extend(ext.custom_leaves.keys().cloned());
+        mounted.extend(ext.entry_leaves.keys().map(|id| format!("entry:{id}")));
+
+        for slot in mounted {
+            if !live.contains(&slot) {
+                self.unmount_slot(&slot);
+            }
+        }
+        for slot in live {
+            self.ensure_slot_mounted(&slot);
+            self.sync_slot(&slot);
+        }
     }
 }
 

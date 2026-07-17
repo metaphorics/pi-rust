@@ -37,6 +37,17 @@ use serde_json::Value;
 
 use super::actions::NotificationSink;
 
+/// Maximum FIFO edge-triggered events retained while the TUI pump is stalled.
+pub const FRAME_HUB_EDGE_CAPACITY: usize = 1_024;
+/// Maximum distinct coalesced state keys retained while the TUI pump is stalled.
+pub const FRAME_HUB_STATE_CAPACITY: usize = 256;
+/// Maximum distinct dirty slot keys retained before requesting reconciliation.
+pub const FRAME_HUB_DIRTY_CAPACITY: usize = 1_024;
+/// Maximum total queued events; frame content is coalesced separately.
+pub const FRAME_HUB_EVENT_CAPACITY: usize = FRAME_HUB_EDGE_CAPACITY + FRAME_HUB_STATE_CAPACITY;
+/// Maximum total buffered queue entries and dirty keys.
+pub const FRAME_HUB_BUFFER_CAPACITY: usize = FRAME_HUB_EVENT_CAPACITY + FRAME_HUB_DIRTY_CAPACITY;
+
 // ============================================================================
 // Outbound (TUI thread → sidecar)
 // ============================================================================
@@ -96,10 +107,14 @@ pub enum HubEvent {
     Done { slot: String, result: Value },
     /// `ui/overlay {slot,options}` — overlay mount/state update.
     Overlay { slot: String, options: Value },
-    /// Every other UI notification routed through the fallback sink
-    /// (working message/indicator, setTheme, pasteToEditor, editor
-    /// submit/change, terminal-input activation, ...), in arrival order.
+    /// Every other UI notification routed through the fallback sink.
     Ui(Notification),
+    /// Events discarded to keep ingestion nonblocking and memory bounded.
+    /// Required events already accepted by the queue are never evicted.
+    Overflow { dropped: usize },
+    /// Bounded dirty/state tracking overflowed; reconcile from authoritative
+    /// slot snapshots rather than retaining more pending keys.
+    ResyncAll,
 }
 
 /// Immutable snapshot of a slot's latest content (cloned out of the hub so
@@ -111,6 +126,12 @@ pub struct SlotSnapshot {
     pub wants_key_release: bool,
     pub focusable: bool,
     pub placement: Option<WidgetPlacement>,
+}
+
+#[derive(Debug)]
+struct QueuedEvent {
+    sequence: u64,
+    event: HubEvent,
 }
 
 #[derive(Debug, Default)]
@@ -131,16 +152,166 @@ struct SlotState {
 #[derive(Default)]
 struct HubInner {
     slots: HashMap<String, SlotState>,
-    events: VecDeque<HubEvent>,
+    /// FIFO one-shot/structural traffic.
+    edges: VecDeque<QueuedEvent>,
+    /// Latest state per semantic kind (and per key/slot where applicable).
+    states: VecDeque<QueuedEvent>,
+    next_sequence: u64,
+    /// Number of events discarded since the previous drain.
+    dropped_events: usize,
     /// Slots with unseen content changes, deduplicated.
     dirty: Vec<String>,
+    /// Dirty/state key overflow requires authoritative slot reconciliation.
+    resync_all: bool,
 }
 
 impl HubInner {
+    fn request_resync(&mut self) {
+        self.dirty.clear();
+        self.resync_all = true;
+    }
+
     fn mark_dirty(&mut self, slot: &str) {
-        if !self.dirty.iter().any(|s| s == slot) {
-            self.dirty.push(slot.to_string());
+        if self.resync_all || self.dirty.iter().any(|s| s == slot) {
+            return;
         }
+        if self.dirty.len() == FRAME_HUB_DIRTY_CAPACITY {
+            self.request_resync();
+            self.dropped_events = self.dropped_events.saturating_add(1);
+            return;
+        }
+        self.dirty.push(slot.to_string());
+    }
+
+    fn enqueue(&mut self, event: HubEvent) {
+        let sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.saturating_add(1);
+
+        if is_coalescing_state(&event) {
+            if let Some(index) = self
+                .states
+                .iter()
+                .position(|queued| same_state_slot(&queued.event, &event))
+            {
+                self.states.remove(index);
+            } else if self.states.len() == FRAME_HUB_STATE_CAPACITY {
+                self.states.pop_front();
+                self.request_resync();
+                self.dropped_events = self.dropped_events.saturating_add(1);
+            }
+            self.states.push_back(QueuedEvent { sequence, event });
+            return;
+        }
+
+        if self.edges.len() == FRAME_HUB_EDGE_CAPACITY {
+            if is_required_edge(&event) {
+                if let Some(index) = self
+                    .edges
+                    .iter()
+                    .position(|queued| !is_required_edge(&queued.event))
+                {
+                    self.edges.remove(index);
+                    self.dropped_events = self.dropped_events.saturating_add(1);
+                } else {
+                    // An all-required FIFO cannot grow without bound. Keep
+                    // every already-accepted completion/submit, reject the
+                    // newest event, and surface the loss on the next drain.
+                    self.dropped_events = self.dropped_events.saturating_add(1);
+                    return;
+                }
+            } else {
+                self.dropped_events = self.dropped_events.saturating_add(1);
+                return;
+            }
+        }
+
+        self.edges.push_back(QueuedEvent { sequence, event });
+    }
+}
+
+fn is_required_edge(event: &HubEvent) -> bool {
+    matches!(
+        event,
+        HubEvent::Done { .. }
+            | HubEvent::Ui(
+                Notification::UiEditorSubmit(_)
+                    | Notification::UiFocus(_)
+                    | Notification::UiComponentInput(_)
+            )
+    )
+}
+
+fn is_coalescing_state(event: &HubEvent) -> bool {
+    matches!(
+        event,
+        HubEvent::Mounted { .. }
+            | HubEvent::Disposed { .. }
+            | HubEvent::Overlay { .. }
+            | HubEvent::Ui(
+                Notification::UiSetStatus(_)
+                    | Notification::UiSetWorkingMessage(_)
+                    | Notification::UiSetWorkingVisible(_)
+                    | Notification::UiSetWorkingIndicator(_)
+                    | Notification::UiSetHiddenThinkingLabel(_)
+                    | Notification::UiSetTitle(_)
+                    | Notification::UiSetEditorText(_)
+                    | Notification::UiSetTheme(_)
+                    | Notification::UiSetToolsExpanded(_)
+                    | Notification::UiResize(_)
+                    | Notification::UiEditorChange(_)
+                    | Notification::UiTerminalInputActive(_)
+            )
+    )
+}
+
+fn same_state_slot(left: &HubEvent, right: &HubEvent) -> bool {
+    match (left, right) {
+        (
+            HubEvent::Mounted { slot: left } | HubEvent::Disposed { slot: left },
+            HubEvent::Mounted { slot: right } | HubEvent::Disposed { slot: right },
+        ) => left == right,
+        (HubEvent::Overlay { slot: left, .. }, HubEvent::Overlay { slot: right, .. }) => {
+            left == right
+        }
+        (
+            HubEvent::Ui(Notification::UiSetStatus(left)),
+            HubEvent::Ui(Notification::UiSetStatus(right)),
+        ) => left.key == right.key,
+        (HubEvent::Ui(left), HubEvent::Ui(right)) => matches!(
+            (left, right),
+            (
+                Notification::UiSetWorkingMessage(_),
+                Notification::UiSetWorkingMessage(_)
+            ) | (
+                Notification::UiSetWorkingVisible(_),
+                Notification::UiSetWorkingVisible(_)
+            ) | (
+                Notification::UiSetWorkingIndicator(_),
+                Notification::UiSetWorkingIndicator(_)
+            ) | (
+                Notification::UiSetHiddenThinkingLabel(_),
+                Notification::UiSetHiddenThinkingLabel(_)
+            ) | (Notification::UiSetTitle(_), Notification::UiSetTitle(_))
+                | (
+                    Notification::UiSetEditorText(_),
+                    Notification::UiSetEditorText(_)
+                )
+                | (Notification::UiSetTheme(_), Notification::UiSetTheme(_))
+                | (
+                    Notification::UiSetToolsExpanded(_),
+                    Notification::UiSetToolsExpanded(_)
+                )
+                | (Notification::UiResize(_), Notification::UiResize(_))
+                | (
+                    Notification::UiEditorChange(_),
+                    Notification::UiEditorChange(_)
+                )
+                | (
+                    Notification::UiTerminalInputActive(_),
+                    Notification::UiTerminalInputActive(_)
+                )
+        ),
+        _ => false,
     }
 }
 
@@ -172,19 +343,17 @@ impl FrameHub {
             Notification::UiDispose(params) => {
                 inner.slots.remove(&params.slot);
                 inner.dirty.retain(|s| *s != params.slot);
-                inner
-                    .events
-                    .push_back(HubEvent::Disposed { slot: params.slot });
+                inner.enqueue(HubEvent::Disposed { slot: params.slot });
             }
-            Notification::UiDone(params) => inner.events.push_back(HubEvent::Done {
+            Notification::UiDone(params) => inner.enqueue(HubEvent::Done {
                 slot: params.slot,
                 result: params.result,
             }),
-            Notification::UiOverlay(params) => inner.events.push_back(HubEvent::Overlay {
+            Notification::UiOverlay(params) => inner.enqueue(HubEvent::Overlay {
                 slot: params.slot,
                 options: params.options,
             }),
-            other => inner.events.push_back(HubEvent::Ui(other)),
+            other => inner.enqueue(HubEvent::Ui(other)),
         }
     }
 
@@ -193,17 +362,57 @@ impl FrameHub {
     #[must_use]
     pub fn drain(&self) -> (Vec<HubEvent>, Vec<String>) {
         let mut inner = self.inner.lock();
-        (
-            inner.events.drain(..).collect(),
-            std::mem::take(&mut inner.dirty),
-        )
+        let mut edges = std::mem::take(&mut inner.edges).into_iter().peekable();
+        let mut states = std::mem::take(&mut inner.states).into_iter().peekable();
+        let mut events = Vec::with_capacity(edges.len() + states.len() + 1);
+        while edges.peek().is_some() || states.peek().is_some() {
+            let take_edge = match (edges.peek(), states.peek()) {
+                (Some(edge), Some(state)) => edge.sequence < state.sequence,
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => break,
+            };
+            let queued = if take_edge {
+                edges.next().expect("peeked edge")
+            } else {
+                states.next().expect("peeked state")
+            };
+            events.push(queued.event);
+        }
+        let dropped = std::mem::take(&mut inner.dropped_events);
+        if std::mem::take(&mut inner.resync_all) {
+            events.push(HubEvent::ResyncAll);
+        }
+        if dropped > 0 {
+            events.push(HubEvent::Overflow { dropped });
+        }
+        (events, std::mem::take(&mut inner.dirty))
     }
 
-    /// True when any event or dirty slot is pending (cheap pre-check).
+    /// Number of buffered events and dirty keys, excluding the
+    /// allocation-free overflow/reconciliation flags.
+    #[must_use]
+    pub fn pending_event_count(&self) -> usize {
+        let inner = self.inner.lock();
+        inner.edges.len() + inner.states.len() + inner.dirty.len()
+    }
+
+    /// Snapshot the authoritative set of live frame slots. Used only after a
+    /// bounded-buffer overflow requests full reconciliation.
+    #[must_use]
+    pub fn slot_names(&self) -> Vec<String> {
+        self.inner.lock().slots.keys().cloned().collect()
+    }
+
+    /// True when any event, overflow report, or dirty slot is pending.
     #[must_use]
     pub fn has_pending(&self) -> bool {
         let inner = self.inner.lock();
-        !inner.events.is_empty() || !inner.dirty.is_empty()
+        !inner.edges.is_empty()
+            || !inner.states.is_empty()
+            || inner.dropped_events > 0
+            || inner.resync_all
+            || !inner.dirty.is_empty()
     }
 
     /// Latest content snapshot for a slot.
@@ -262,7 +471,10 @@ impl FrameHub {
     pub fn clear(&self) {
         let mut inner = self.inner.lock();
         inner.slots.clear();
-        inner.events.clear();
+        inner.edges.clear();
+        inner.states.clear();
+        inner.dropped_events = 0;
+        inner.resync_all = false;
         inner.dirty.clear();
     }
 }
@@ -285,7 +497,7 @@ fn apply_frame(inner: &mut HubInner, params: FrameParams) {
         state.placement = params.placement;
     }
     if is_new {
-        inner.events.push_back(HubEvent::Mounted {
+        inner.enqueue(HubEvent::Mounted {
             slot: params.slot.clone(),
         });
     }
@@ -446,7 +658,8 @@ impl Focusable for BridgedLeaf {
 mod tests {
     use super::*;
     use pi_ext_protocol::{
-        ComponentInputParams, DoneParams, FrameParams, OverlayParams, SlotParams,
+        ActiveParams, ComponentInputParams, DoneParams, FrameParams, OptionalTextParams,
+        OverlayParams, SlotParams, TextParams, ThemeSelectionParams, VisibleParams,
     };
     use serde_json::json;
 
@@ -477,6 +690,216 @@ mod tests {
     }
 
     #[test]
+    fn stalled_pump_keeps_mixed_ui_traffic_strictly_bounded() {
+        let hub = FrameHub::new();
+        let mut submitted = Vec::new();
+
+        for sequence in 1..=100_001_u64 {
+            hub.apply(Notification::UiSetWorkingMessage(OptionalTextParams {
+                text: Some(format!("working-{sequence}")),
+            }));
+            hub.apply(Notification::UiSetToolsExpanded(VisibleParams {
+                visible: sequence % 2 == 0,
+            }));
+            hub.apply(Notification::UiTerminalInputActive(ActiveParams {
+                active: sequence % 3 == 0,
+            }));
+            hub.apply(Notification::UiSetTheme(ThemeSelectionParams {
+                theme: format!("theme-{sequence}"),
+            }));
+            hub.apply(Notification::UiEditorChange(TextParams {
+                text: format!("draft-{sequence}"),
+            }));
+            hub.apply(Notification::UiPasteToEditor(TextParams {
+                text: format!("paste-{sequence}"),
+            }));
+            hub.apply(frame(
+                "widget:stress",
+                sequence,
+                &[&format!("frame-{sequence}")],
+            ));
+
+            if sequence % 10_000 == 0 {
+                let text = format!("submit-{sequence}");
+                submitted.push(text.clone());
+                hub.apply(Notification::UiEditorSubmit(TextParams { text }));
+            }
+        }
+
+        // A delayed pre-stress frame must not roll the retained slot backward.
+        hub.apply(frame("widget:stress", 99_999, &["stale"]));
+
+        assert!(
+            hub.pending_event_count() <= FRAME_HUB_BUFFER_CAPACITY,
+            "stalled pump retained {} buffered items (capacity {})",
+            hub.pending_event_count(),
+            FRAME_HUB_BUFFER_CAPACITY
+        );
+
+        let (events, dirty) = hub.drain();
+        assert_eq!(dirty, vec!["widget:stress".to_string()]);
+        assert_eq!(
+            hub.snapshot("widget:stress").unwrap().lines,
+            vec!["frame-100001".to_string()]
+        );
+
+        let delivered_submits: Vec<String> = events
+            .iter()
+            .filter_map(|event| match event {
+                HubEvent::Ui(Notification::UiEditorSubmit(params)) => Some(params.text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            delivered_submits, submitted,
+            "submit order changed under pressure"
+        );
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            HubEvent::Ui(Notification::UiSetWorkingMessage(params))
+                if params.text.as_deref() == Some("working-100001")
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            HubEvent::Ui(Notification::UiSetToolsExpanded(params)) if !params.visible
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            HubEvent::Ui(Notification::UiTerminalInputActive(params)) if !params.active
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            HubEvent::Ui(Notification::UiSetTheme(params)) if params.theme == "theme-100001"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            HubEvent::Ui(Notification::UiEditorChange(params)) if params.text == "draft-100001"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            HubEvent::Overflow { dropped } if *dropped > 0
+        )));
+    }
+
+    #[test]
+    fn overflow_never_evicts_accepted_submit_or_dismiss_events() {
+        let hub = FrameHub::new();
+        for index in 0..FRAME_HUB_EDGE_CAPACITY {
+            hub.apply(Notification::UiPasteToEditor(TextParams {
+                text: format!("paste-{index}"),
+            }));
+        }
+        hub.apply(Notification::UiEditorSubmit(TextParams {
+            text: "required-submit".to_string(),
+        }));
+        hub.apply(Notification::UiDone(DoneParams {
+            slot: "custom:required".to_string(),
+            result: json!(null),
+        }));
+
+        assert_eq!(hub.pending_event_count(), FRAME_HUB_EDGE_CAPACITY);
+        let (events, _) = hub.drain();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            HubEvent::Ui(Notification::UiEditorSubmit(params)) if params.text == "required-submit"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            HubEvent::Done { slot, .. } if slot == "custom:required"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            HubEvent::Overflow { dropped } if *dropped == 2
+        )));
+    }
+
+    #[test]
+    fn required_edge_saturation_cannot_displace_latest_state() {
+        let hub = FrameHub::new();
+        for index in 0..FRAME_HUB_EDGE_CAPACITY {
+            hub.apply(Notification::UiEditorSubmit(TextParams {
+                text: format!("submit-{index}"),
+            }));
+        }
+
+        hub.apply(Notification::UiSetTheme(ThemeSelectionParams {
+            theme: "latest-theme".to_string(),
+        }));
+        hub.apply(Notification::UiEditorChange(TextParams {
+            text: "latest-editor".to_string(),
+        }));
+        hub.apply(Notification::UiTerminalInputActive(ActiveParams {
+            active: true,
+        }));
+        hub.apply(Notification::UiOverlay(OverlayParams {
+            slot: "custom:latest".to_string(),
+            options: json!({"anchor": "center"}),
+        }));
+        hub.apply(frame("custom:latest", 1, &["latest-frame"]));
+
+        assert_eq!(
+            hub.pending_event_count(),
+            FRAME_HUB_EDGE_CAPACITY + 6,
+            "state and dirty keys must use independent bounded storage"
+        );
+        let (events, dirty) = hub.drain();
+        assert_eq!(dirty, vec!["custom:latest".to_string()]);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            HubEvent::Ui(Notification::UiSetTheme(params)) if params.theme == "latest-theme"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            HubEvent::Ui(Notification::UiEditorChange(params)) if params.text == "latest-editor"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            HubEvent::Ui(Notification::UiTerminalInputActive(params)) if params.active
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            HubEvent::Overlay { slot, .. } if slot == "custom:latest"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            HubEvent::Mounted { slot } if slot == "custom:latest"
+        )));
+    }
+
+    #[test]
+    fn unique_slot_flood_switches_to_bounded_authoritative_resync() {
+        let hub = FrameHub::new();
+        for sequence in 1..=100_001_u64 {
+            let slot = format!("widget:{sequence}");
+            hub.apply(frame(&slot, 1, &["frame"]));
+        }
+
+        assert!(
+            hub.pending_event_count() <= FRAME_HUB_BUFFER_CAPACITY,
+            "unique slots retained {} buffered items (capacity {})",
+            hub.pending_event_count(),
+            FRAME_HUB_BUFFER_CAPACITY
+        );
+        let (events, dirty) = hub.drain();
+        assert!(dirty.is_empty(), "resync supersedes individual dirty keys");
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, HubEvent::ResyncAll))
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            HubEvent::Overflow { dropped } if *dropped > 0
+        )));
+        assert_eq!(hub.slot_names().len(), 100_001);
+        assert_eq!(
+            hub.snapshot("widget:100001").unwrap().lines,
+            vec!["frame".to_string()]
+        );
+    }
+
+    #[test]
     fn stale_versions_drop() {
         let hub = FrameHub::new();
         hub.apply(frame("s", 5, &["new"]));
@@ -496,8 +919,8 @@ mod tests {
         hub.apply(frame("s", 1, &["x"]));
         hub.apply(Notification::UiDispose(SlotParams { slot: "s".into() }));
         let (events, dirty) = hub.drain();
-        assert_eq!(events.len(), 2);
-        assert!(matches!(&events[1], HubEvent::Disposed { slot } if slot == "s"));
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], HubEvent::Disposed { slot } if slot == "s"));
         assert!(dirty.is_empty());
         assert!(hub.snapshot("s").is_none());
     }
