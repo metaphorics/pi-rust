@@ -291,6 +291,9 @@ pub struct ProcessTerminal {
     stdin_tx: Option<Sender<Vec<u8>>>,
     stdin_rx: Option<Receiver<Vec<u8>>>,
     stdin_segmenter: Segmenter,
+    /// Armed when the segmenter buffers a partial escape; drives the
+    /// oracle's 10ms lone-ESC flush (stdin-buffer.ts:378-385).
+    pending_escape_since: Option<Instant>,
     /// Bytes typed while a pre-start terminal probe owns stdin.
     pending_stdin_chunks: Vec<Vec<u8>>,
     #[cfg(unix)]
@@ -326,6 +329,7 @@ impl ProcessTerminal {
             stdin_tx: None,
             stdin_rx: None,
             stdin_segmenter: Segmenter::default(),
+            pending_escape_since: None,
             pending_stdin_chunks: Vec::new(),
             #[cfg(unix)]
             saved_termios: None,
@@ -513,6 +517,20 @@ impl ProcessTerminal {
         handler(&input);
     }
 
+    /// Route one segmented raw sequence: negotiation intercepts first, then
+    /// the input handler (single dispatch point for live and flushed bytes).
+    fn dispatch_raw_sequence(&mut self, sequence: &str) {
+        match self.read_keyboard_protocol_negotiation_sequence(sequence) {
+            NegotiationRead::Pending => {}
+            NegotiationRead::Complete(neg) => {
+                self.handle_keyboard_protocol_negotiation_sequence(neg);
+            }
+            NegotiationRead::NotNegotiation => {
+                self.forward_input_sequence(sequence);
+            }
+        }
+    }
+
     /// Feed a raw stdin chunk through the segmenter and dispatch sequences.
     pub fn process_stdin_chunk(&mut self, bytes: &[u8]) {
         if bytes.windows(8).any(|w| w == b"\x1b[?2026h") {
@@ -524,15 +542,7 @@ impl ProcessTerminal {
             match segment {
                 Segment::Bytes(raw) => {
                     let sequence = String::from_utf8_lossy(&raw).into_owned();
-                    match self.read_keyboard_protocol_negotiation_sequence(&sequence) {
-                        NegotiationRead::Pending => {}
-                        NegotiationRead::Complete(neg) => {
-                            self.handle_keyboard_protocol_negotiation_sequence(neg);
-                        }
-                        NegotiationRead::NotNegotiation => {
-                            self.forward_input_sequence(&sequence);
-                        }
-                    }
+                    self.dispatch_raw_sequence(&sequence);
                 }
                 Segment::Paste(payload) => {
                     let content = String::from_utf8_lossy(&payload);
@@ -540,6 +550,34 @@ impl ProcessTerminal {
                     self.forward_input_sequence(&wrapped);
                 }
             }
+        }
+        // Oracle StdinBuffer arms a 10ms flush timer whenever an incomplete
+        // escape remains buffered (stdin-buffer.ts:378-385): a lone ESC
+        // keypress must surface as "\x1b" instead of waiting for more bytes.
+        self.pending_escape_since = if self.stdin_segmenter.has_pending_escape() {
+            Some(Instant::now())
+        } else {
+            None
+        };
+    }
+
+    /// Flush a buffered partial escape after the oracle's 10ms window
+    /// (stdin-buffer.ts:284 `timeout ?? 10`).
+    fn flush_stale_pending_escape(&mut self) {
+        const ESCAPE_FLUSH_TIMEOUT: Duration = Duration::from_millis(10);
+        let Some(since) = self.pending_escape_since else {
+            return;
+        };
+        if since.elapsed() < ESCAPE_FLUSH_TIMEOUT {
+            return;
+        }
+        self.pending_escape_since = None;
+        if !self.stdin_segmenter.has_pending_escape() {
+            return;
+        }
+        if let Some(raw) = self.stdin_segmenter.flush_pending_escape() {
+            let sequence = String::from_utf8_lossy(&raw).into_owned();
+            self.dispatch_raw_sequence(&sequence);
         }
     }
 
@@ -605,6 +643,7 @@ impl ProcessTerminal {
         for chunk in &chunks {
             self.process_stdin_chunk(chunk);
         }
+        self.flush_stale_pending_escape();
         self.flush_negotiation_buffer_if_stale();
         self.poll_resize();
     }
@@ -668,6 +707,7 @@ impl Terminal for ProcessTerminal {
 
         let _ = self.enable_raw_mode();
         self.stdin_segmenter = Segmenter::default();
+        self.pending_escape_since = None;
 
         // Bracketed paste enable.
         Self::write_stdout("\x1b[?2004h");
@@ -865,6 +905,7 @@ impl Terminal for ProcessTerminal {
     fn resume(&mut self) {
         let _ = self.enable_raw_mode();
         self.stdin_segmenter = Segmenter::default();
+        self.pending_escape_since = None;
         Self::write_stdout("\x1b[?2004h");
         Self::signal_sigwinch_self();
         self.keyboard_protocol_pushed = true;
@@ -952,5 +993,62 @@ mod tests {
             parse_terminal_background_color_response("\x1b[?1;2c\x1b]11;rgb:ffff/0000/8080\x1b\\"),
             None
         );
+    }
+    /// Terminal harness capturing forwarded input sequences.
+    fn capture_terminal() -> (
+        ProcessTerminal,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let mut term = ProcessTerminal::new();
+        let got = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&got);
+        term.input_handler = Some(Box::new(move |s| {
+            sink.lock().unwrap().push(s.to_string());
+        }));
+        (term, got)
+    }
+
+    /// Oracle StdinBuffer flushes an incomplete escape after its 10ms timer
+    /// (stdin-buffer.ts:378-385): a lone ESC keypress must reach the input
+    /// handler as "\x1b" instead of being buffered until the next key.
+    #[test]
+    fn lone_escape_flushes_after_timeout() {
+        let (mut term, got) = capture_terminal();
+        term.process_stdin_chunk(b"\x1b");
+        assert!(got.lock().unwrap().is_empty(), "ESC must not flush early");
+
+        // Before the deadline: no flush.
+        term.flush_stale_pending_escape();
+        assert!(got.lock().unwrap().is_empty());
+
+        // Force the deadline past instead of sleeping.
+        term.pending_escape_since = Some(Instant::now() - Duration::from_millis(11));
+        term.flush_stale_pending_escape();
+        assert_eq!(got.lock().unwrap().as_slice(), &["\x1b".to_string()]);
+
+        // Idempotent: nothing left to flush.
+        term.flush_stale_pending_escape();
+        assert_eq!(got.lock().unwrap().len(), 1);
+    }
+
+    /// The invalidating condition for the timer: a split CSI sequence whose
+    /// tail arrives before the deadline must emit ONE key, never a premature
+    /// escape plus loose text.
+    #[test]
+    fn split_csi_before_timeout_emits_single_sequence() {
+        let (mut term, got) = capture_terminal();
+        term.process_stdin_chunk(b"\x1b");
+        assert!(
+            got.lock().unwrap().is_empty(),
+            "partial CSI must stay buffered"
+        );
+        term.process_stdin_chunk(b"[A");
+        assert_eq!(got.lock().unwrap().as_slice(), &["\x1b[A".to_string()]);
+        assert!(term.pending_escape_since.is_none());
+
+        // A stale-looking deadline afterwards flushes nothing.
+        term.pending_escape_since = Some(Instant::now() - Duration::from_millis(11));
+        term.flush_stale_pending_escape();
+        assert_eq!(got.lock().unwrap().len(), 1);
     }
 }
