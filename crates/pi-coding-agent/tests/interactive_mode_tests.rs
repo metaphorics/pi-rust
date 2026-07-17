@@ -1392,3 +1392,89 @@ async fn editor_history_recalls_in_memory_and_persists_nothing() {
     assert!(unexpected.is_empty(), "{unexpected:?}");
     assert_no_flicker(&handle);
 }
+
+/// Oracle interactive-mode.ts:892-894: the initial startup prompt is sent
+/// with `initialImages`; the provider call must see the image content in
+/// the first user message.
+#[tokio::test(flavor = "current_thread")]
+async fn initial_message_carries_initial_images_to_the_provider() {
+    use std::collections::VecDeque;
+    use parking_lot::Mutex;
+
+    let contexts: Arc<Mutex<Vec<pi_ai::Context>>> = Arc::new(Mutex::new(Vec::new()));
+    let seed = make_runtime(TestRuntimeOptions {
+        with_auth: true,
+        ..Default::default()
+    })
+    .await;
+    let reply = assistant_text_message(&seed.model, "image-received");
+    drop(seed);
+    let stream_fn: StreamFn = {
+        let contexts = contexts.clone();
+        let script = Arc::new(Mutex::new(VecDeque::from(vec![reply])));
+        Arc::new(move |model: pi_ai::Model, context, _options| {
+            let contexts = contexts.clone();
+            let script = script.clone();
+            Box::pin(async move {
+                contexts.lock().push(context);
+                let stream = pi_ai::create_assistant_message_event_stream();
+                let message = script.lock().pop_front().unwrap_or_else(|| {
+                    let mut error = assistant_text_message(&model, "");
+                    error.stop_reason = StopReason::Error;
+                    error.error_message = Some("script exhausted".to_string());
+                    error
+                });
+                stream.push(AssistantMessageEvent::Done {
+                    reason: message.stop_reason,
+                    message,
+                });
+                stream
+            })
+        })
+    };
+    let test = make_runtime(TestRuntimeOptions {
+        with_auth: true,
+        stream_fn: Some(stream_fn),
+        ..Default::default()
+    })
+    .await;
+    let (terminal, handle) = VtTerminal::new(90, 28);
+    let mut mode = InteractiveMode::new(
+        test.runtime.clone(),
+        terminal,
+        InteractiveModeOptions {
+            initial_message: Some("describe the attachment".to_string()),
+            initial_images: vec![pi_ai::ImageContent {
+                data: "QUJDREVG".to_string(),
+                mime_type: "image/png".to_string(),
+            }],
+            ..Default::default()
+        },
+    );
+    mode.init();
+    mode.begin_startup_messages();
+    pump_until(&mut mode, &handle, Duration::from_secs(2), |screen| {
+        screen.contains("image-received")
+    })
+    .await;
+
+    let contexts = contexts.lock();
+    assert_eq!(contexts.len(), 1, "one provider call expected");
+    let Message::User(user) = &contexts[0].messages[0] else {
+        panic!("first context message must be the user prompt");
+    };
+    let UserContent::Blocks(blocks) = &user.content else {
+        panic!("image prompt must use content blocks");
+    };
+    assert!(
+        blocks.iter().any(|block| matches!(
+            block,
+            Content::Image(image) if image.data == "QUJDREVG" && image.mime_type == "image/png"
+        )),
+        "provider context missing the initial image: {blocks:?}"
+    );
+    assert!(blocks.iter().any(|block| matches!(
+        block,
+        Content::Text(text) if text.text.to_string().contains("describe the attachment")
+    )));
+}

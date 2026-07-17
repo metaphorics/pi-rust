@@ -116,6 +116,9 @@ pub fn format_resume_command(session_manager: &SessionManager) -> Option<String>
 #[derive(Default)]
 pub struct InteractiveModeOptions {
     pub initial_message: Option<String>,
+    /// Images attached to `initial_message` (oracle `initialImages`; sent
+    /// only with the initial message, interactive-mode.ts:892-894).
+    pub initial_images: Vec<pi_ai::ImageContent>,
     pub initial_messages: Vec<String>,
     pub model_fallback_message: Option<String>,
     /// Install SIGTERM/SIGHUP handlers (binary entry points only).
@@ -557,7 +560,7 @@ pub struct InteractiveMode {
     suspend_signal: Rc<dyn Fn()>,
     is_bash_mode: bool,
     selector_open: bool,
-    startup_messages: VecDeque<String>,
+    startup_messages: VecDeque<(String, Vec<pi_ai::ImageContent>)>,
     compaction_queued: Vec<CompactionQueuedMessage>,
     bash_component: Option<Rc<RefCell<BashExecutionComponent>>>,
     bash_chunks: Option<Arc<parking_lot::Mutex<Vec<String>>>>,
@@ -845,13 +848,7 @@ impl InteractiveMode {
     /// Run until quit; returns the exit code and farewell line.
     pub async fn run(mut self) -> RunOutcome {
         self.init();
-
-        if let Some(initial) = self.options.initial_message.take() {
-            self.startup_messages.push_back(initial);
-        }
-        self.startup_messages
-            .extend(std::mem::take(&mut self.options.initial_messages));
-        self.spawn_next_startup_message();
+        self.begin_startup_messages();
 
         #[cfg(unix)]
         let mut sigterm = if self.options.handle_signals {
@@ -1584,17 +1581,48 @@ impl InteractiveMode {
     }
 
     fn spawn_prompt(&mut self, text: String) {
+        self.spawn_prompt_with_images(text, Vec::new());
+    }
+
+    fn spawn_prompt_with_images(&mut self, text: String, images: Vec<pi_ai::ImageContent>) {
         let session = self.session.clone();
         self.ops.push(Box::pin(async move {
-            OpOutcome::PromptFinished(session.prompt(&text, PromptOptions::default()).await)
+            OpOutcome::PromptFinished(
+                session
+                    .prompt(
+                        &text,
+                        PromptOptions {
+                            images,
+                            ..Default::default()
+                        },
+                    )
+                    .await,
+            )
         }));
+    }
+
+    /// Queue the startup prompts exactly as `run()` sends them (oracle
+    /// interactive-mode.ts:891-910): the initial message carries the initial
+    /// images; additional messages follow sequentially. Public as the test
+    /// seam for the startup path — production only calls it from `run()`.
+    pub fn begin_startup_messages(&mut self) {
+        if let Some(initial) = self.options.initial_message.take() {
+            let images = std::mem::take(&mut self.options.initial_images);
+            self.startup_messages.push_back((initial, images));
+        }
+        self.startup_messages.extend(
+            std::mem::take(&mut self.options.initial_messages)
+                .into_iter()
+                .map(|message| (message, Vec::new())),
+        );
+        self.spawn_next_startup_message();
     }
 
     fn spawn_next_startup_message(&mut self) {
         if !self.session.is_streaming()
-            && let Some(message) = self.startup_messages.pop_front()
+            && let Some((message, images)) = self.startup_messages.pop_front()
         {
-            self.spawn_prompt(message);
+            self.spawn_prompt_with_images(message, images);
         }
     }
 

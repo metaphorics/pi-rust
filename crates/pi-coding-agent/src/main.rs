@@ -1041,6 +1041,7 @@ async fn main() {
                 terminal,
                 InteractiveModeOptions {
                     initial_message: initial.initial_message,
+                    initial_images: initial.initial_images,
                     initial_messages: std::mem::take(&mut parsed.messages),
                     model_fallback_message: runtime.model_fallback_message(),
                     handle_signals: true,

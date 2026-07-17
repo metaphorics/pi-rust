@@ -99,17 +99,20 @@ print(s.getsockname()[1])
 s.close()
 EOF
 )
-python3 - "$PORT" <<'EOF' &
+python3 - "$PORT" "$WORK/requests.log" <<'EOF' &
 import http.server, json, sys
 
 PORT = int(sys.argv[1])
+REQUEST_LOG = sys.argv[2]
 
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def do_POST(self):
         length = int(self.headers.get("content-length", 0))
-        self.rfile.read(length)
+        body = self.rfile.read(length)
+        with open(REQUEST_LOG, "ab") as log:
+            log.write(body + b"\n")
         chunks = []
         for word in ["Here", " is", " the", " reply:", " SMOKE-REPLY"]:
             chunks.append({"choices": [{"index": 0, "delta": {"content": word}}]})
@@ -143,7 +146,7 @@ cat > "$AGENT/models.json" <<EOF
           "id": "smoke-model",
           "name": "Smoke Model",
           "reasoning": false,
-          "input": ["text"],
+          "input": ["text", "image"],
           "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
           "contextWindow": 32000,
           "maxTokens": 1024
@@ -294,6 +297,32 @@ if command -v tmux >/dev/null 2>&1; then
     sleep 0.25
   done
   tmux kill-session -t pi-main-smoke 2>/dev/null
+  # @image attachment: the initial interactive prompt must deliver the
+  # image to the provider (oracle initialImages → session.prompt images).
+  python3 - "$PROJ/pic.png" <<'EOF'
+import base64, sys
+PNG_1PX = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+)
+with open(sys.argv[1], "wb") as f:
+    f.write(PNG_1PX)
+EOF
+  : > "$WORK/requests.log"
+  tmux new-session -d -s pi-main-smoke -x 100 -y 30 \
+    "env PI_CODING_AGENT_DIR='$AGENT' PI_OFFLINE=1 '$BIN' --no-session @pic.png 'describe the picture'"
+  img_ok=0
+  for _ in $(seq 1 40); do
+    if tmux capture-pane -t pi-main-smoke -p 2>/dev/null | grep -q "SMOKE-REPLY"; then img_ok=1; break; fi
+    sleep 0.25
+  done
+  check "interactive @image streamed reply" 1 "$img_ok"
+  check_contains "model received image content" 'data:image/png;base64,iVBORw0KGgo' "$(cat "$WORK/requests.log" 2>/dev/null)"
+  check_contains "model received image prompt text" 'describe the picture' "$(cat "$WORK/requests.log" 2>/dev/null)"
+  tmux send-keys -t pi-main-smoke -l "/quit"
+  tmux send-keys -t pi-main-smoke Enter
+  sleep 1
+  tmux kill-session -t pi-main-smoke 2>/dev/null
+  rm -f -- "$PROJ/pic.png"
   # ---------------------------------------------------- pi config (tmux)
   # Non-interactive surfaces first: help text and error exits.
   out=$("$BIN" config --help); rc=$?
